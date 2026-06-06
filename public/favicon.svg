@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <!-- Background Gradient: Warm Orange to Sakura Pink, representing both themes -->
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF7E40" />
+      <stop offset="100%" stop-color="#FF4B91" />
+    </linearGradient>
+    
+    <!-- Subtle drop shadow for the play button to give it depth -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1" flood-opacity="0.25" />
+    </filter>
+  </defs>
+
+  <!-- Main Squircle Background -->
+  <rect x="2" y="2" width="28" height="28" rx="8" fill="url(#bg-grad)" />
+
+  <!-- Inner border for a premium, glassmorphic feel -->
+  <rect x="3" y="3" width="26" height="26" rx="7" fill="none" stroke="#ffffff" stroke-width="1" opacity="0.2" />
+
+  <!-- Stylized Play Button Icon, perfectly centered with rounded corners and drop shadow -->
+  <path d="M13 10.5 L21.5 16 L13 21.5 Z" 
+        fill="#ffffff" 
+        stroke="#ffffff" 
+        stroke-width="2.5" 
+        stroke-linejoin="round" 
+        filter="url(#shadow)" />
+</svg>

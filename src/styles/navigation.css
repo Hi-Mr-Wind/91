@@ -1,0 +1,248 @@
+/* =========================================================
+ * Navigation
+ * sticky 玻璃顶栏 + Logo 渐变 + 移动端汉堡
+ * ========================================================= */
+.top-bar {
+  display: none; /* TopBar 当前返回 null */
+}
+
+.main-nav {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-nav);
+  background: var(--glass-nav);
+  border-bottom: 1px solid var(--border-subtle);
+  backdrop-filter: saturate(160%) blur(16px);
+  -webkit-backdrop-filter: saturate(160%) blur(16px);
+}
+
+.main-nav__inner {
+  display: flex;
+  align-items: center;
+  height: 64px;
+  gap: var(--space-5);
+}
+
+/* ----- Logo ----- */
+.main-nav__logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: var(--weight-bold);
+  font-size: var(--font-lg);
+  letter-spacing: 0.01em;
+  color: var(--text-strong);
+  transition: transform var(--transition-fast);
+}
+
+.main-nav__logo-text {
+  background: var(--accent-gradient-strong);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-weight: var(--weight-extrabold);
+}
+
+.main-nav__logo:hover {
+  color: var(--text-strong);
+  transform: scale(1.02);
+}
+
+.main-nav__logo:hover .main-nav__logo-mark {
+  transform: rotate(6deg) scale(1.05);
+  box-shadow: 0 6px 20px rgba(255, 138, 60, 0.45), var(--shadow-inset);
+}
+
+.main-nav__logo-mark {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-gradient);
+  color: var(--text-on-accent);
+  box-shadow:
+    0 4px 14px var(--accent-glow),
+    var(--shadow-inset);
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.main-nav__logo-mark::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 60%);
+  pointer-events: none;
+}
+
+/* ----- 链接列表 ----- */
+.main-nav__list {
+  display: flex;
+  gap: var(--space-1);
+  margin-left: auto;
+  align-items: center;
+}
+
+.main-nav__link {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-md);
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.main-nav__link:hover {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.main-nav__link.is-active {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+.main-nav__link.is-active::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -10px;
+  transform: translateX(-50%);
+  width: 18px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+/* ----- 汉堡按钮 ----- */
+.main-nav__toggle {
+  display: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-subtle);
+  align-items: center;
+  justify-content: center;
+  transition: background var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.main-nav__toggle:hover {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: var(--border-default);
+  transform: scale(1.04);
+}
+
+.main-nav__toggle:active {
+  transform: scale(0.96);
+}
+
+/* ----- 子导航（一般为空，留作扩展） ----- */
+.sub-nav {
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.sub-nav__list {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  height: 40px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.sub-nav__list::-webkit-scrollbar {
+  display: none;
+}
+
+.sub-nav__item {
+  white-space: nowrap;
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  transition: color var(--transition-fast);
+}
+
+.sub-nav__item:hover {
+  color: var(--accent);
+}
+
+/* ----- 响应式 ----- */
+@media (max-width: 768px) {
+  .main-nav__inner {
+    height: 56px;
+    gap: var(--space-3);
+  }
+
+  .main-nav__logo {
+    font-size: 15px;
+  }
+
+  .main-nav__logo-mark {
+    width: 30px;
+    height: 30px;
+  }
+
+  .main-nav__list {
+    display: none;
+  }
+
+  .main-nav__toggle {
+    display: inline-flex;
+    margin-left: auto;
+  }
+
+  /* Mobile floating glassmorphism card menu */
+  .main-nav.is-open .main-nav__list {
+    display: flex;
+    position: absolute;
+    top: 64px;
+    left: var(--space-3);
+    right: var(--space-3);
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    padding: var(--space-3);
+    background: var(--glass-nav);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-xl);
+    animation: mobile-nav-slide-down var(--transition-fast) var(--ease-out);
+  }
+
+  @keyframes mobile-nav-slide-down {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .main-nav.is-open .main-nav__link {
+    width: 100%;
+    height: 42px;
+    padding: 0 var(--space-4);
+    border-radius: var(--radius-sm);
+    justify-content: flex-start;
+    font-size: var(--font-base);
+  }
+
+  .main-nav.is-open .main-nav__link.is-active::after {
+    display: none;
+  }
+}

@@ -1,0 +1,827 @@
+/* 短视频模式：沉浸式垂直滑动 feed。整个页面占满视口高度，
+   滚动靠原生 scroll-snap 实现 TikTok 式吸附切屏。 */
+
+.shorts-page {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  color: #fff;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* 长按选中、上下文菜单、iOS 长按浮层都不要 */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  /* 防止移动端在边缘滑动触发"上一页"导航 */
+  overscroll-behavior: none;
+}
+
+/* ---------- 顶部条 (高阶毛玻璃渐变遮罩) ---------- */
+.shorts-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  /* 用 padding-top 把 header 内容压到 safe area 下面，
+     这样刘海/状态栏不会盖住返回按钮 */
+  padding: env(safe-area-inset-top) 16px 0 16px;
+  height: calc(64px + env(safe-area-inset-top));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.7) 0%,
+    rgba(0, 0, 0, 0.4) 40%,
+    rgba(0, 0, 0, 0) 100%
+  );
+  pointer-events: none;
+}
+
+.shorts-header__back,
+.shorts-header__icon-btn {
+  pointer-events: auto;
+  width: 42px;
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 50%;
+  color: #fff;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.shorts-header__back:hover,
+.shorts-header__icon-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.3);
+  transform: scale(1.05);
+}
+
+.shorts-header__back:active,
+.shorts-header__icon-btn:active {
+  transform: scale(0.95);
+}
+
+.shorts-header__actions {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* 桌面端音量条容器 */
+.shorts-header__volume-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.shorts-header__volume-slider-container {
+  position: absolute;
+  right: calc(100% + 8px);
+  background: rgba(0, 0, 0, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 8px 12px;
+  border-radius: 99px;
+  display: flex;
+  align-items: center;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(10px) scale(0.95);
+  transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.shorts-header__volume-group:hover .shorts-header__volume-slider-container,
+.shorts-header__volume-slider-container:hover {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0) scale(1);
+}
+
+@media (max-width: 768px) {
+  .shorts-header__volume-slider-container {
+    display: none !important;
+  }
+}
+
+.shorts-header__volume-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 80px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.3);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.shorts-header__volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.8);
+  transition: transform 0.1s;
+}
+
+.shorts-header__volume-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+/* ---------- feed 列表 ---------- */
+.shorts-feed {
+  flex: 1;
+  overflow-y: scroll;
+  scroll-snap-type: y mandatory;
+  /* 隐藏滚动条，沉浸感 */
+  scrollbar-width: none;
+  /* 允许竖直方向 pan，水平方向给进度条 */
+  touch-action: pan-y;
+  overscroll-behavior: contain;
+}
+.shorts-feed::-webkit-scrollbar {
+  display: none;
+}
+
+/* ---------- 单屏 (高度锁定 svh 杜绝抖动) ---------- */
+.shorts-slide {
+  position: relative;
+  width: 100%;
+  height: 100svh;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  overflow: hidden;
+  background: #000;
+  cursor: pointer;
+}
+
+@supports not (height: 100svh) {
+  .shorts-slide {
+    height: 100dvh;
+  }
+}
+@supports not (height: 100dvh) {
+  .shorts-slide {
+    height: 100vh;
+  }
+}
+
+/* 模糊海报背景：填充黑边的部分 */
+.shorts-slide__bg {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  filter: blur(32px) brightness(0.45);
+  transform: scale(1.15); /* 模糊后边缘羽化，放大避免漏边 */
+  z-index: 0;
+}
+
+.shorts-slide__video,
+.shorts-slide__poster {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: auto;
+  object-fit: contain; /* 横屏视频不裁切，多余处由 __bg 顶上 */
+  z-index: 1;
+  /* 影院镜头变焦动效：非活跃状态下稍微缩小，切入时柔和放大并淡入 */
+  transform: scale(0.96);
+  opacity: 0.5;
+  transition: transform 0.6s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.shorts-slide[data-active="true"] .shorts-slide__video,
+.shorts-slide[data-active="true"] .shorts-slide__poster {
+  transform: scale(1);
+  opacity: 1;
+  filter: drop-shadow(0 20px 50px rgba(0, 0, 0, 0.95));
+}
+
+/* 播放状态脉冲 HUD (磨砂玻璃大图标弹出动效) */
+.shorts-slide__hud-pulse {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1.5px solid rgba(255, 255, 255, 0.25);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  z-index: 15;
+  pointer-events: none;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  animation: shorts-hud-pop 450ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+@keyframes shorts-hud-pop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.6);
+  }
+  25% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.1);
+  }
+  75% {
+    opacity: 0.85;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.9);
+  }
+}
+
+/* 视频加载/卡顿缓冲磨砂提示圈 */
+.shorts-slide__buffering {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.9);
+  z-index: 12;
+  pointer-events: none;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.shorts-slide__buffering-icon {
+  animation: shorts-spin 1.1s linear infinite;
+}
+
+@keyframes shorts-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* 原始大三角形的遗留样式（做兼容处理） */
+.shorts-slide__paused {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 80px;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* 2x 倍速指示 */
+.shorts-slide__rate-hint {
+  position: absolute;
+  top: calc(76px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+  z-index: 10;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: shorts-rate-in 150ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shorts-slide__rate-hint::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: #ff4060;
+  border-radius: 50%;
+  animation: shorts-ping 1.2s infinite;
+}
+
+@keyframes shorts-ping {
+  0% { transform: scale(1); opacity: 1; }
+  70% { transform: scale(2.2); opacity: 0; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+
+@keyframes shorts-rate-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -10px) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+
+
+/* ---------- 底部信息覆盖层 ---------- */
+.shorts-slide__overlay {
+  position: absolute;
+  left: 0;
+  /* 给右侧操作栏让出更多位置，并提高人体工学间隔 */
+  right: 80px;
+  /* 抬高以腾出空间给下方的进度条，避免文字与进度条重叠 */
+  bottom: calc(env(safe-area-inset-bottom) + 52px);
+  padding: 0 16px 10px 16px;
+  /* 完全去掉背景灰色/黑影区域，保持背景 100% 透明 */
+  background: transparent;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+  
+  /* 影院文字浮现动效：切屏时，文字稍微往下位移并淡入 */
+  transform: translateY(15px);
+  opacity: 0;
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  transition-delay: 0.1s;
+}
+
+.shorts-slide[data-active="true"] .shorts-slide__overlay {
+  transform: translateY(0);
+  opacity: 1;
+}
+
+.shorts-slide__overlay * {
+  pointer-events: auto;
+}
+
+.shorts-slide__title {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.4;
+  font-weight: 600;
+  color: #fff;
+  /* 多层阴影叠加：近距离锐边 + 远距离弥散，浅色视频上也清楚 */
+  text-shadow:
+    0 1px 1px rgba(0, 0, 0, 0.9),
+    0 2px 5px rgba(0, 0, 0, 0.8),
+    0 4px 15px rgba(0, 0, 0, 0.6);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-height: 2.8em;
+}
+
+.shorts-slide__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.shorts-slide__meta-item {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 2.5px 8px;
+  border-radius: 99px;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  font-weight: 500;
+}
+
+/* 查看详情胶囊按钮 */
+.shorts-slide__detail {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 5px 12px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 500;
+  text-decoration: none;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.shorts-slide__detail:hover {
+  background: rgba(255, 255, 255, 0.22);
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 4px 12px rgba(255, 255, 255, 0.15);
+}
+
+.shorts-slide__detail:active {
+  transform: scale(0.96);
+}
+
+@media (max-width: 768px) {
+  .shorts-slide__detail {
+    display: none !important;
+  }
+}
+
+/* ---------- 右下角竖排操作栏 (符合人体工学的拇指扇形热区) ---------- */
+.shorts-slide__actions {
+  position: absolute;
+  right: 14px;
+  /* 进一步抬升操作栏高度，避开底部交互，符合右手大拇指舒适操纵热区 */
+  bottom: calc(env(safe-area-inset-bottom) + 120px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  z-index: 15;
+  
+  /* 影院动作条滑入动效：切屏时，右侧按钮向右微移并淡入 */
+  transform: translateX(18px);
+  opacity: 0;
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  transition-delay: 0.15s;
+}
+
+.shorts-slide[data-active="true"] .shorts-slide__actions {
+  transform: translateX(0);
+  opacity: 1;
+}
+
+/* 来源云盘圆形徽章，支持微光呼吸效果 */
+.shorts-drive-badge {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  position: relative;
+  z-index: 2;
+  margin-bottom: 4px;
+}
+
+/* 云盘的圆形炫光边框 */
+.shorts-drive-badge::after {
+  content: "";
+  position: absolute;
+  inset: -1.5px;
+  border-radius: 50%;
+  padding: 1.5px;
+  background: linear-gradient(135deg, #ff4060, #ff8030);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  animation: rotate-gradient 4s linear infinite;
+}
+
+@keyframes rotate-gradient {
+  100% { transform: rotate(360deg); }
+}
+
+.shorts-slide__action {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  padding: 0;
+  color: #fff;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  -webkit-tap-highlight-color: transparent;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  position: relative;
+}
+
+/* 大拇指物理触控回弹微缩放动效 */
+.shorts-slide__action:active {
+  transform: scale(0.85);
+}
+
+.shorts-slide__action:hover {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.35);
+  /* 炫酷的悬停外发光，突出按键焦点 */
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.2), 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* 点赞激活态 (高对比度红粉发光) */
+.shorts-slide__action.is-liked {
+  color: #ff4060;
+  background: rgba(255, 64, 96, 0.12);
+  border-color: rgba(255, 64, 96, 0.4);
+  box-shadow: 0 0 12px rgba(255, 64, 96, 0.35);
+  animation: heart-active-bounce 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+@keyframes heart-active-bounce {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.22); }
+  100% { transform: scale(1); }
+}
+
+/* 操作计数标签 */
+.shorts-slide__action-count {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ---------- 双击点赞的心形飞起动画 ---------- */
+.shorts-slide__heart-burst {
+  position: absolute;
+  /* x/y 通过 inline style 设置，加 translate 让心形以指点为中心 */
+  transform: translate(-50%, -50%);
+  color: #ff4060;
+  pointer-events: none;
+  z-index: 18;
+  animation: shorts-heart-pop 650ms cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+  filter: drop-shadow(0 4px 16px rgba(255, 64, 96, 0.7));
+}
+
+@keyframes shorts-heart-pop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.3) rotate(-16deg);
+  }
+  30% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.25) rotate(-6deg);
+  }
+  50% {
+    opacity: 1;
+    transform: translate(-50%, -60%) scale(1.05) rotate(4deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -105%) scale(0.7) rotate(12deg);
+  }
+}
+
+/* ---------- 进度条 (触摸激活与发光手柄) ---------- */
+.shorts-slide__progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  /* 抬高到 safe area 之上并留出 14px 缓冲区，以彻底杜绝用户拉动进度条时误触手机手势导航条/Home条 */
+  bottom: calc(env(safe-area-inset-bottom) + 14px);
+  height: 40px; /* 适当增加点击与拖拽的热区高度 */
+  z-index: 16;
+  display: flex;
+  align-items: center; /* 纵向居中，使实际感应轴心往上提升，拉大与屏幕底边缘的安全间距 */
+  /* 拦截手势：进度条上的手指不要触发 feed 上下滚动 */
+  touch-action: none;
+  cursor: pointer;
+}
+
+/* 进度条轨道 */
+.shorts-slide__progress-track {
+  width: 100%;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.22);
+  position: relative;
+  border-radius: 99px;
+  transition: height 0.15s ease, background-color 0.15s ease;
+  margin: 0 16px;
+}
+
+/* 进度条悬停/激活手柄 (微型发光白点) */
+.shorts-slide__progress-track::after {
+  content: "";
+  position: absolute;
+  right: calc(100% - var(--progress-pct, 0%) - 6px);
+  top: 50%;
+  transform: translateY(-50%) scale(0);
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.9);
+  transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
+  pointer-events: none;
+  z-index: 4;
+}
+
+/* 悬停或拖动状态下，轨道变粗，白色手柄浮现 */
+.shorts-slide__progress:hover .shorts-slide__progress-track,
+.shorts-slide__progress.is-scrubbing .shorts-slide__progress-track {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.shorts-slide__progress:hover .shorts-slide__progress-track::after,
+.shorts-slide__progress.is-scrubbing .shorts-slide__progress-track::after {
+  transform: translateY(-50%) scale(1);
+}
+
+.shorts-slide__progress-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  /* 使用高颜值渐变（从粉红到蛇金橙），契合主色调，带来极高的高级感 */
+  background: linear-gradient(90deg, #ff4060 0%, #ff8030 100%);
+  border-radius: 99px;
+  transition: width 80ms linear;
+}
+
+.shorts-slide__progress.is-scrubbing .shorts-slide__progress-fill {
+  transition: none;
+  background: linear-gradient(90deg, #ff4060 0%, #ff8030 100%);
+  box-shadow: 0 0 10px rgba(255, 64, 96, 0.6);
+}
+
+/* 拖拽seek时间提示气泡 */
+.shorts-slide__progress-time {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) scale(0.9);
+  padding: 6px 14px;
+  border-radius: 99px;
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  pointer-events: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  animation: shorts-tooltip-pop 150ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes shorts-tooltip-pop {
+  to { transform: translateX(-50%) scale(1); }
+}
+
+/* ---------- “不再展示” (Hide) 半透明毛玻璃屏蔽遮罩 ---------- */
+.shorts-slide__hidden-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  z-index: 30;
+  animation: hidden-fade-in 0.25s ease-out forwards;
+  color: #fff;
+  text-align: center;
+  padding: 24px;
+}
+
+@keyframes hidden-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.shorts-slide__hidden-title {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.shorts-slide__hidden-desc {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* ---------- 统一悬浮 HUD 提醒 (音量/键盘快捷键/链接复制) ---------- */
+.shorts-hud-toast {
+  position: absolute;
+  top: calc(76px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 8px 16px;
+  border-radius: 99px;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  animation: hud-toast-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes hud-toast-in {
+  from { opacity: 0; transform: translate(-50%, -15px) scale(0.92); }
+  to { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+
+/* ---------- 空 / 加载提示 ---------- */
+.shorts-empty {
+  height: 100svh;
+  display: grid;
+  place-items: center;
+  gap: 12px;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.85);
+  scroll-snap-align: start;
+}
+@supports not (height: 100svh) {
+  .shorts-empty {
+    height: 100dvh;
+  }
+}
+
+.shorts-empty__link {
+  color: #fff;
+  text-decoration: none;
+  background: rgba(255, 255, 255, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  padding: 8px 20px;
+  border-radius: 99px;
+  font-weight: 500;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  margin-top: 8px;
+  transition: all 0.2s;
+}
+
+.shorts-empty__link:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.shorts-loading {
+  height: 70px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 13px;
+  font-weight: 500;
+}

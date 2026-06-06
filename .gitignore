@@ -1,0 +1,40 @@
+node_modules
+dist
+.vite
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# 第三方源码参考，可选，详见 vendor-refs/README.md
+vendor-refs/
+OpenList-4.2.1/
+
+# 后端数据目录（SQLite + teaser/封面）
+backend/data/
+backend/config.yaml
+
+# 工具链
+tools/
+
+# 注意：backend/vendor/ 是 Go modules vendor 目录，故意入库
+# 目的是让任何人 clone 后断网也能直接 go build
+# 不要加 `vendor/` 或 `backend/vendor/` 到这里
+
+# 编译产物
+backend/server
+backend/server.*
+release/
+tsconfig.tsbuildinfo
+tmp/
+
+# 91 爬虫脚本独立运行时的默认输出文件（backend 跑时会显式 --output 到 backend/data/spider91/，所以不会落在这里）
+91porn_videos.json
+91VideoSpider/91porn_videos.json
+91VideoSpider/data/
+91VideoSpider/__pycache__/
+__pycache__/
+*.pyc
+/backend/cmd/server/build.bat
+/backend/cmd/server/server
+/backend/vendor/
