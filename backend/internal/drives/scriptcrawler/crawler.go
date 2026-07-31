@@ -1188,8 +1188,6 @@ func (c *Crawler) downloadHLSAtomic(ctx context.Context, ref MediaRef, dst, refe
 	args = append(args,
 		"-protocol_whitelist", "http,https,tcp,tls,crypto",
 		"-allowed_extensions", "ALL",
-		"-allowed_segment_extensions", "ALL",
-		"-extension_picky", "0",
 		"-i", src,
 		"-c", "copy",
 		"-bsf:a", "aac_adtstoasc",

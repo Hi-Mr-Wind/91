@@ -1002,8 +1002,6 @@ func TestCrawlerRunOnceDownloadsHLSMediaURL(t *testing.T) {
 	for _, want := range []string{
 		"\n-protocol_whitelist\nhttp,https,tcp,tls,crypto\n",
 		"\n-allowed_extensions\nALL\n",
-		"\n-allowed_segment_extensions\nALL\n",
-		"\n-extension_picky\n0\n",
 	} {
 		if !strings.Contains(argsText, want) {
 			t.Fatalf("ffmpeg args missing %q in:\n%s", strings.TrimSpace(want), string(argsData))
