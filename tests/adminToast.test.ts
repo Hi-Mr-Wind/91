@@ -27,6 +27,7 @@ function mobileCss(): string {
 
 test("admin toasts auto-dismiss and copy their text when clicked", () => {
   assert.match(toastSource, /const TOAST_DISMISS_MS = 2500/);
+  assert.match(toastSource, /const TOAST_MAX_VISIBLE = 2/);
   assert.match(toastSource, /const TOAST_COPY_SUCCESS_TEXT = "已复制到剪贴板"/);
   assert.match(toastSource, /const TOAST_COPY_ERROR_TEXT = "复制失败，请手动复制"/);
   assert.match(toastSource, /navigator\.clipboard\?\.writeText/);
@@ -48,6 +49,15 @@ test("admin toasts auto-dismiss and copy their text when clicked", () => {
   assert.doesNotMatch(toastSource, /event\.stopPropagation\(\)/);
   assert.doesNotMatch(toastSource, /onPointerEnter/);
   assert.doesNotMatch(toastSource, /onPointerLeave/);
+});
+
+test("admin toasts keep the newest two visible", () => {
+  assert.match(toastSource, /const visible = withNewToast\.slice\(-TOAST_MAX_VISIBLE\)/);
+  assert.match(toastSource, /const evicted = withNewToast\.slice\(/);
+  assert.match(toastSource, /for \(const item of evicted\) \{\s*forgetToast\(item\);/);
+  assert.match(toastSource, /setToastItems\(visible\)/);
+  assert.match(toastSource, /repeated text is refreshed and moved last/);
+  assert.doesNotMatch(toastSource, /setItems\(\(list\) => \[\.\.\.list,/);
 });
 
 test("admin toasts show long messages without internal scrolling", () => {

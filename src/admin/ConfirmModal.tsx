@@ -10,9 +10,12 @@ type ConfirmModalProps = {
   confirmText?: string;
   cancelText?: string;
   danger?: boolean;
+  plainConfirm?: boolean;
+  hideIcon?: boolean;
   centerMessage?: boolean;
   modalClassName?: string;
   loading?: boolean;
+  restoreFocus?: boolean;
   children?: ReactNode;
   onCancel: () => void;
   onConfirm: () => void;
@@ -26,9 +29,12 @@ export function ConfirmModal({
   confirmText = "确认",
   cancelText = "取消",
   danger = false,
+  plainConfirm = false,
+  hideIcon = false,
   centerMessage = false,
   modalClassName = "",
   loading = false,
+  restoreFocus = true,
   children,
   onCancel,
   onConfirm,
@@ -38,7 +44,8 @@ export function ConfirmModal({
       open={open}
       title={title}
       onClose={onCancel}
-      className={modalClassName}
+      className={`admin-modal--confirm${modalClassName ? ` ${modalClassName}` : ""}`}
+      restoreFocus={restoreFocus}
       footer={
         <>
           <button type="button" className="admin-btn" onClick={onCancel} disabled={loading}>
@@ -46,7 +53,7 @@ export function ConfirmModal({
           </button>
           <button
             type="button"
-            className={`admin-btn${danger ? " is-danger" : " is-primary"}`}
+            className={`admin-btn${plainConfirm ? "" : danger ? " is-danger" : " is-primary"}`}
             onClick={onConfirm}
             disabled={loading}
           >
@@ -55,10 +62,12 @@ export function ConfirmModal({
         </>
       }
     >
-      <div className={`admin-confirm${centerMessage ? " is-message-centered" : ""}`}>
-        <div className={`admin-confirm__icon${danger ? " is-danger" : ""}`} aria-hidden={centerMessage}>
-          <AlertTriangle size={20} />
-        </div>
+      <div className={`admin-confirm${centerMessage ? " is-message-centered" : ""}${hideIcon ? " has-no-icon" : ""}`}>
+        {!hideIcon && (
+          <div className={`admin-confirm__icon${danger ? " is-danger" : ""}`} aria-hidden={centerMessage}>
+            <AlertTriangle size={20} />
+          </div>
+        )}
         <div className="admin-confirm__content">
           <p className="admin-confirm__message">{message}</p>
           {details && details.length > 0 && (

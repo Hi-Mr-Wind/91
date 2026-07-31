@@ -1,27 +1,177 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/video-site/backend/internal/api"
+	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/fingerprint"
+	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
 )
+
+func TestHashPasswordCommandProducesBcryptHash(t *testing.T) {
+	var out bytes.Buffer
+	if err := runHashPasswordCommand(strings.NewReader("secret123"), &out); err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	hash := strings.TrimSpace(out.String())
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("secret123")); err != nil {
+		t.Fatalf("hash does not verify: %v", err)
+	}
+}
+
+func TestLoadApplicationConfigSeparatesFileAndRuntimeStoragePaths(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+storage:
+  db_path: "./data/video-site.db"
+  local_preview_dir: "./data/previews"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workingDir := t.TempDir()
+
+	fileConfig, runtimeConfig, err := loadApplicationConfig(configPath, workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileConfig.Storage.DBPath != "./data/video-site.db" ||
+		fileConfig.Storage.LocalPreviewDir != "./data/previews" {
+		t.Fatalf("file storage paths changed: %+v", fileConfig.Storage)
+	}
+	if runtimeConfig.Storage.DBPath != filepath.Join(workingDir, "data", "video-site.db") ||
+		runtimeConfig.Storage.LocalPreviewDir != filepath.Join(workingDir, "data", "previews") {
+		t.Fatalf("runtime storage paths = %+v", runtimeConfig.Storage)
+	}
+}
+
+func TestGuangYaPanLegacyRootPath(t *testing.T) {
+	credentials := map[string]string{"root_path": "  影视/电影  "}
+	if got := guangYaPanLegacyRootPath("", credentials); got != "影视/电影" {
+		t.Fatalf("legacy root path = %q", got)
+	}
+	if got := guangYaPanLegacyRootPath("folder-id", credentials); got != "" {
+		t.Fatalf("root ID should take precedence, legacy path = %q", got)
+	}
+}
+
+func TestListDriveDirChildrenPersistsFailureAndRecovery(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "drive-id",
+		Kind:   "fake",
+		Name:   "Fake Drive",
+		RootID: "root",
+		Status: "ok",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	drv := &serverListResultDrive{err: errors.New("token expired")}
+	registry := proxy.NewRegistry()
+	registry.Set("drive-id", drv)
+	app := &App{cat: cat, registry: registry}
+
+	if _, err := app.listDriveDirChildren(ctx, "drive-id", ""); err == nil {
+		t.Fatal("list directory succeeded, want provider error")
+	}
+	got, err := cat.GetDrive(ctx, "drive-id")
+	if err != nil {
+		t.Fatalf("get drive after failure: %v", err)
+	}
+	if got.Status != "error" || !strings.Contains(got.LastError, "token expired") {
+		t.Fatalf("status=%q lastError=%q, want error containing provider failure", got.Status, got.LastError)
+	}
+
+	drv.err = nil
+	drv.entries = []drives.Entry{
+		{ID: "folder-id", Name: "Movies", IsDir: true},
+		{ID: "file-id", Name: "clip.mp4", IsDir: false},
+	}
+	children, err := app.listDriveDirChildren(ctx, "drive-id", "")
+	if err != nil {
+		t.Fatalf("list directory after recovery: %v", err)
+	}
+	if len(children) != 1 || children[0].ID != "folder-id" {
+		t.Fatalf("children = %#v, want only the directory", children)
+	}
+	got, err = cat.GetDrive(ctx, "drive-id")
+	if err != nil {
+		t.Fatalf("get drive after recovery: %v", err)
+	}
+	if got.Status != "ok" || got.LastError != "" {
+		t.Fatalf("status=%q lastError=%q, want recovered ok status", got.Status, got.LastError)
+	}
+}
+
+func TestEnsureConfigAdminUserMigratesCustomConfigAdmin(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	cfg := &config.Config{}
+	cfg.Server.Admin.Username = "owner"
+	cfg.Server.Admin.Password = "secret123"
+
+	if err := ensureConfigAdminUser(ctx, cat, cfg); err != nil {
+		t.Fatalf("ensure config admin: %v", err)
+	}
+	u, err := cat.GetUserByUsername(ctx, "owner")
+	if err != nil {
+		t.Fatalf("get migrated user: %v", err)
+	}
+	if u.Role != "admin" {
+		t.Fatalf("role = %q, want admin", u.Role)
+	}
+
+	authr := &auth.Authenticator{Catalog: cat}
+	role, err := authr.UserLogin(httptest.NewRecorder(), httptest.NewRequest("POST", "/admin/api/login", nil), "owner", "secret123")
+	if err != nil {
+		t.Fatalf("login migrated user: %v", err)
+	}
+	if role != "admin" {
+		t.Fatalf("role = %q, want admin", role)
+	}
+}
 
 func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -506,7 +656,7 @@ func TestRunCrawlerMigrationAfterManualCrawlRequiresCrawlerUploadTarget(t *testi
 	}
 
 	app.runCrawlerMigrationAfterManualCrawl(ctx, "crawler-main")
-	if migrator.called != 0 {
+	if migrator.called.Load() != 0 {
 		t.Fatalf("migration called without upload target")
 	}
 
@@ -519,8 +669,8 @@ func TestRunCrawlerMigrationAfterManualCrawlRequiresCrawlerUploadTarget(t *testi
 		t.Fatalf("set upload target: %v", err)
 	}
 	app.runCrawlerMigrationAfterManualCrawl(ctx, "crawler-main")
-	if migrator.called != 1 {
-		t.Fatalf("migration calls = %d, want 1", migrator.called)
+	if migrator.called.Load() != 1 {
+		t.Fatalf("migration calls = %d, want 1", migrator.called.Load())
 	}
 }
 
@@ -563,10 +713,10 @@ func TestScheduleCrawlerUploadMigrationRunsForConfiguredCrawler(t *testing.T) {
 		t.Fatal("scheduleCrawlerUploadMigration returned false, want true")
 	}
 	deadline := time.After(time.Second)
-	for migrator.called == 0 {
+	for migrator.called.Load() == 0 {
 		select {
 		case <-deadline:
-			t.Fatalf("migration calls = %d, want 1", migrator.called)
+			t.Fatalf("migration calls = %d, want 1", migrator.called.Load())
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -598,8 +748,8 @@ func TestScheduleCrawlerUploadMigrationSkipsWithoutUploadTarget(t *testing.T) {
 	if app.scheduleCrawlerUploadMigration(ctx, "crawler-local") {
 		t.Fatal("scheduleCrawlerUploadMigration returned true without upload target")
 	}
-	if migrator.called != 0 {
-		t.Fatalf("migration calls = %d, want 0", migrator.called)
+	if migrator.called.Load() != 0 {
+		t.Fatalf("migration calls = %d, want 0", migrator.called.Load())
 	}
 }
 
@@ -662,10 +812,10 @@ func TestScheduleManualCrawlerUploadMigrationRunsWhenAssetsReady(t *testing.T) {
 		t.Fatalf("accepted = false, message = %q", message)
 	}
 	deadline := time.After(time.Second)
-	for migrator.called == 0 {
+	for migrator.called.Load() == 0 {
 		select {
 		case <-deadline:
-			t.Fatalf("migration calls = %d, want 1", migrator.called)
+			t.Fatalf("migration calls = %d, want 1", migrator.called.Load())
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -720,8 +870,8 @@ func TestScheduleManualCrawlerUploadMigrationRejectsPendingFingerprint(t *testin
 	if !strings.Contains(message, "指纹") {
 		t.Fatalf("message = %q, want fingerprint reason", message)
 	}
-	if migrator.called != 0 {
-		t.Fatalf("migration calls = %d, want 0", migrator.called)
+	if migrator.called.Load() != 0 {
+		t.Fatalf("migration calls = %d, want 0", migrator.called.Load())
 	}
 }
 
@@ -913,6 +1063,7 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 		{ID: "115", Kind: "p115", Name: "115", RootID: "0", TeaserEnabled: true},
 		{ID: "pikpak", Kind: "pikpak", Name: "PikPak", RootID: "0", TeaserEnabled: true},
 		{ID: "crawler-main", Kind: scriptcrawler.Kind, Name: "Crawler", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/crawler.py"}, TeaserEnabled: true},
+		{ID: "crawler-paused", Kind: scriptcrawler.Kind, Name: "Paused Crawler", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/paused.py", "paused": "true"}, TeaserEnabled: true},
 		{ID: "crawler-deleted", Kind: scriptcrawler.Kind, Name: "Deleted Crawler", RootID: "/", Credentials: map[string]string{}, TeaserEnabled: true},
 	} {
 		if err := cat.UpsertDrive(ctx, d); err != nil {
@@ -1328,7 +1479,8 @@ func TestCleanupDriveVideosForDeleteRemovesRowsAndGeneratedAssetsOnly(t *testing
 
 	previewPath := filepath.Join(localDir, "localstorage-local-main-file.mp4")
 	thumbPath := filepath.Join(localDir, "thumbs", "localstorage-local-main-file.jpg")
-	for _, path := range []string{previewPath, thumbPath} {
+	backgroundPath := mediaasset.ShortsBackgroundPath(localDir, "localstorage-local-main-file")
+	for _, path := range []string{previewPath, thumbPath, backgroundPath} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
@@ -1386,7 +1538,7 @@ func TestCleanupDriveVideosForDeleteRemovesRowsAndGeneratedAssetsOnly(t *testing
 	if _, err := cat.GetVideo(ctx, "pikpak-other"); err != nil {
 		t.Fatalf("other drive video missing: %v", err)
 	}
-	for _, path := range []string{previewPath, thumbPath} {
+	for _, path := range []string{previewPath, thumbPath, backgroundPath} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("generated asset %s still exists, stat err=%v", path, err)
 		}
@@ -1427,7 +1579,8 @@ func TestDeleteVideoRemovesGeneratedAssetsKeepsLocalOriginalAndTombstones(t *tes
 
 	previewPath := filepath.Join(localDir, "localstorage-local-main-file.mp4")
 	thumbPath := filepath.Join(localDir, "thumbs", "localstorage-local-main-file.jpg")
-	for _, path := range []string{previewPath, thumbPath} {
+	backgroundPath := mediaasset.ShortsBackgroundPath(localDir, "localstorage-local-main-file")
+	for _, path := range []string{previewPath, thumbPath, backgroundPath} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
@@ -1477,7 +1630,7 @@ func TestDeleteVideoRemovesGeneratedAssetsKeepsLocalOriginalAndTombstones(t *tes
 	if !deleted {
 		t.Fatal("deleted video tombstone missing")
 	}
-	for _, path := range []string{previewPath, thumbPath} {
+	for _, path := range []string{previewPath, thumbPath, backgroundPath} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("generated asset %s still exists, stat err=%v", path, err)
 		}
@@ -1546,6 +1699,13 @@ func TestDeleteVideoRemovesSourceFileWhenRequested(t *testing.T) {
 	}
 	if _, err := cat.GetVideo(ctx, "video-with-source"); err != sql.ErrNoRows {
 		t.Fatalf("deleted video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	deletedItems, _, err := cat.ListDeletedVideos(ctx, catalog.ListParams{Page: 1, PageSize: 10, IncludeSourceDeleted: true})
+	if err != nil {
+		t.Fatalf("list deleted videos: %v", err)
+	}
+	if len(deletedItems) != 0 {
+		t.Fatalf("source-deleted video kept tombstone = %#v", deletedItems)
 	}
 	for _, path := range []string{previewPath, thumbPath} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -1687,8 +1847,141 @@ func TestDeleteVideoRemovesScriptCrawlerSourceFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("check tombstone: %v", err)
 	}
-	if !deleted {
-		t.Fatal("deleted crawler video tombstone missing")
+	if deleted {
+		t.Fatal("deleted crawler source kept tombstone")
+	}
+}
+
+func TestRunBlacklistSourceDeleteMarksSuccessAndKeepsFailuresPending(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID: "source-ok", DriveID: "source-drive", FileID: "file-ok", ParentID: "parent-ok",
+			FileName: "ok.mp4", Title: "OK", Size: 123,
+			PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "source-fail", DriveID: "missing-drive", FileID: "file-fail",
+			FileName: "fail.mp4", Title: "Fail", Size: 456,
+			PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+		if err := cat.DeleteVideoWithTombstone(ctx, v.ID); err != nil {
+			t.Fatalf("tombstone %s: %v", v.ID, err)
+		}
+	}
+
+	registry := proxy.NewRegistry()
+	drv := &serverSourceRemovableFakeDrive{id: "source-drive"}
+	registry.Set(drv.ID(), drv)
+	app := &App{cat: cat, registry: registry}
+
+	app.runBlacklistSourceDelete(ctx)
+
+	wantSource := drives.SourceFile{
+		FileID: "file-ok", ParentID: "parent-ok", Name: "ok.mp4", Size: 123,
+	}
+	if drv.removedSource != wantSource {
+		t.Fatalf("removed source = %#v, want %#v", drv.removedSource, wantSource)
+	}
+	status := app.blacklistSourceDeleteStatus()
+	if status.State != "completed" ||
+		status.Running ||
+		status.Total != 2 ||
+		status.Processed != 2 ||
+		status.Deleted != 1 ||
+		status.Failed != 1 {
+		t.Fatalf("source delete status = %#v", status)
+	}
+
+	items, _, err := cat.ListDeletedVideos(ctx, catalog.ListParams{Page: 1, PageSize: 10, IncludeSourceDeleted: true})
+	if err != nil {
+		t.Fatalf("list tombstones: %v", err)
+	}
+	remaining := make(map[string]bool, len(items))
+	for _, item := range items {
+		remaining[item.ID] = true
+	}
+	if remaining["source-ok"] || !remaining["source-fail"] {
+		t.Fatalf("remaining tombstones = %#v, want only failed source", remaining)
+	}
+	pending, err := cat.CountDeletedVideosPendingSourceDeletion(ctx)
+	if err != nil || pending != 1 {
+		t.Fatalf("pending after job = %d, err=%v, want 1", pending, err)
+	}
+}
+
+func TestRunBlacklistSourceDeleteCanTargetSelectedIDs(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID: "selected-source", DriveID: "source-drive", FileID: "file-selected", ParentID: "parent-selected",
+			FileName: "selected.mp4", Title: "Selected", Size: 123,
+			PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "unselected-source", DriveID: "source-drive", FileID: "file-unselected", ParentID: "parent-unselected",
+			FileName: "unselected.mp4", Title: "Unselected", Size: 456,
+			PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+		if err := cat.DeleteVideoWithTombstone(ctx, v.ID); err != nil {
+			t.Fatalf("tombstone %s: %v", v.ID, err)
+		}
+	}
+
+	registry := proxy.NewRegistry()
+	drv := &serverSourceRemovableFakeDrive{id: "source-drive"}
+	registry.Set(drv.ID(), drv)
+	app := &App{cat: cat, registry: registry}
+
+	app.runBlacklistSourceDelete(ctx, api.BlacklistSourceDeleteRequest{IDs: []string{"selected-source"}})
+
+	wantSource := drives.SourceFile{
+		FileID: "file-selected", ParentID: "parent-selected", Name: "selected.mp4", Size: 123,
+	}
+	if drv.removedSource != wantSource {
+		t.Fatalf("removed source = %#v, want %#v", drv.removedSource, wantSource)
+	}
+	status := app.blacklistSourceDeleteStatus()
+	if status.State != "completed" ||
+		status.Total != 1 ||
+		status.Processed != 1 ||
+		status.Deleted != 1 ||
+		status.Failed != 0 {
+		t.Fatalf("source delete status = %#v", status)
+	}
+
+	items, _, err := cat.ListDeletedVideos(ctx, catalog.ListParams{Page: 1, PageSize: 10, IncludeSourceDeleted: true})
+	if err != nil {
+		t.Fatalf("list tombstones: %v", err)
+	}
+	remaining := make(map[string]bool, len(items))
+	for _, item := range items {
+		remaining[item.ID] = true
+	}
+	if remaining["selected-source"] || !remaining["unselected-source"] {
+		t.Fatalf("remaining tombstones = %#v, want only unselected source", remaining)
 	}
 }
 
@@ -1985,7 +2278,11 @@ func TestCleanupDuplicateVideoAssetsDeletesExactDuplicateRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list deleted videos: %v", err)
 	}
-	if len(deletedItems) != 1 || deletedItems[0].ID != "duplicate-video" || deletedItems[0].Reason != catalog.DeletedVideoReasonDuplicate {
+	if len(deletedItems) != 1 ||
+		deletedItems[0].ID != "duplicate-video" ||
+		deletedItems[0].Reason != catalog.DeletedVideoReasonDuplicate ||
+		deletedItems[0].CanonicalVideoID != "canonical-video" ||
+		deletedItems[0].RestorePolicy != catalog.DeletedVideoRestorePolicyNone {
 		t.Fatalf("duplicate tombstone = %#v, want reason %q", deletedItems, catalog.DeletedVideoReasonDuplicate)
 	}
 	canon, err := cat.GetVideo(ctx, "canonical-video")
@@ -2085,7 +2382,11 @@ func TestCleanupDuplicateVideoAssetsDeletesNearDuplicateRowsKeepingLargest(t *te
 	if err != nil {
 		t.Fatalf("list deleted videos: %v", err)
 	}
-	if len(deletedItems) != 1 || deletedItems[0].ID != "small-video" || deletedItems[0].Reason != catalog.DeletedVideoReasonDuplicate {
+	if len(deletedItems) != 1 ||
+		deletedItems[0].ID != "small-video" ||
+		deletedItems[0].Reason != catalog.DeletedVideoReasonDuplicate ||
+		deletedItems[0].CanonicalVideoID != "large-video" ||
+		deletedItems[0].RestorePolicy != catalog.DeletedVideoRestorePolicyNone {
 		t.Fatalf("small duplicate tombstone = %#v, want reason %q", deletedItems, catalog.DeletedVideoReasonDuplicate)
 	}
 	large, err := cat.GetVideo(ctx, "large-video")
@@ -2223,6 +2524,16 @@ type serverFakeKindDrive struct {
 func (d *serverFakeKindDrive) Kind() string { return d.kind }
 func (d *serverFakeKindDrive) ID() string   { return d.id }
 
+type serverListResultDrive struct {
+	serverFakeDrive
+	entries []drives.Entry
+	err     error
+}
+
+func (d *serverListResultDrive) List(context.Context, string) ([]drives.Entry, error) {
+	return d.entries, d.err
+}
+
 type serverRemovableFakeDrive struct {
 	serverFakeDrive
 	id            string
@@ -2264,11 +2575,11 @@ func (d *serverSourceRemovableFakeDrive) Remove(ctx context.Context, fileID stri
 }
 
 type serverFakeCrawlerUploadRunner struct {
-	called int
+	called atomic.Int32
 }
 
 func (r *serverFakeCrawlerUploadRunner) RunOnce(context.Context) error {
-	r.called++
+	r.called.Add(1)
 	return nil
 }
 

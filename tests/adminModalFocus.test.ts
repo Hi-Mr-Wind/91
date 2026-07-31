@@ -16,6 +16,14 @@ test("admin modal does not reset focus when close handler identity changes", () 
   assert.doesNotMatch(modalSource, /\}, \[open, onClose\]\);/);
 });
 
+test("admin modal can skip restoring focus to the opener", () => {
+  assert.match(modalSource, /restoreFocus\?: boolean;/);
+  assert.match(modalSource, /restoreFocus = true/);
+  assert.match(modalSource, /const restoreFocusRef = useRef\(restoreFocus\);/);
+  assert.match(modalSource, /restoreFocusRef\.current = restoreFocus;/);
+  assert.match(modalSource, /if \(restoreFocusRef\.current && previousFocus\?\.isConnected\)/);
+});
+
 test("admin modal backdrop clicks do not close dialogs", () => {
   assert.match(modalSource, /import \{ createPortal \} from "react-dom";/);
   assert.match(modalSource, /createPortal\(/);

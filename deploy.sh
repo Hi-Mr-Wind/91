@@ -130,7 +130,7 @@ apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   log "installing base packages"
   apt-get update
-  apt-get install -y ca-certificates curl git ffmpeg openssl iproute2 build-essential \
+  apt-get install -y ca-certificates curl git ffmpeg iproute2 build-essential \
     python3 python3-requests python3-bs4 python3-lxml python3-socks
 }
 
@@ -228,13 +228,6 @@ prepare_config() {
     log "backend/config.yaml already exists; keeping it"
   fi
 
-  if grep -q 'session_secret: "change-me-to-a-random-string"' "$cfg"; then
-    local secret
-    secret="$(openssl rand -hex 32)"
-    sed -i -E "s#session_secret: \".*\"#session_secret: \"$secret\"#" "$cfg"
-    log "generated a random session_secret"
-  fi
-
   ensure_ownership
 }
 
@@ -290,10 +283,12 @@ Group=${DEPLOY_GROUP}
 WorkingDirectory=${REPO_DIR}/backend
 ExecStart=${REPO_DIR}/backend/server
 Restart=on-failure
+RestartForceExitStatus=75
 RestartSec=5
 TimeoutStopSec=20
 Environment=HOME=${DEPLOY_HOME}
 Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Environment=VIDEO_RESTART_MANAGED=true
 ${env_lines}LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal

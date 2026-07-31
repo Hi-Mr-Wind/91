@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
+	"github.com/video-site/backend/internal/localpath"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,18 +22,19 @@ var (
 )
 
 type Config struct {
-	Server  Server  `yaml:"server"`
-	Storage Storage `yaml:"storage"`
-	Scanner Scanner `yaml:"scanner"`
-	Preview Preview `yaml:"preview"`
-	Nightly Nightly `yaml:"nightly"`
-	Drives  []Drive `yaml:"drives"`
+	Server       Server       `yaml:"server"`
+	Storage      Storage      `yaml:"storage"`
+	Scanner      Scanner      `yaml:"scanner"`
+	Preview      Preview      `yaml:"preview"`
+	Proxy        Proxy        `yaml:"proxy"`
+	Nightly      Nightly      `yaml:"nightly"`
+	RemoteUpload RemoteUpload `yaml:"remote_upload"`
+	Drives       []Drive      `yaml:"drives"`
 }
 
 type Server struct {
-	Listen        string `yaml:"listen"`
-	Admin         Admin  `yaml:"admin"`
-	SessionSecret string `yaml:"session_secret"`
+	Listen string `yaml:"listen"`
+	Admin  Admin  `yaml:"admin"`
 	// AllowedOrigins 是允许跨源访问的前端 Origin 白名单（如 "https://video.example.com"）。
 	// 默认空 → 不开启 CORS 跨源；同源部署（前后端在同一个域名 + 端口下）不需要配置此项。
 	// 浏览器对不在列表里的 Origin 不会拿到 Access-Control-Allow-Origin 头，自然就读不到响应。
@@ -71,9 +72,37 @@ func WriteAdminCredentials(path, username, password string) error {
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
 	}
+	out, err := rewriteAdminCredentials(b, username, password)
+	if err != nil {
+		return err
+	}
+
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm()
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, mode); err != nil {
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
+// RedactAdminCredentials clears only the configured administrator username and
+// password while preserving the rest of the YAML document, including unknown
+// fields that may belong to a newer application version.
+func RedactAdminCredentials(data []byte) ([]byte, error) {
+	return rewriteAdminCredentials(data, "", "")
+}
+
+func rewriteAdminCredentials(data []byte, username, password string) ([]byte, error) {
 	var root yaml.Node
-	if err := yaml.Unmarshal(b, &root); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	doc := ensureDocumentMapping(&root)
 	server := ensureMappingValue(doc, "server")
@@ -86,25 +115,12 @@ func WriteAdminCredentials(path, username, password string) error {
 	enc.SetIndent(2)
 	if err := enc.Encode(&root); err != nil {
 		_ = enc.Close()
-		return fmt.Errorf("encode config: %w", err)
+		return nil, fmt.Errorf("encode config: %w", err)
 	}
 	if err := enc.Close(); err != nil {
-		return fmt.Errorf("encode config: %w", err)
+		return nil, fmt.Errorf("encode config: %w", err)
 	}
-
-	mode := os.FileMode(0o644)
-	if st, err := os.Stat(path); err == nil {
-		mode = st.Mode().Perm()
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out.Bytes(), mode); err != nil {
-		return fmt.Errorf("write temp config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("replace config: %w", err)
-	}
-	return nil
+	return out.Bytes(), nil
 }
 
 func ensureDocumentMapping(root *yaml.Node) *yaml.Node {
@@ -174,6 +190,24 @@ type Storage struct {
 	LocalPreviewDir string `yaml:"local_preview_dir"`
 }
 
+// ResolveStoragePaths returns the storage configuration used by the running
+// process. Values in config.yaml remain unchanged, while every subsystem gets
+// the same absolute paths resolved from the process startup directory.
+func ResolveStoragePaths(storage Storage, baseDir string) (Storage, error) {
+	dbPath, err := localpath.Resolve(baseDir, storage.DBPath)
+	if err != nil {
+		return Storage{}, fmt.Errorf("resolve database path: %w", err)
+	}
+	previewDir, err := localpath.Resolve(baseDir, storage.LocalPreviewDir)
+	if err != nil {
+		return Storage{}, fmt.Errorf("resolve preview path: %w", err)
+	}
+	return Storage{
+		DBPath:          dbPath,
+		LocalPreviewDir: previewDir,
+	}, nil
+}
+
 type Scanner struct {
 	// IntervalSeconds 已废弃。旧版每天 02:00–07:00 窗口内按这个间隔重复扫盘；
 	// 新版统一由 nightly.cron_hour 调度，此字段被忽略，保留仅为兼容旧 yaml。
@@ -191,23 +225,38 @@ type Preview struct {
 	Segments        int    `yaml:"segments"`
 }
 
-// Nightly 是凌晨流水线（扫盘 → 91 爬虫 → 迁移）的调度配置。
+type Proxy struct {
+	// AllowForcedRelay controls whether authenticated playback clients may ask
+	// the backend to relay an otherwise redirectable stream. nil preserves the
+	// historical/default behavior (enabled).
+	AllowForcedRelay *bool `yaml:"allow_forced_relay"`
+}
+
+func (p Proxy) AllowsForcedRelay() bool {
+	return p.AllowForcedRelay == nil || *p.AllowForcedRelay
+}
+
+// Nightly 是凌晨流水线（扫盘 → 爬虫 → 迁移 → 去重维护）的调度配置。
 //
 // 一个进程只跑一条 nightly 流水线；该 cron 时间到达且当天还没跑过时触发，
-// 也可被管理后台「扫描所有网盘」按钮手动触发。MaxDuration 是软超时，超过
-// 后当前 phase 完成、后续 phase 不再启动。
+// 也可被管理后台「扫描所有网盘」按钮手动触发。
 type Nightly struct {
-	// CronHour 是每日触发整点（0–23）；默认 1 表示 01:00。
+	// CronHour 是每日触发整点；默认 1 表示 01:00。
 	CronHour int `yaml:"cron_hour"`
-	// MaxDuration 是单次流水线总耗时上限；默认 6h。
-	MaxDuration time.Duration `yaml:"max_duration"`
+}
+
+type RemoteUpload struct {
+	// DiskReserveBytes 是直链下载期间必须留给数据盘的最小可用空间。
+	DiskReserveBytes int64 `yaml:"disk_reserve_bytes"`
+	// IdleTimeoutSeconds 是响应正文连续无数据时中止任务的秒数。
+	IdleTimeoutSeconds int `yaml:"idle_timeout_seconds"`
 }
 
 // Drive 配置项中的敏感字段（Cookie / RefreshToken 等）最终由管理后台写入 DB
 // 这里保留 yaml 中的静态定义，用于启动时预置盘。生产建议只在 DB 里维护。
 type Drive struct {
 	ID     string            `yaml:"id"`
-	Kind   string            `yaml:"kind"` // quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / localstorage
+	Kind   string            `yaml:"kind"` // quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / webdav / localstorage
 	Name   string            `yaml:"name"`
 	RootID string            `yaml:"root_id"`
 	Params map[string]string `yaml:"params,omitempty"`
@@ -271,16 +320,14 @@ func (c *Config) applyDefaults() {
 	if c.Preview.Segments == 0 {
 		c.Preview.Segments = 3
 	}
-	// Nightly defaults。CronHour=0 是合法值（午夜），没法用 zero-value 单独
-	// 区分"未设"和"显式 0"。把整个 nightly 块当 sentinel —— MaxDuration==0
-	// 视为整个块缺失，重置成 (cron_hour=1, max_duration=6h)。代价：用户想配
-	// CronHour=0（午夜）必须同时显式写 max_duration（任何 >0 的值即可）。
-	// 收益：默认部署（yaml 没 nightly 块）得到 01:00 + 6h，与用户预期一致。
-	if c.Nightly.MaxDuration <= 0 {
+	if c.Nightly.CronHour <= 0 || c.Nightly.CronHour > 23 {
 		c.Nightly.CronHour = 1
-		c.Nightly.MaxDuration = 6 * time.Hour
-	} else if c.Nightly.CronHour < 0 || c.Nightly.CronHour > 23 {
-		c.Nightly.CronHour = 1
+	}
+	if c.RemoteUpload.DiskReserveBytes <= 0 {
+		c.RemoteUpload.DiskReserveBytes = 1 << 30
+	}
+	if c.RemoteUpload.IdleTimeoutSeconds <= 0 {
+		c.RemoteUpload.IdleTimeoutSeconds = 120
 	}
 }
 

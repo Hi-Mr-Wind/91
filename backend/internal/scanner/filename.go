@@ -4,15 +4,13 @@ import (
 	"path"
 	"regexp"
 	"strings"
-
-	"github.com/video-site/backend/internal/fixedtags"
 )
 
-// ParsedName 从文件名里解析出的视频元数据
+// ParsedName 从文件名里解析出的视频元数据。
+// 标签不再在这里解析——扫描器统一用 catalog 的标签匹配引擎打标。
 type ParsedName struct {
 	Title  string
 	Author string
-	Tags   []string
 }
 
 var (
@@ -37,6 +35,5 @@ func Parse(filename string) ParsedName {
 	}
 
 	out.Title = strings.TrimSpace(name)
-	out.Tags = fixedtags.MatchFilename(filename)
 	return out
 }

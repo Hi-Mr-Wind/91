@@ -1,108 +1,122 @@
+// Package fixedtags 是内置标签规则包：
+//
+//   - builtin 标签保留 AV、奶子、女大、人妻、后入、制服、美臀、口交。
+//   - 内置标签包只在初始化/旧版迁移时写入一次；之后删除标签或包含词不会自动补回。
+//
+// 每个标签携带 tagging.Rule 匹配规则（包含词），首次入库时
+// 写进 tags.match_rules；之后管理员在后台的修改优先，这里的默认值不会覆盖。
 package fixedtags
 
 import (
 	"strings"
-	"unicode"
+
+	"github.com/video-site/backend/internal/tagging"
 )
 
-var Labels = []string{"后入", "奶子", "口交", "臀", "人妻", "女大", "AV"}
+const SourceBuiltin = "builtin"
 
-var aliases = map[string][]string{
-	"后入": {"后入", "後入", "后入式", "後入式", "后进", "後進", "后位", "後位", "背入", "背后", "后背", "背后式", "后背位", "狗爬", "狗爬式", "追尾", "doggy", "doggystyle", "doggy style", "doggy-style", "backshot", "back shot", "back-shot", "from behind", "rear entry"},
-	"奶子": {"奶子", "奶", "大奶", "巨乳", "美乳", "爆乳", "丰乳", "丰胸", "大胸", "胸", "胸部", "胸器", "胸前", "揉胸", "揉奶", "揉乳", "双乳", "乳房", "乳头", "美胸", "boob", "boobs", "big boobs", "big-boobs", "tits", "titties", "titty", "breast", "breasts"},
-	"口交": {"口交", "口爆", "口活", "口射", "吹箫", "吹萧", "深喉", "吞精", "含屌", "含鸡巴", "含龟头", "舔屌", "bj", "blowjob", "blow job", "oral", "oral sex", "oral-sex", "oralsex", "fellatio"},
-	"臀":  {"臀", "屁股", "屁屁", "翘臀", "美臀", "肥臀", "巨臀", "蜜桃臀", "大屁股", "尻", "后庭", "後庭", "菊花", "肛", "肛交", "屁眼", "ass", "big ass", "big-ass", "butt", "big butt", "big-butt", "booty", "buttocks", "hip"},
-	"人妻": {"人妻", "妻子", "老婆", "太太", "少妇", "少熟", "熟女", "已婚", "良家", "人妇", "人夫", "wife", "housewife", "married", "married woman", "young wife", "milf"},
-	"女大": {"女大", "女大学生", "大学生", "女子大生", "大学", "女学生", "学生妹", "校花", "学妹", "校园", "大一", "大二", "大三", "大四", "college", "college student", "university", "university student", "campus", "coed"},
-	"AV": {"AV", "JAV", "番号", "番號"},
+// Tag 是一条内置标签定义。Aliases 仅作展示同义词；实际匹配走 Rule。
+type Tag struct {
+	Label   string
+	Source  string
+	Aliases []string
+	Rule    tagging.Rule
 }
 
+// Labels 保留旧包变量名：当前允许保留为 builtin 的全部内置标签名。
+var Labels = []string{"AV", "奶子", "女大", "人妻", "后入", "制服", "美臀", "口交"}
+
+var builtinTags = []Tag{
+	{
+		Label:  "AV",
+		Source: SourceBuiltin,
+		Rule:   tagging.Rule{MatchAVCode: true},
+	},
+	{
+		Label:  "奶子",
+		Source: SourceBuiltin,
+		Rule: tagging.Rule{
+			Keywords: []string{"奶子", "大奶", "巨乳", "美乳", "大胸", "揉胸", "揉奶"},
+		},
+	},
+	{
+		Label:  "女大",
+		Source: SourceBuiltin,
+		Rule: tagging.Rule{
+			Keywords: []string{"女大", "大一", "大二", "大三", "大四", "学妹", "学姐", "研究生"},
+		},
+	},
+	{
+		Label:  "人妻",
+		Source: SourceBuiltin,
+		Rule: tagging.Rule{
+			Keywords: []string{"人妻", "少妇", "已婚"},
+		},
+	},
+	{
+		Label:  "后入",
+		Source: SourceBuiltin,
+		Rule: tagging.Rule{
+			Keywords: []string{"后入"},
+		},
+	},
+	{
+		Label:  "制服",
+		Source: SourceBuiltin,
+		Rule: tagging.Rule{
+			Keywords: []string{"制服", "水手服", "空姐", "护士", "JK制服"},
+		},
+	},
+	{
+		Label:  "美臀",
+		Source: SourceBuiltin,
+		Rule: tagging.Rule{
+			Keywords: []string{"屁股", "翘臀", "美臀", "蜜桃臀", "大屁股"},
+		},
+	},
+	{
+		Label:  "口交",
+		Source: SourceBuiltin,
+		Rule: tagging.Rule{
+			Keywords: []string{"口交", "口爆", "口活", "深喉", "吞精"},
+		},
+	},
+}
+
+// All 返回全部内置标签定义。返回副本，调用方可安全修改。
+func All() []Tag {
+	out := make([]Tag, len(builtinTags))
+	copy(out, builtinTags)
+	return out
+}
+
+// IsBuiltinLabel reports whether label is one of the current builtin labels.
+func IsBuiltinLabel(label string) bool {
+	label = strings.TrimSpace(label)
+	for _, builtin := range Labels {
+		if strings.EqualFold(label, builtin) {
+			return true
+		}
+	}
+	return false
+}
+
+// RuleFor 返回某个内置标签的默认规则；不存在时返回零值。
+func RuleFor(label string) tagging.Rule {
+	for _, t := range All() {
+		if t.Label == label {
+			return t.Rule
+		}
+	}
+	return tagging.Rule{}
+}
+
+// AliasesFor 保留旧包函数名：返回旧版 aliases 字段的兼容值（通常为空）。
 func AliasesFor(label string) []string {
-	values := aliases[label]
-	out := make([]string, len(values))
-	copy(out, values)
-	return out
-}
-
-func MatchFilename(name string) []string {
-	text := normalize(name)
-	out := make([]string, 0, len(Labels))
-	for _, label := range Labels {
-		for _, alias := range aliases[label] {
-			if text.contains(alias) {
-				out = append(out, label)
-				break
-			}
+	for _, t := range All() {
+		if t.Label == label {
+			return append([]string(nil), t.Aliases...)
 		}
 	}
-	return out
-}
-
-type normalizedText struct {
-	lower   string
-	compact string
-	tokens  map[string]struct{}
-}
-
-func normalize(s string) normalizedText {
-	lower := strings.ToLower(s)
-	var compact strings.Builder
-	var spaced strings.Builder
-	for _, r := range lower {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			compact.WriteRune(r)
-			spaced.WriteRune(r)
-			continue
-		}
-		spaced.WriteByte(' ')
-	}
-
-	tokens := make(map[string]struct{})
-	for _, token := range strings.Fields(spaced.String()) {
-		tokens[token] = struct{}{}
-	}
-
-	return normalizedText{
-		lower:   lower,
-		compact: compact.String(),
-		tokens:  tokens,
-	}
-}
-
-func (n normalizedText) contains(alias string) bool {
-	lowerAlias := strings.ToLower(alias)
-	compactAlias := compact(lowerAlias)
-	if compactAlias == "" {
-		return false
-	}
-	if isShortASCIIWord(compactAlias) && compactAlias == lowerAlias {
-		_, ok := n.tokens[compactAlias]
-		return ok
-	}
-	if strings.Contains(n.lower, lowerAlias) {
-		return true
-	}
-	return strings.Contains(n.compact, compactAlias)
-}
-
-func compact(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-func isShortASCIIWord(s string) bool {
-	if len(s) > 3 {
-		return false
-	}
-	for _, r := range s {
-		if r > unicode.MaxASCII || (!unicode.IsLetter(r) && !unicode.IsDigit(r)) {
-			return false
-		}
-	}
-	return true
+	return nil
 }

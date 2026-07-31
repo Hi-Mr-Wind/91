@@ -1,215 +1,348 @@
-# backend
+## 快速开始
 
-视频聚合站的 Go 后端。提供三件事：
+依赖：**Go 1.23+**、**ffmpeg / ffprobe**（用于封面、预览视频、媒体探测/转码和内容级去重，必装；路径可在配置里改）。`sampled_sha256` 指纹由 Go 直接读取 Range 字节计算，不依赖 ffmpeg。SQLite 用纯 Go 驱动（modernc），无需系统库；依赖已 vendored，可离线构建。跑爬虫需要 `python3`。
 
-1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通网盘 / 光鸭网盘 / OneDrive / Google Drive / 本地存储）
-2. 视频元数据目录（SQLite）+ 扫描 + 预览视频预生成
-3. REST API（前台）+ 管理后台 + 直链代理
-4. 标签池、视频隐藏、按网盘统计和详情页来源网盘类型展示能力
+```bash
+cd backend
+go run ./cmd/server        # 首次启动自动从 config.example.yaml 生成 config.yaml，监听 127.0.0.1:9192
+go test ./...              # 单元测试；缺 ffmpeg / python3 时相关测试自动跳过
+go build -o server ./cmd/server
+```
+
+前端开发在仓库根目录 `npm run dev`，vite 会把 `/api`、`/p`、`/admin/api` 代理到 9192。所有配置项及注释见 [config.example.yaml](config.example.yaml)，正文只在涉及行为时提及个别配置。
 
 ## 目录
 
+仓库根目录是前端（Vite + React），`backend/` 是本文档描述的 Go 服务：
+
 ```
-cmd/server/main.go          入口
+91/
+  src/                      前端源码：admin/ 管理后台、pages/、components/、lib/、styles/
+  tests/                    前端测试（node --test）
+  index.html  public/       前端入口与静态资源
+  scripts/  .github/        构建脚本与 CI
+  install.sh  start.sh      一键安装、本地启动前后端
+  deploy.sh  Dockerfile     部署
+  backend/                  Go 服务，见下
+```
+
+`backend/` 的主干：
+
+```
+cmd/server/                 入口：加载配置、挂载网盘、注册路由、跑启动迁移
 internal/
+  api/                      前台接口与管理后台路由
+  auth/                     管理员登录、会话、失败封禁
+  catalog/                  SQLite 元数据与标签
   config/                   YAML 配置
-  catalog/                  SQLite 元数据
+  drives/                   网盘抽象 + 12 个驱动（含 Python 爬虫、站内上传）
+  scanner/                  扫盘落库、文件名解析
+  preview/                  ffmpeg 抽封面、生成预览视频
+  proxy/                    播放直链代理与 302 策略
+  fingerprint/              跨盘去重指纹
+  nightly/                  每日维护流水线
+  crawlerupload/            把爬虫产物迁移到目标网盘
+  remoteupload/             公网视频直链的安全下载与持久化单 worker
+  …                         转码、标签、字幕、相似度、路径与文件名规则等小包
+data/                       运行时数据：主库、封面、上传、爬虫产物（不在版本库）
+```
+
+<details>
+<summary>完整目录（每个包和关键文件）</summary>
+
+### backend/
+
+```
+cmd/
+  server/                   服务入口与装配
+    main.go                 启动、加载配置、跑启动期迁移
+    app.go app_status.go    应用状态、按盘的预览开关
+    http.go                 chi 路由、CORS、真实 IP 解析
+    drives.go               按 kind 构造并挂载网盘
+    crawlers.go             脚本爬虫任务调度与凭证
+    generation.go           封面 / 预览视频的重生入口
+    blacklist.go            历史「隐藏」视频迁移为黑名单墓碑
+    tag_maintenance.go      启动期标签迁移与清理
+    video_maintenance.go    本地上传文件名迁移 + 夜间全库去重（精确指纹、标题/封面近重复）
+    video_maintenance_content.go
+                            夜间内容级去重通道：时长相等的视频比较 teaser 对齐帧
+  dedupe-dryrun/            预演内容级去重会删哪些视频（默认只读；-apply 真正执行）
+  diag-115/ list-115-yingshi/ list-yingshi-children/ trace-parents/
+                            一次性诊断工具，读库里的 115 cookie 列目录 / 追父目录，不参与服务运行
+
+internal/
+  api/                      REST 路由
+    api.go                  前台接口：首页、列表、搜索、详情、点赞、收藏、字幕
+    home_recommendations.go 首页推荐
+    shorts_feed.go          短视频模式取流
+    video_shares.go         一次性免登录分享链接
+    storage_usage*.go       存储占用接口（含 unix / windows 分支）
+    admin_*.go              管理后台：登录、网盘、爬虫、视频、重复复核、标签、用户、设置
+  auth/                     管理员 session、密码哈希、登录失败封禁
+  catalog/                  SQLite 元数据层
+    catalog.go              视频、网盘、扫描状态
+    tag_*.go                标签 CRUD、匹配、分类、迁移、维护
+    duplicate_review.go     疑似重复复核队列
+    users.go video_shares.go
+  config/                   YAML 配置与默认值
   drives/
-    iface.go                Drive 接口
+    iface.go                Drive 接口 + 可选能力（Remover、GenerationStreamProvider 等）
     quark/                  夸克（自己实现，参考 OpenList quark_uc）
     p115/                   115（壳子 + SheltonZhu/115driver）
+    p123/                   123网盘（含扫码登录）
     pikpak/                 PikPak（自己实现，参考 OpenList pikpak）
     wopan/                  联通网盘（壳子 + OpenListTeam/wopan-sdk-go）
     guangyapan/             光鸭网盘（参考 AList GuangYaPan）
     onedrive/               OneDrive（OpenList 在线续期 + Microsoft Graph 文件接口）
-    googledrive/            Google Drive（OpenList 在线续期 + Google Drive API；播放走后端代理）
+    googledrive/            Google Drive（自建 OAuth 续期 + Google Drive API；播放走后端代理）
+    webdav/                 标准 WebDAV（扫描、代理播放、上传、移动和删除）
     localstorage/           本地目录扫描（服务器已有视频目录）
-  scanner/                  扫目录 → 落库
-  preview/                  ffmpeg 抽封面和生成多段预览视频
-  proxy/                    /p/stream/*、/p/preview/* 代理
-  auth/                     管理员 session
-  api/                      REST 路由
+    localupload/            站内上传的伪网盘，文件落在 data/uploads/
+    scriptcrawler/          自定义 Python 爬虫驱动
+      crawler.go runtime.go 进程管理、事件流解析、v1/v2 协议校验与超时兜底
+      metadata.go           CRAWLER_NAME / CRAWLER_PROTOCOL 解析
+      dryrun*.go            后台「测试脚本」，含跨平台进程组终止
+      neardupe.go           入库前的近重复判定
+  scanner/                  扫目录 → 落库；filename.go 从文件名解析标题和作者
+  preview/                  ffmpeg 抽封面、生成多段预览视频，含 worker 队列与限流冷却
+  fingerprint/              采样 SHA256 指纹 worker，用于跨盘的文件级去重
+  transcode/                探测是否需要转码 + 转码 worker
+  proxy/                    /p/stream/*、/p/preview/* 代理与 302 直链策略
+  streamhttp/               共享的重定向策略，跳转时不泄漏网盘凭据
+  nightly/                  每日一条维护流水线：扫盘 → 爬虫 → 上传迁移 → 去重维护
+  crawlerupload/            把爬虫落地的视频迁移到目标网盘并改写 catalog 行
+  remoteupload/             视频直链任务、SSRF 防护、磁盘保护和下载 worker
+  tagging/                  标签匹配规则、番号识别
+  fixedtags/                内置标签包及其匹配规则
+  mediasim/                 标题相似度 + 封面 SSIM + teaser 帧签名，供近重复判定使用
+  mediaasset/               封面 / 预览视频及派生资源的本地路径与文件名规则
+  videoname/                扫描、上传、爬虫迁移共用的文件名与标题规则
+  storageusage/             磁盘与各网盘占用统计
+
+docs/
+  CRAWLER_PROTOCOL.md       crawler.v2 脚本协议
+  DEDUP.md                  去重体系：信号、阈值、时机与流程图
 config.example.yaml         配置模板
+vendor/                     依赖已 vendored，可离线构建
 ```
 
-## 开发环境（Windows）
-
-本仓库假设工具都装在用户目录，不需要管理员权限。
+以下由运行时生成，不在版本库里：
 
 ```
-C:\Users\<you>\tools\
-  go\bin\go.exe             Go 1.23+
-  ffmpeg\bin\ffmpeg.exe     任意 ≥ 4.x 版本
+config.yaml                 首次启动从 config.example.yaml 复制
+data/video-site.db          SQLite 主库
+data/previews/              预览视频及本地媒体资产根目录（storage.local_preview_dir）
+data/previews/thumbs/       普通封面
+data/previews/thumbs-shorts-bg/
+                            Shorts 按需生成的 96px 预模糊背景封面
+data/previews/framesigs/    内容级去重的帧签名缓存（约 110KB/视频，删了会自动重建）
+data/uploads/               站内上传的视频
+data/scriptcrawlers/        爬虫落地的视频
+data/crawler-scripts/       后台导入的爬虫 .py 脚本
 ```
 
-并加到 `PATH`。
+</details>
 
-### 第一次启动
+## 运行流程
 
-Git Bash / WSL 环境推荐从仓库根目录启动完整开发环境：
+### 总览
 
-```bash
-npm install
-./start.sh               # 默认前端 production preview，无热更新
+```mermaid
+flowchart TB
+    subgraph TRIG["触发源"]
+        BOOT["进程启动"]
+        CRON["nightly 每日 cron_hour"]
+        ADMIN["管理后台操作"]
+        USER["前台用户请求"]
+    end
+
+    subgraph INGEST["入库：视频从哪来"]
+        SCAN["scanner 扫盘<br/>列目录 → 解析文件名 → 落库"]
+        CRAWL["scriptcrawler 爬虫<br/>Python 子进程 → JSON Lines 事件"]
+        UPLOAD["localupload 站内上传"]
+    end
+
+    CAT[("catalog · SQLite<br/>视频 / 网盘 / 标签 / 用户")]
+
+    subgraph GEN["异步生成：每盘一组 worker"]
+        THUMB["ThumbWorker 封面"]
+        PREV["Worker 预览视频"]
+        FP["fingerprint 采样哈希"]
+        TRANS["transcode 转码<br/>仅后台手动启动"]
+    end
+
+    DISK[("data/previews · data/uploads<br/>本地封面与预览")]
+
+    subgraph PLAY["播放"]
+        LIST["/api/home · /api/list · /api/video/{id}"]
+        PROXY["/p/stream 取直链"]
+        R302["302 浏览器直连网盘 CDN"]
+        RELAY["后端中转字节"]
+    end
+
+    MIG["crawlerupload<br/>爬虫产物迁移到目标网盘"]
+    DEDUP["夜间去重维护<br/>全库硬去重（docs/DEDUP.md）"]
+
+    BOOT --> SCAN
+    CRON --> SCAN
+    CRON --> CRAWL
+    CRON --> MIG
+    CRON --> DEDUP
+    ADMIN --> SCAN
+    ADMIN --> CRAWL
+    ADMIN --> TRANS
+    USER --> UPLOAD
+    USER --> LIST
+
+    SCAN --> CAT
+    CRAWL --> CAT
+    UPLOAD --> CAT
+    MIG --> CAT
+    DEDUP --> CAT
+
+    CAT --> THUMB
+    CAT --> PREV
+    CAT --> FP
+    THUMB --> DISK
+    PREV --> DISK
+    FP --> CAT
+    TRANS --> CAT
+
+    CAT --> LIST
+    LIST --> PROXY
+    PROXY -->|"115 / PikPak / OneDrive / 123 / 联通 / 光鸭"| R302
+    PROXY -->|"Google Drive / 本地 / WebDAV 返回 200·206"| RELAY
+    DISK --> LIST
 ```
 
-需要前端开发热更新时再用 `FRONTEND_MODE=dev ./start.sh --restart`。
+### 1. 启动装配
 
-PowerShell 下可以分两个终端手动启动，后端命令如下：
+`cmd/server/main.go` 的顺序是刻意安排的：
 
-```powershell
-cd F:\VideoProject\backend
-go run ./cmd/server
+1. 读 `config.yaml`（缺失则从模板复制）、建 `data/` 目录、打开 SQLite。
+2. 挂载本地内置盘（`localupload`），启动指纹补扫协程。
+3. 恢复视频直链任务：删除中断的 `.part`，把执行中任务从字节 0 重新排队，并启动唯一下载 worker。
+4. 装配 `api.Server` / `api.AdminServer`，注册 chi 路由，挂前端静态资源。
+5. **先监听端口**，再 `go attachExistingDrives(ctx)` 异步挂载云盘。云盘挂载要校验上游登录态，放在监听之前会拖慢启动。
+6. 启动 nightly 流水线协程，等待退出信号；HTTP 服务关闭后会等待直链 worker 中止请求、清理临时文件并重新排队未完成任务。
+
+启动期还会跑一次性迁移：孤儿视频清理、config 管理员写入 users 表、隐藏视频转黑名单墓碑、标签迁移。
+
+每挂载一个盘，就为它单独起 **封面 / 预览 / 指纹三个 worker**，并注册一个可独立取消的 context —— 后台「停止该盘任务」就是取消这个 context。
+
+### 2. 入库的四条路径
+
+| 路径 | 触发 | 关键行为 |
+|---|---|---|
+| 扫盘 | 夜间流水线、后台「重新扫描」 | 递归列目录，按扩展名过滤，`videoname` 解析标题/作者，`UpsertVideo` 落库 |
+| 爬虫 | 夜间流水线、后台「重新扫描」（爬虫盘等同触发爬取） | 启动 Python 子进程，读 stdout 的 JSON Lines 事件流，逐条下载入库 |
+| 上传 | 前台 `POST /api/upload` | 落到 `data/uploads/`，直接入库并立即排生成队列 |
+| 视频直链 | 上传页 `POST /api/upload/remote` | 持久化后台下载，校验视频流后落到 `data/uploads/`，复用上传生成队列 |
+
+扫盘结束后还有一步**删除检测**：本轮见到的 `file_id` 集合之外、且父目录在本轮走过的视频，判定为已从网盘删除。若本轮有目录报错（`stats.Errors > 0`）则整轮跳过检测 —— 宁可漏删，不可把「暂时列不出来」误判成「用户删了」。爬虫盘和站内上传不参与这个检测，它们有自己的生命周期。
+
+#### 视频直链后台任务
+
+上传页的「视频直链」只对管理员开放。创建接口立即返回 `202`，页面通过 `GET /api/upload/remote?limit=20` 展示最近任务；排队或执行中的任务可调用 `POST /api/upload/remote/{jobId}/cancel` 取消。任务保存在 `remote_upload_jobs`，严格由一个 FIFO worker 串行下载，页面刷新或关闭不影响。服务重启会删除中断任务的临时文件并从头下载；普通网络错误不自动重试，重新提交链接即可。完成、失败和取消记录保留 7 天，进入任一终态时原始 URL 会立即从数据库清空，API 和日志始终只使用不含查询参数的主机与路径标签。
+
+直链下载的边界刻意较窄：
+
+- 只接受公网 `http` / `https` 文件 URL，不接受 userinfo、HLS/m3u8、内网/NAS、网页解析或网盘分享页。
+- 不提供 Cookie、Referer 或自定义请求头，因此依赖这些鉴权信息的链接不支持；URL 自身带的签名查询参数可以使用，但不会出现在任务响应、错误或日志里。
+- 独立 HTTP transport 不读取环境代理。提交、DNS 解析、实际拨号和每次重定向都会拒绝回环、私网、链路本地、组播、未指定、CGNAT和云元数据地址；最多跟随 5 次重定向。
+- 连接、TLS 和响应头阶段各有 30 秒超时。下载没有业务大小或总时长上限，但正文连续无数据达到 `remote_upload.idle_timeout_seconds`（默认 120 秒）会失败。
+- 已知 `Content-Length` 时会先检查空间，写入每个数据块前也会继续检查，始终保留 `remote_upload.disk_reserve_bytes`（默认 1 GiB）。临时 `.part` 与最终视频在同一 `data/uploads/` 文件系统中。
+- 下载结束后必须由 `ffprobe` 确认存在视频流，并只接受 AVI、MKV、MOV、MP4 或 WebM。标题优先级为显式标题、`Content-Disposition` 文件名、最终 URL 文件名、原始 URL 文件名，沿用本地上传的文件名安全与同名冲突规则。
+- 最终文件、视频记录、人工标签和任务完成状态按可恢复流程提交；失败会清理文件和数据库记录。成功后仍调用 `OnVideoUploaded`，继续生成封面、预览和指纹。
+
+### 3. 播放链路
+
+```mermaid
+sequenceDiagram
+    participant B as 浏览器
+    participant A as api
+    participant P as proxy
+    participant D as drive
+    participant C as 网盘 CDN
+
+    B->>A: GET /api/video/{id}
+    A-->>B: 元数据 + videoSrc=/p/stream/{drive}/{file}
+    B->>P: GET /p/stream/...（带 session）
+    P->>P: 查链接缓存（最长 5m；UA 绑定链接的 key 含 UA）
+    alt 缓存未命中且没有同 key 换链
+        P->>D: StreamURL 取直链（15s 硬超时）
+        D-->>P: StreamLink：URL + Headers + Expires
+    else 已有同 key 换链
+        P->>P: 等待并复用同一个 inflight 结果
+    end
+    alt 自签名 URL 的网盘
+        P-->>B: 302 Location
+        B->>C: 直连拉流，不占服务端带宽
+    else 需要请求头鉴权
+        P->>C: 带 Header 请求，透传 Range
+        C-->>P: 206 分片
+        P-->>B: 转发字节
+    end
 ```
 
-首次启动会在当前目录创建：
+设计要点：
 
-- `config.yaml`（从 `config.example.yaml` 复制）
-- `data/video-site.db`
-- `data/previews/`
+- **302 白名单**只放「URL 自带签名、不依赖持久请求头」的网盘：115、PikPak、OneDrive、123网盘、联通、光鸭。Google Drive 的下载地址必须带 `Authorization`，只能中转；WebDAV 遵循上游 —— 上游给 3xx 就把不含凭据的直链交给浏览器，给 200/206 就由后端转发。
+- **链接缓存最长 5 分钟**，且要求离 `link.Expires` 至少还有 15 秒；最多保留 2048 项，满时淘汰最久未使用项。115 等 UA 绑定链接的 cache key 包含 UA。
+- 同一个 cache key 的并发请求只发起一次换链，其他请求等待同一个 inflight 结果；换链有 15 秒硬超时，即使某个 driver 不响应 context，也会清掉 inflight 并唤醒等待者。
+- `/api/shorts/next` 会在后台预热返回批次中前两条可代理视频的直链，不传输媒体字节；全局最多同时 4 个预热任务，真实播放与预热共用上述缓存和 inflight。
+- 每次取链和中转的结果都会回写网盘健康状态。浏览器主动断开、单个文件 404 不算网盘故障，只有真正影响整盘的错误才标记异常。
+- 播放器的「三屏画面」可以带 `?tripleScreenRelay=1` 请求强制中转（WebGL 需要同源帧），受 `proxy.allow_forced_relay` 开关控制。
 
-默认监听 `127.0.0.1:9192`。首次部署如果仍是默认管理员配置，登录页会要求先设置用户名和密码，并写回 `config.yaml`。如果本地已有旧的 `config.yaml`，请确认 `server.listen` 与前端代理端口一致。
+### 4. 异步生成
 
-### 连接前端
+新视频入库即入队，队列按 video ID 去重，避免同一视频重复排队；每处理完一条 worker 休眠 500ms 节流。
 
-`vite.config.ts` 已经把 `/api`、`/p`、`/admin/api` 代理到 `127.0.0.1:9192`。
+- **封面**：`ffprobe` 探时长 → `ffmpeg` 抽帧。
+- **Shorts 背景封面**：第一次请求 `/p/thumb/{videoID}?variant=shorts-bg` 时，从普通封面按需生成最长边 96px、预先模糊的 JPEG，后续直接复用；普通封面更新后会自动刷新。它计入封面存储占用，并随视频或网盘删除一起清理。
+- **预览视频**：30 秒以下最多 3 段、30 秒及以上固定 4 段，每段 3 秒。取点区间按时长分档：10 分钟以上在 20%–80% 之间均匀取，30 秒到 10 分钟避开片头片尾（5% 或 3 秒起、85% 前结束），30 秒以下从 10% 起。拼接后校验确有视频流；段数不足时只有在明确的降级路径下才接受 2 段，并留日志。⚠️ **选段起点只由时长决定**——这是内容级去重（[docs/DEDUP.md](docs/DEDUP.md)）帧对齐的正确性依赖，改选段算法必须同步评估那边。
+- **指纹**：读少量 Range 片段算 `sampled_sha256`，用于跨盘去重。除入库即时入队外，还有每分钟一次的补扫协程捞 `pending`。
+- **转码**：不自动跑，由后台按盘手动启动。候选按扩展名圈定：webm（规范上只装浏览器必播编码）和 strm（远程引用）除外都算候选——mp4/m4v 容器兼容但可能装着 MPEG-4 Part 2 / HEVC 等浏览器解不了的视频轨（表现为黑屏有声音）。云盘候选先用 `ffprobe` 远程探测直链（Range 只读容器元数据，MB 级流量），编码兼容的直接标 `skipped` 零下载跳过，需要转码的才整文件下载；mp4/m4v 远程探测失败标 `failed` 等重试，不做整文件下载兜底，避免系统性探测失败时把全库 mp4 拉一遍。单条视频可用 `go run ./cmd/transcode-one <videoID>` 立即处理（走同一流程，目前仅支持 p115）。
 
-```
-npm run build       构建前端静态资源
-npm run preview     前端 9191，无热更新
-go run ./cmd/server 后端 9192
-```
+**限流冷却**是这一层的横切设计：上游返回 429 / 403 / `activityLimitReached` 这类信号时，整盘进入冷却期，任务保留 `pending` 等下轮，而不是标记失败。联通和光鸭默认冷却 10 分钟。115 的签名链接被提前拒绝时会刷新一次直链重试。
 
-## 添加一个盘
+### 5. 夜间流水线
 
-推荐在前端管理后台 `/admin/drives` 新增网盘。保存后会立即挂载并触发扫描；视频结果可在 `/admin/videos` 按网盘查看，每页 100 条，页面会同时显示各网盘预览视频已生成、待生成、失败数量。
+每天 `cron_hour` 跑一次，后台「扫描所有网盘」按钮触发同一条流水线。五个阶段**串行**；Phase 1 和 Phase 2 结束时都会等待封面、预览和指纹三个生成队列排空：
 
-也可以直接调用后端接口：
-
-1. 先在浏览器访问 `/login` 完成首次管理员设置，或使用已有管理员账号登录：`POST /admin/api/login`
-2. 新建盘：`POST /admin/api/drives`
-   ```json
-   {
-     "id":   "my-quark",
-     "kind": "quark",
-     "name": "我的夸克盘",
-     "rootId": "0",
-     "credentials": {
-       "cookie": "粘贴浏览器 F12 复制的 pan.quark.cn Cookie"
-     }
-   }
-   ```
-3. 手动触发扫描：`POST /admin/api/drives/my-quark/rescan`
-
-各网盘的凭证字段：
-
-| kind   | credentials 字段                                              |
-|--------|---------------------------------------------------------------|
-| quark  | `cookie`                                                      |
-| p115   | `cookie`（形如 `UID=...; CID=...; SEID=...; KID=...`）         |
-| pikpak | `username`、`password`（token、验证码和设备 ID 由服务端自动处理并保存） |
-| wopan  | `access_token`、`refresh_token`，可选 `family_id`              |
-| guangyapan | 推荐后台扫码登录自动写入 `access_token`、`refresh_token`；也可手工填写 token；可选 `root_path` |
-| onedrive | `refresh_token` |
-| googledrive | 默认只需 `refresh_token`；自建 OAuth 客户端模式还需 `use_online_api=false`、`client_id`、`client_secret` |
-| localstorage | `path`（服务器上的已有视频目录，如 `/mnt/videos`） |
-
-### PikPak 速度说明
-
-`disable_media_link` 默认按 `true` 处理，会使用 PikPak 的 `web_content_link` 原始下载链接；在当前服务器实测，单连接通常只有约 2.8-3 MiB/s。把该字段设置为 `false` 后，驱动会请求 `usage=CACHE` 并优先使用 `medias[].link.url`，当前服务器实测 `/p/stream` 64 MiB Range 可到约 8.9 MiB/s。
-
-当前服务器同时存在 sing-box TUN 透明代理，PikPak 默认出站会被 `tun0` 接管；但强制直连物理网卡并没有更快，慢速的主要差异来自 PikPak 取链方式。media/cache CDN 节点仍有波动，偶尔可能遇到慢节点；如果播放变慢，可重新获取直链或重新挂载 PikPak 后再测。
-
-OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/renewapi` 在线刷新 token，不需要配置 Azure 应用的 `client_id` / `client_secret` / `redirect_uri`。后台新建 OneDrive 时只需要填 OpenList 代刷得到的 `refresh_token`；服务端会默认挂载根目录并自动回写新 token。
-
-Google Drive 默认按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/renewapi` 刷新 token。后台新建 Google Drive 时只需要填 OpenList Google Drive 获取到的 `refresh_token`。如果不想依赖 OpenList 在线 API，可以关闭“使用 OpenList 在线续期 API”，并填写同一个 Google OAuth 客户端授权得到的 `refresh_token`、`client_id`、`client_secret`，服务端会直接请求 Google OAuth token 接口续期。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。
-
-## 文件名约定
-
-扫描器按以下顺序解析文件名，用于提取标题和作者：
-
-1. `[前缀] 标题 - 作者.mp4`
-2. `[前缀] 标题.mp4`
-3. `标题 - 作者.mp4`
-4. `标题.mp4`
-
-开头的 `[前缀]` 只会从标题里剥离，不会按分隔符作为任意标签入库。视频标签来自三类规则：
-
-1. 文件名、作者和目录名命中系统标签或已有标签的标签名 / 别名。
-2. 符合条件的目录名会自动创建 `collection` 合集标签，并给同目录视频打上该标签。
-3. 常见番号类噪声会统一归并到 `AV`，避免把每个番号都变成独立标签。
-
-当前内置系统标签为：`后入`、`奶子`、`口交`、`臀`、`人妻`、`女大`、`AV`。解析结果可在管理后台覆盖；手动保存后，该视频会标记为人工标签，后续扫描不会再自动覆盖。
-
-## 视频去重
-
-项目有三层去重：
-
-1. 同一网盘同一文件按 `(drive_id, file_id)` 形成稳定视频 ID，重复扫描只更新同一行。
-2. 扫描时优先按网盘侧 `content_hash` 去重；没有 hash 时退化为 `file_name + size_bytes`。
-3. 扫描、本地上传或服务启动挂载网盘后，后台指纹 worker 会异步读取视频的少量 Range 片段，生成 `sampled_sha256`。前台列表、首页、搜索、推荐会按 `size_bytes + sampled_sha256` 只展示最早入库的 canonical 视频。
-
-`sampled_sha256` 是文件级去重：适合识别同一个视频文件被复制到 115 / PikPak / OneDrive / Google Drive 等不同网盘的情况。它不会删除任何网盘文件，也不用于识别转码、裁剪、加水印后的同源视频。
-
-封面和预览视频仍然优先生成，不等待指纹完成。夜间流水线最后会做一次重复资产清理：对 `size_bytes + sampled_sha256` 命中的非 canonical 视频，只删除本机生成的重复封面和预览视频，并把对应字段重置为 `pending`。网盘原文件和视频元数据记录不会被删除；如果 canonical 视频以后被移除，这些重复项会重新进入生成队列。
-
-## 管理能力
-
-- `/admin/drives`：新增、编辑、删除网盘，触发扫描。
-- `/admin/videos`：按网盘筛选视频，每页 100 条分页，查看各网盘预览视频统计，编辑标题/作者/分类/标签，单条或全量重生预览视频；拉黑视频页可查看被删除或被隐藏的视频，并支持移出黑名单后在下次扫盘重新入库。
-- `/admin/tags`：新增标签并用内置规则自动匹配已有视频；删除非系统标签时会从所有视频上同步移除该标签。
-- 播放页视频信息会展示来源网盘类型，并提供删除入口。被删除或被隐藏的视频会进入黑名单，不会再出现在首页、列表、搜索和详情接口中；在后台移出黑名单后，会在下次扫盘时重新发现并入库。
-
-## 预览视频生成
-
-scanner 扫到新视频会把 `(driveID, videoID)` 丢进 worker 队列。worker 会先用 `ffprobe` 探测时长，再用 `ffmpeg` 抽封面和生成无声预览视频：
-
-```
-ffmpeg -ss <起点> -headers "UA/Cookie/Referer" -i <直链> \
-       -t 3 -an -vf scale=480:-2 -c:v libx264 -preset veryfast -crf 28 \
-       -movflags +faststart -y <local>.mp4
+```mermaid
+flowchart LR
+    P1["Phase 1<br/>扫所有云盘<br/>+ 删除检测"] --> W1{{"等封面/预览/指纹队列排空"}}
+    W1 --> P2["Phase 2<br/>跑脚本爬虫"]
+    P2 --> W2{{"等封面/预览/指纹队列排空"}}
+    W2 --> P3["Phase 3<br/>爬虫产物上传到目标网盘"]
+    P3 --> P4["Phase 4<br/>扫爬虫本地目录<br/>恢复已解除拉黑的视频"]
+    P4 --> P5["Phase 5<br/>全库去重维护"]
 ```
 
-当前策略是每段固定 3 秒；30 秒以下最多 3 段，30 秒及以上固定 4 段；长视频在 20% 到 80% 区间均匀取段。生成的预览视频和封面都只保存在本地 `data/previews/`，不会回写到网盘；旧数据中的 `preview_file_id` 会被忽略。
+流水线返回后（包括阶段仅记录错误、整体仍正常返回的情况），会把本次启动日期写入 `settings` 表的 `nightly.last_run_date`；同一天不再自动触发，管理员仍可手动重跑。如果进程在流水线返回前崩溃，日期尚未写入，重启后仍处于 `cron_hour` 时可能再次执行。流水线没有固定时长上限 —— 网盘冷却可能让某个阶段跑很久。标签匹配**不在**流水线里全库重算，它是事件驱动的：新视频入库和管理员改标签规则时即时刷新。
 
-服务启动或网盘重新挂载时，如果预览视频开关已开启，后端会把历史 `pending` 任务重新入队，避免重启后长期停在“待生成”。OneDrive 扫盘和直链生成预览视频 / 封面时可能触发 Microsoft Graph 429、`TooManyRequests`、`activityLimitReached` 或 throttled 文本；Google Drive 可能返回 429、`usageLimits`、`userRateLimitExceeded`、`downloadQuotaExceeded` 等限制标识。后端会识别这类错误并让当前网盘进入冷却期，保留任务为 `pending`，避免连续请求触发更严重限流。扫盘阶段会按 `Retry-After` 或默认冷却时间等待后继续当前目录。
+### 6. 去重体系
 
-前端卡片的 `previewSrc` 统一指向 `/p/preview/<videoID>`，后端只从本地 `preview_local` 文件读取。
+去重分布在视频生命周期四个时机，外加人工复核兜底——完整的信号定义、阈值、判定流程图见 **[docs/DEDUP.md](docs/DEDUP.md)**。一段话版本：
 
-## 验证
+- **文件级**：`(drive_id, file_id)` 表示同一个源文件；扫描按 `content_hash`（哈希缺失或未命中时以 `file_name + size_bytes` 弱兜底）跳过重复，前台软过滤还会使用 `size_bytes + sampled_sha256`。夜间 Phase 5 的精确硬去重只按 `size_bytes + sampled_sha256` 分组。
+- **内容级**：teaser 选段只由时长决定，时长几乎相等的视频比较对齐帧 SSIM（中位数 ≥0.92 判重，时长精确相等时另有交叉匹配兜底），能抓标题、封面完全对不上的跨源转码副本；爬虫导入时同样启用，重复视频在上传网盘前就被挡下。
+- **人工兜底**：夜间内容通道会把对齐中位数落在 `[0.80, 0.92)` 的疑似对写入 `duplicate_review_pairs`，由后台「重复复核」页并排裁决。
+- **删除语义**：一律打 `reason=duplicate` 墓碑 + 指向保留项，清理本地 teaser、普通封面、Shorts 背景封面和帧签名，**不删网盘源文件**；墓碑阻止重新入库，可在黑名单恢复。
 
-```bash
-# 前端，在仓库根目录执行
-npm run lint
-npm run build
-node --test tests/previewIntent.test.ts
+### 7. 鉴权与分享
 
-# 后端，在 backend/ 执行
-go test ./... -count=1
-```
+用户体系两级：`admin` / `user`，没有开放注册，账号由管理后台创建（首次部署时引导设置管理员）。前台的浏览、播放、上传、点赞全部要求登录；`admin` 额外能进管理后台。
 
-## 部署到 Linux
+前台接口、`/p/stream`、`/p/preview`、`/p/thumb` 全部在鉴权组内，代理路由同样要登录，防止绕过 API 直接拉流。管理接口再加一层管理员校验。
 
-推荐先使用根目录的预编译安装脚本：
+登录失败 3 次永久封禁来源 IP，只能后台手动解除；只信任本机代理传来的 `X-Forwarded-For` / `X-Real-IP`。
 
-```bash
-sudo bash install.sh
-```
+一次性分享是独立链路：`POST /api/share/consume` 用一次性 token 换一个 HttpOnly 分享会话，之后 `/p/share/{shareID}/*` 每次请求都校验该会话，且只能访问绑定的那一个视频。链接首次打开后即失效。
 
-它会从 GitHub Release 下载预编译包，安装运行依赖、写入 systemd 服务并启动。下面是手动部署方式，适合你想自己接管构建和服务管理时使用。
+### 8. 日志与排查
 
-```bash
-# 交叉编译
-GOOS=linux GOARCH=amd64 go build -o video-server ./cmd/server
-
-# 目标机
-sudo apt install ffmpeg
-scp video-server user@host:/opt/video-site/
-ssh user@host
-cd /opt/video-site
-cp config.example.yaml config.yaml
-# 改密码、监听地址
-./video-server
-```
-
-配 systemd + nginx 反代到 `/` 和 `/api`、`/p`、`/admin`。
+- 一键脚本部署（systemd）：`journalctl -u video-site-backend` / `-u video-site-frontend`；`start.sh` 模式日志在 `$LOG_DIR`（默认 `/tmp/video-site-91/`）。
+- 后端日志按模块带前缀，直接 grep：`[scanner]`、`[scriptcrawler]`、`[nightly]`、`[dedupe-maintenance]`、`[duplicate-review]`、`[local-upload-maintenance]` 等。爬虫 Python 子进程的输出并入后端日志。
+- 常见排查入口：网盘异常看后台网盘页的健康状态与 `lastError`；预览/封面卡住多半是上游限流，等冷却期过或看 `[nightly]` 是否在等队列排空；去重删了什么搜 `duplicate deleted`，拿不准的对搜 `near-miss`。

@@ -24,6 +24,7 @@ export function normalizeVideoReturnPath(path: string, origin = browserOrigin())
   if (origin && url.origin !== origin) return null;
   if (!url.pathname.startsWith("/")) return null;
   if (url.pathname === "/login") return null;
+  if (url.pathname === "/share" || url.pathname.startsWith("/share/")) return null;
   if (url.pathname === "/video" || url.pathname.startsWith("/video/")) return null;
 
   return `${url.pathname}${url.search}${url.hash}` || "/";

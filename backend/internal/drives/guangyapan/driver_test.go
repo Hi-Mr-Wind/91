@@ -49,7 +49,7 @@ func TestDriverRefreshListAndStream(t *testing.T) {
 					"total": 2,
 					"list": []map[string]any{
 						{"fileId": "dir-1", "parentId": "", "fileName": "Movies", "resType": 2},
-						{"fileId": "file-1", "parentId": "", "fileName": "clip.mp4", "fileSize": 123, "resType": 1, "utime": 1700000000},
+						{"fileId": "file-1", "parentId": "", "fileName": "clip.mp4", "fileSize": 123, "gcid": "0123456789abcdef0123456789abcdef01234567", "resType": 1, "utime": 1700000000},
 					},
 				},
 			})
@@ -93,7 +93,7 @@ func TestDriverRefreshListAndStream(t *testing.T) {
 	if !listedRoot || len(entries) != 2 {
 		t.Fatalf("listedRoot=%v entries=%#v", listedRoot, entries)
 	}
-	if !entries[0].IsDir || entries[1].ID != "file-1" || entries[1].Size != 123 {
+	if !entries[0].IsDir || entries[1].ID != "file-1" || entries[1].Size != 123 || entries[1].Hash != "0123456789ABCDEF0123456789ABCDEF01234567" {
 		t.Fatalf("entries = %#v", entries)
 	}
 

@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/mediaasset"
+	"github.com/video-site/backend/internal/persistence"
 	"golang.org/x/net/proxy"
 )
 
@@ -35,32 +37,67 @@ const (
 	defaultCandidateMultiplier = 10
 	defaultCandidateFloorExtra = 50
 	defaultCandidateBudgetMax  = 500
+	defaultRunTimeout          = 3 * time.Hour
+	defaultCandidateIdle       = 30 * time.Minute
+	defaultV2IdleTimeout       = 5 * time.Minute
+	defaultProgressInterval    = 60 * time.Second
+	defaultDoneGrace           = 5 * time.Second
+	defaultMaxStdoutBytes      = 64 * 1024 * 1024
+	defaultMaxStderrBytes      = 1024 * 1024
+	maxV1StdoutLineBytes       = 4 * 1024 * 1024
+	maxV2StdoutLineBytes       = 1024 * 1024
+	maxStderrLineBytes         = 8 * 1024
+	crawlHistoryKeep           = 5
+	crawlPartMaxAge            = 24 * time.Hour
 )
 
 type CrawlerConfig struct {
-	Driver          *Driver
-	Catalog         *catalog.Catalog
-	CrawlerName     string
-	PythonPath      string
-	FFmpegPath      string
-	FFprobePath     string
-	ScriptPath      string
-	WorkDir         string
-	CommonThumbDir  string
-	ProxyURL        string
-	ConfigJSON      string
-	DisablePreview  bool
-	HTTPClient      *http.Client
-	DownloadTimeout time.Duration
-	OnProgress      func(CrawlProgress)
+	Driver      *Driver
+	Catalog     *catalog.Catalog
+	CrawlerName string
+	// Protocol is the protocol to start from. Every run re-reads it from the
+	// script itself, so this is the value used before the first run and
+	// whenever SkipProtocolRefresh keeps the script from being consulted.
+	Protocol string
+	// SkipProtocolRefresh keeps Protocol authoritative instead of re-reading
+	// the script's metadata on each run. Test harnesses that point ScriptPath
+	// at a stub set this; production crawlers must leave it false so an edited
+	// script cannot keep running under its previously declared protocol.
+	SkipProtocolRefresh  bool
+	PythonPath           string
+	FFmpegPath           string
+	FFprobePath          string
+	ScriptPath           string
+	WorkDir              string
+	CommonThumbDir       string
+	ProxyURL             string
+	ConfigJSON           string
+	DisablePreview       bool
+	HTTPClient           *http.Client
+	DownloadTimeout      time.Duration
+	RunTimeout           time.Duration
+	CandidateIdleTimeout time.Duration
+	IdleTimeout          time.Duration
+	DoneGrace            time.Duration
+	MaxStdoutBytes       int64
+	MaxStderrBytes       int64
+	OnProgress           func(CrawlProgress)
 }
 
 type Crawler struct {
-	cfg   CrawlerConfig
-	runMu sync.Mutex
+	cfg                          CrawlerConfig
+	runTimeoutExplicit           bool
+	candidateIdleTimeoutExplicit bool
+
+	// protocol is the protocol resolved for the current run. It is refreshed
+	// from the script under runMu, so cfg stays immutable after construction.
+	protocol string
+	runMu    sync.Mutex
 }
 
 func NewCrawler(cfg CrawlerConfig) *Crawler {
+	runTimeoutExplicit := cfg.RunTimeout > 0
+	candidateIdleTimeoutExplicit := cfg.CandidateIdleTimeout > 0
 	if strings.TrimSpace(cfg.PythonPath) == "" {
 		cfg.PythonPath = "python3"
 	}
@@ -72,6 +109,28 @@ func NewCrawler(cfg CrawlerConfig) *Crawler {
 	}
 	if cfg.DownloadTimeout <= 0 {
 		cfg.DownloadTimeout = 30 * time.Minute
+	}
+	if strings.TrimSpace(cfg.Protocol) == "" {
+		cfg.Protocol = ProtocolV1
+	}
+	cfg.Protocol = strings.TrimSpace(cfg.Protocol)
+	if cfg.RunTimeout <= 0 {
+		cfg.RunTimeout = defaultRunTimeout
+	}
+	if cfg.CandidateIdleTimeout <= 0 {
+		cfg.CandidateIdleTimeout = defaultCandidateIdle
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaultV2IdleTimeout
+	}
+	if cfg.DoneGrace <= 0 {
+		cfg.DoneGrace = defaultDoneGrace
+	}
+	if cfg.MaxStdoutBytes <= 0 {
+		cfg.MaxStdoutBytes = defaultMaxStdoutBytes
+	}
+	if cfg.MaxStderrBytes <= 0 {
+		cfg.MaxStderrBytes = defaultMaxStderrBytes
 	}
 	if cfg.HTTPClient == nil {
 		transport := &http.Transport{
@@ -85,7 +144,26 @@ func NewCrawler(cfg CrawlerConfig) *Crawler {
 		}
 		cfg.HTTPClient = &http.Client{Transport: transport}
 	}
-	return &Crawler{cfg: cfg}
+	return &Crawler{
+		cfg:                          cfg,
+		runTimeoutExplicit:           runTimeoutExplicit,
+		candidateIdleTimeoutExplicit: candidateIdleTimeoutExplicit,
+		protocol:                     cfg.Protocol,
+	}
+}
+
+func (c *Crawler) effectiveRunTimeout() time.Duration {
+	if c.protocol == ProtocolV2 || c.runTimeoutExplicit {
+		return c.cfg.RunTimeout
+	}
+	return 0
+}
+
+func (c *Crawler) effectiveCandidateIdleTimeout() time.Duration {
+	if c.protocol == ProtocolV2 || c.candidateIdleTimeoutExplicit {
+		return c.cfg.CandidateIdleTimeout
+	}
+	return 0
 }
 
 type CrawlResult struct {
@@ -126,10 +204,19 @@ type Job struct {
 	OutputDir         string          `json:"output_dir"`
 	Config            json.RawMessage `json:"config"`
 	Network           JobNetwork      `json:"network"`
+	Limits            *JobLimits      `json:"limits,omitempty"`
 }
 
 type JobNetwork struct {
 	ProxyURL string `json:"proxy_url,omitempty"`
+}
+
+type JobLimits struct {
+	MaxRuntimeSeconds           int    `json:"max_runtime_seconds"`
+	DeadlineAt                  string `json:"deadline_at"`
+	ProgressIntervalSeconds     int    `json:"progress_interval_seconds"`
+	IdleTimeoutSeconds          int    `json:"idle_timeout_seconds"`
+	CandidateIdleTimeoutSeconds int    `json:"candidate_idle_timeout_seconds"`
 }
 
 type Event struct {
@@ -262,6 +349,20 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	if _, err := os.Stat(c.cfg.ScriptPath); err != nil {
 		return nil, fmt.Errorf("scriptcrawler: script not found: %w", err)
 	}
+	// A crawler script can be replaced in place between runs. Refresh the
+	// protocol from the file itself so a scheduled run validates exactly what
+	// dry-run just validated, instead of the protocol seen when the drive was
+	// attached.
+	if !c.cfg.SkipProtocolRefresh {
+		metadata, err := ReadMetadata(c.cfg.ScriptPath)
+		if err != nil {
+			return nil, fmt.Errorf("scriptcrawler: script metadata: %w", err)
+		}
+		c.protocol = metadata.Protocol
+	}
+	if c.protocol != ProtocolV1 && c.protocol != ProtocolV2 {
+		return nil, fmt.Errorf("scriptcrawler: unsupported protocol %q", c.protocol)
+	}
 	if targetNew <= 0 {
 		targetNew = DefaultTargetNew
 	}
@@ -293,6 +394,7 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	if err := os.MkdirAll(crawlDir, 0o755); err != nil {
 		return result, err
 	}
+	pruneCrawlDir(crawlDir)
 	runID := time.Now().UTC().Format("20060102T150405Z")
 	seenPath := filepath.Join(crawlDir, "seen-"+runID+".txt")
 	jobPath := filepath.Join(crawlDir, "job-"+runID+".json")
@@ -306,82 +408,23 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	result.SeenSnapshot = seenCount
 	emit(CrawlProgress{})
 
-	if err := c.writeJobFile(jobPath, runID, targetNew, candidateBudget, seenPath); err != nil {
+	runTimeout := c.effectiveRunTimeout()
+	var deadline time.Time
+	if runTimeout > 0 {
+		deadline = time.Now().Add(runTimeout).UTC()
+	}
+	if err := c.writeJobFile(jobPath, runID, targetNew, candidateBudget, seenPath, deadline); err != nil {
 		return result, fmt.Errorf("scriptcrawler: write job: %w", err)
 	}
 
-	cmd, stdout, err := c.startScript(ctx, jobPath, targetNew, candidateBudget)
-	if err != nil {
-		return result, fmt.Errorf("scriptcrawler: start: %w", err)
+	runCtx := ctx
+	cancel := func() {}
+	if !deadline.IsZero() {
+		runCtx, cancel = context.WithDeadline(ctx, deadline)
 	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	progress := CrawlProgress{}
-	for scanner.Scan() {
-		if err := ctx.Err(); err != nil {
-			_ = cmd.Process.Kill()
-			break
-		}
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var event Event
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			log.Printf("[scriptcrawler] drive=%s stdout parse: %v line=%q", c.cfg.Driver.ID(), err, line)
-			continue
-		}
-		eventType := strings.ToLower(strings.TrimSpace(event.Type))
-		item := event.normalizedItem()
-		if eventType == "" && item.hasPayload() {
-			eventType = "item"
-		}
-		switch eventType {
-		case "item":
-			result.TotalEntries++
-			progress.Emitted++
-			emit(progress)
-			if result.NewVideos >= targetNew {
-				_ = cmd.Process.Kill()
-				break
-			}
-			added, err := c.processItem(ctx, item)
-			if err != nil {
-				log.Printf("[scriptcrawler] drive=%s item failed source_id=%q title=%q: %v", c.cfg.Driver.ID(), item.SourceID, item.Title, err)
-				result.Failed++
-			} else if added {
-				result.NewVideos++
-			} else {
-				result.Skipped++
-			}
-			emit(progress)
-			if result.NewVideos >= targetNew {
-				_ = cmd.Process.Kill()
-				break
-			}
-		case "progress":
-			if event.Checked > 0 {
-				progress.Checked = event.Checked
-			}
-			if event.Emitted > 0 {
-				progress.Emitted = event.Emitted
-			}
-			progress.Message = event.Message
-			emit(progress)
-		case "done":
-			progress.Message = event.Message
-			emit(progress)
-		case "":
-			log.Printf("[scriptcrawler] drive=%s missing event type line=%q", c.cfg.Driver.ID(), line)
-		default:
-			log.Printf("[scriptcrawler] drive=%s unknown event type=%q", c.cfg.Driver.ID(), event.Type)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("[scriptcrawler] drive=%s stdout scan: %v", c.cfg.Driver.ID(), err)
-	}
-	if err := cmd.Wait(); err != nil && ctx.Err() == nil && result.NewVideos < targetNew {
-		log.Printf("[scriptcrawler] drive=%s script exit: %v", c.cfg.Driver.ID(), err)
+	defer cancel()
+	if err := c.executeScript(runCtx, ctx, jobPath, targetNew, candidateBudget, result, emit); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -421,7 +464,47 @@ func (c *Crawler) writeSeenSourceIDs(ctx context.Context, path string) (int, err
 	return len(seen), nil
 }
 
-func (c *Crawler) writeJobFile(path, runID string, targetNew, candidateBudget int, seenPath string) error {
+// pruneCrawlDir bounds the .crawl history. Every run writes a fresh
+// seen-/job- file pair, so a scheduled crawler would otherwise accumulate
+// them forever. The newest crawlHistoryKeep of each kind survive for
+// post-mortem debugging. Stale .part leftovers from interrupted writes are
+// removed once they are old enough to not belong to a live run.
+func pruneCrawlDir(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var seenFiles, jobFiles []string
+	now := time.Now()
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		switch {
+		case strings.HasSuffix(name, ".part"):
+			if info, err := entry.Info(); err == nil && now.Sub(info.ModTime()) > crawlPartMaxAge {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+		case strings.HasPrefix(name, "seen-") && strings.HasSuffix(name, ".txt"):
+			seenFiles = append(seenFiles, name)
+		case strings.HasPrefix(name, "job-") && strings.HasSuffix(name, ".json"):
+			jobFiles = append(jobFiles, name)
+		}
+	}
+	for _, group := range [][]string{seenFiles, jobFiles} {
+		if len(group) <= crawlHistoryKeep {
+			continue
+		}
+		// Run IDs are UTC timestamps, so lexical order is chronological.
+		sort.Strings(group)
+		for _, name := range group[:len(group)-crawlHistoryKeep] {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
+}
+
+func (c *Crawler) writeJobFile(path, runID string, targetNew, candidateBudget int, seenPath string, deadline time.Time) error {
 	cfg := json.RawMessage([]byte("{}"))
 	if raw := strings.TrimSpace(c.cfg.ConfigJSON); raw != "" {
 		if !json.Valid([]byte(raw)) {
@@ -434,7 +517,7 @@ func (c *Crawler) writeJobFile(path, runID string, targetNew, candidateBudget in
 		return fmt.Errorf("resolve output dir: %w", err)
 	}
 	job := Job{
-		Protocol:          "crawler.v1",
+		Protocol:          c.protocol,
 		Mode:              "crawl",
 		RunID:             runID,
 		CrawlerID:         c.cfg.Driver.ID(),
@@ -445,6 +528,15 @@ func (c *Crawler) writeJobFile(path, runID string, targetNew, candidateBudget in
 		OutputDir:         outputDir,
 		Config:            cfg,
 		Network:           JobNetwork{ProxyURL: strings.TrimSpace(c.cfg.ProxyURL)},
+	}
+	if c.protocol == ProtocolV2 {
+		job.Limits = &JobLimits{
+			MaxRuntimeSeconds:           durationSeconds(c.cfg.RunTimeout),
+			DeadlineAt:                  deadline.UTC().Format(time.RFC3339),
+			ProgressIntervalSeconds:     durationSeconds(defaultProgressInterval),
+			IdleTimeoutSeconds:          durationSeconds(c.cfg.IdleTimeout),
+			CandidateIdleTimeoutSeconds: durationSeconds(c.cfg.CandidateIdleTimeout),
+		}
 	}
 	data, err := json.MarshalIndent(job, "", "  ")
 	if err != nil {
@@ -459,6 +551,11 @@ func (c *Crawler) writeJobFile(path, runID string, targetNew, candidateBudget in
 
 func (c *Crawler) startScript(ctx context.Context, jobPath string, targetNew, candidateBudget int) (*exec.Cmd, io.ReadCloser, error) {
 	cmd := exec.CommandContext(ctx, c.cfg.PythonPath, c.cfg.ScriptPath, "--job", jobPath)
+	setCrawlerProcAttr(cmd)
+	cmd.Cancel = func() error {
+		return killCrawlerProcess(cmd)
+	}
+	cmd.WaitDelay = 3 * time.Second
 	if strings.TrimSpace(c.cfg.WorkDir) != "" {
 		cmd.Dir = c.cfg.WorkDir
 	}
@@ -487,20 +584,87 @@ func (c *Crawler) startScript(ctx context.Context, jobPath string, targetNew, ca
 		_ = stderr.Close()
 		return nil, nil, err
 	}
-	go forwardScriptLog(c.cfg.Driver.ID(), stderr)
+	go forwardScriptLog(c.cfg.Driver.ID(), stderr, c.cfg.MaxStderrBytes)
 	return cmd, stdout, nil
 }
 
-func forwardScriptLog(driveID string, r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+func forwardScriptLog(driveID string, r io.Reader, maxBytes int64) {
+	reader := bufio.NewReaderSize(r, maxStderrLineBytes)
+	line := make([]byte, 0, maxStderrLineBytes)
+	var consumed int64
+	var suppressed int64
+	lineTruncated := false
+	flushLine := func() {
+		trimmed := strings.TrimSpace(string(line))
+		if trimmed != "" {
+			if lineTruncated {
+				trimmed += "…"
+			}
+			log.Printf("[scriptcrawler:script] drive=%s %s", driveID, trimmed)
 		}
-		log.Printf("[scriptcrawler:script] drive=%s %s", driveID, line)
+		line = line[:0]
+		lineTruncated = false
 	}
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		accepted := fragment
+		if remaining := maxBytes - consumed; remaining <= 0 {
+			accepted = nil
+			suppressed += int64(len(fragment))
+		} else if int64(len(accepted)) > remaining {
+			accepted = accepted[:remaining]
+			consumed += int64(len(accepted))
+			suppressed += int64(len(fragment) - len(accepted))
+		} else {
+			consumed += int64(len(accepted))
+		}
+		if len(accepted) > 0 {
+			content := accepted
+			if content[len(content)-1] == '\n' {
+				content = content[:len(content)-1]
+			}
+			if remaining := maxStderrLineBytes - len(line); remaining > 0 {
+				toKeep := content
+				if len(toKeep) > remaining {
+					toKeep = toKeep[:remaining]
+				}
+				line = append(line, toKeep...)
+				if len(toKeep) < len(content) {
+					lineTruncated = true
+					suppressed += int64(len(content) - len(toKeep))
+				}
+			} else if len(content) > 0 {
+				lineTruncated = true
+				suppressed += int64(len(content))
+			}
+		}
+		if len(fragment) > 0 && fragment[len(fragment)-1] == '\n' {
+			flushLine()
+		}
+		if err != nil {
+			if errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
+			if err != io.EOF && !errors.Is(err, os.ErrClosed) {
+				log.Printf("[scriptcrawler:script] drive=%s stderr read: %v", driveID, err)
+			}
+			if len(line) > 0 || lineTruncated {
+				flushLine()
+			}
+			break
+		}
+	}
+	if suppressed > 0 {
+		log.Printf("[scriptcrawler:script] drive=%s suppressed %d stderr bytes after limit", driveID, suppressed)
+	}
+}
+
+func durationSeconds(value time.Duration) int {
+	seconds := int(value / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
@@ -538,16 +702,34 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		title = sourceID
 	}
 	author := strings.TrimSpace(item.Author)
-	if author == "" {
-		author = c.cfg.Driver.ID()
+	// 标签策略：
+	//   1. 脚本返回的 tags 只挂已存在的标签，不自动创建新标签 → source=crawler；
+	//   2. 规则引擎按标题/文件名/作者匹配已有标签池 → source=auto；
+	//   3. 视频成功入库后才确保并强制挂载爬虫名标签（不受人工锁定影响）。
+	var tagAssignments []catalog.TagAssignment
+	tagLabelSeen := map[string]bool{}
+	crawlerTagLabel := ""
+	appendAssignment := func(a catalog.TagAssignment) {
+		key := strings.ToLower(strings.TrimSpace(a.Label))
+		if key == "" || tagLabelSeen[key] {
+			return
+		}
+		tagLabelSeen[key] = true
+		tagAssignments = append(tagAssignments, a)
 	}
-	tags := cleanStringList(item.Tags)
-	if matched, err := c.cfg.Catalog.MatchTags(ctx, title+" "+author+" "+strings.Join(tags, " ")); err == nil {
-		tags = mergeStringLists(tags, matched)
+	for _, scriptTag := range cleanStringList(item.Tags) {
+		label, ok, err := c.cfg.Catalog.LookupTagLabel(ctx, scriptTag)
+		if err != nil || !ok {
+			continue
+		}
+		appendAssignment(catalog.TagAssignment{Label: label, Source: "crawler", Evidence: "脚本标签"})
 	}
-	if crawlerTag := c.crawlerTagName(); crawlerTag != "" {
-		tags = mergeStringLists(tags, []string{crawlerTag})
+	if matched, err := c.cfg.Catalog.MatchTagAssignments(ctx, title, videoFile, author, ""); err == nil {
+		for _, a := range matched {
+			appendAssignment(a)
+		}
 	}
+	crawlerTagLabel = c.crawlerTagName()
 	publishedAt := now
 	if parsed := parsePublishedAt(item.PublishedAt); !parsed.IsZero() {
 		publishedAt = parsed
@@ -567,7 +749,6 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		FileName:        videoFile,
 		Title:           title,
 		Author:          author,
-		Tags:            tags,
 		DurationSeconds: item.DurationSeconds,
 		Size:            size,
 		Ext:             strings.TrimPrefix(videoExt, "."),
@@ -624,7 +805,8 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 	if thumbReady {
 		v.ThumbnailURL = "/p/thumb/" + v.ID
 	}
-	if duplicate, err := c.findNearDuplicateVideo(ctx, v, commonThumbPath); err != nil {
+	duplicate, err := c.findNearDuplicateVideo(ctx, v, commonThumbPath, videoPath)
+	if err != nil {
 		_ = os.Remove(videoPath)
 		if thumbPath != "" {
 			_ = os.Remove(thumbPath)
@@ -633,9 +815,17 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 			_ = os.Remove(commonThumbPath)
 		}
 		return false, fmt.Errorf("near duplicate lookup: %w", err)
-	} else if duplicate != nil && duplicate.video != nil {
+	}
+	// Media and thumbnail downloads above are written through .part files.
+	// Coordinate only the final file/catalog cleanup and publication.
+	persistence.RLock()
+	defer persistence.RUnlock()
+	if duplicate != nil && duplicate.video != nil {
 		if v.Size > duplicate.video.Size {
-			if err := c.cfg.Catalog.DeleteVideoWithTombstoneReason(ctx, duplicate.video.ID, catalog.DeletedVideoReasonDuplicate); err != nil {
+			if err := c.cfg.Catalog.DeleteVideoWithTombstoneOptions(ctx, duplicate.video.ID, catalog.DeleteVideoTombstoneOptions{
+				Reason:           catalog.DeletedVideoReasonDuplicate,
+				CanonicalVideoID: v.ID,
+			}); err != nil {
 				_ = os.Remove(videoPath)
 				if thumbPath != "" {
 					_ = os.Remove(thumbPath)
@@ -645,7 +835,7 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 				}
 				return false, fmt.Errorf("delete smaller near duplicate %s: %w", duplicate.video.ID, err)
 			}
-			log.Printf("[scriptcrawler] drive=%s source_id=%s replacing_smaller_near_duplicate=%s old_size=%d new_size=%d title_similarity=%.3f thumbnail_ssim=%.3f title=%q duration=%d", c.cfg.Driver.ID(), sourceID, duplicate.video.ID, duplicate.video.Size, v.Size, duplicate.titleSimilarity, duplicate.thumbnailSSIM, title, v.DurationSeconds)
+			log.Printf("[scriptcrawler] drive=%s source_id=%s replacing_smaller_near_duplicate=%s old_size=%d new_size=%d title_similarity=%.3f thumbnail_ssim=%.3f content_ssim=%.3f title=%q duration=%d", c.cfg.Driver.ID(), sourceID, duplicate.video.ID, duplicate.video.Size, v.Size, duplicate.titleSimilarity, duplicate.thumbnailSSIM, duplicate.contentSSIM, title, v.DurationSeconds)
 		} else {
 			_ = os.Remove(videoPath)
 			if thumbPath != "" {
@@ -657,7 +847,7 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 			if markErr := c.cfg.Catalog.MarkCrawlerSourceSeen(ctx, Kind, c.cfg.Driver.ID(), sourceID, "duplicate", duplicate.video.ID, sampled, size); markErr != nil {
 				log.Printf("[scriptcrawler] drive=%s source_id=%s mark near duplicate seen: %v", c.cfg.Driver.ID(), sourceID, markErr)
 			}
-			log.Printf("[scriptcrawler] drive=%s source_id=%s near_duplicate_of=%s old_size=%d new_size=%d title_similarity=%.3f thumbnail_ssim=%.3f title=%q duration=%d", c.cfg.Driver.ID(), sourceID, duplicate.video.ID, duplicate.video.Size, v.Size, duplicate.titleSimilarity, duplicate.thumbnailSSIM, title, v.DurationSeconds)
+			log.Printf("[scriptcrawler] drive=%s source_id=%s near_duplicate_of=%s old_size=%d new_size=%d title_similarity=%.3f thumbnail_ssim=%.3f content_ssim=%.3f title=%q duration=%d", c.cfg.Driver.ID(), sourceID, duplicate.video.ID, duplicate.video.Size, v.Size, duplicate.titleSimilarity, duplicate.thumbnailSSIM, duplicate.contentSSIM, title, v.DurationSeconds)
 			return false, nil
 		}
 	}
@@ -665,11 +855,172 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		_ = os.Remove(videoPath)
 		return false, err
 	}
+	if len(tagAssignments) > 0 {
+		if _, err := c.cfg.Catalog.AddVideoTagAssignments(ctx, v.ID, tagAssignments); err != nil {
+			log.Printf("[scriptcrawler] drive=%s source_id=%s attach tags: %v", c.cfg.Driver.ID(), sourceID, err)
+		} else {
+			for _, a := range tagAssignments {
+				v.Tags = append(v.Tags, a.Label)
+			}
+		}
+	}
+	if crawlerTagLabel != "" {
+		if _, err := c.cfg.Catalog.EnsureCrawlerTagForVideo(ctx, v.ID, crawlerTagLabel); err != nil {
+			log.Printf("[scriptcrawler] drive=%s source_id=%s attach crawler tag %q: %v", c.cfg.Driver.ID(), sourceID, crawlerTagLabel, err)
+		} else {
+			seen := false
+			for _, label := range v.Tags {
+				if strings.EqualFold(label, crawlerTagLabel) {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				v.Tags = append(v.Tags, crawlerTagLabel)
+			}
+		}
+	}
 	if err := c.cfg.Catalog.MarkCrawlerSourceSeen(ctx, Kind, c.cfg.Driver.ID(), sourceID, "imported", v.ID, sampled, size); err != nil {
 		log.Printf("[scriptcrawler] drive=%s source_id=%s mark imported seen: %v", c.cfg.Driver.ID(), sourceID, err)
 	}
 	log.Printf("[scriptcrawler] drive=%s source_id=%s ok title=%q size=%d", c.cfg.Driver.ID(), sourceID, title, size)
 	return true, nil
+}
+
+// RestoreRequestedVideos scans the crawler's retained local video directory
+// after the crawl/generation/upload pipeline has finished. Only tombstones that
+// the user explicitly removed from the blacklist are eligible.
+func (c *Crawler) RestoreRequestedVideos(ctx context.Context) (int, error) {
+	if c == nil || c.cfg.Driver == nil || c.cfg.Catalog == nil {
+		return 0, errors.New("scriptcrawler: restore dependencies not set")
+	}
+	if err := c.cfg.Driver.Init(ctx); err != nil {
+		return 0, fmt.Errorf("scriptcrawler: restore driver init: %w", err)
+	}
+	requests, err := c.cfg.Catalog.ListCrawlerRestoreRequests(ctx, c.cfg.Driver.ID())
+	if err != nil || len(requests) == 0 {
+		return 0, err
+	}
+	entries, err := c.cfg.Driver.List(ctx, c.cfg.Driver.RootID())
+	if err != nil {
+		return 0, fmt.Errorf("scriptcrawler: scan retained videos: %w", err)
+	}
+	files := make(map[string]struct {
+		size    int64
+		modTime time.Time
+	}, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir || entry.Size <= 0 {
+			continue
+		}
+		files[entry.ID] = struct {
+			size    int64
+			modTime time.Time
+		}{size: entry.Size, modTime: entry.ModTime}
+	}
+
+	restored := 0
+	var restoreErrors []error
+	for _, request := range requests {
+		if err := ctx.Err(); err != nil {
+			return restored, err
+		}
+		fileID := strings.TrimSpace(request.FileID)
+		file, ok := files[fileID]
+		if !ok {
+			continue
+		}
+
+		video := &catalog.Video{}
+		if request.Video != nil {
+			copy := *request.Video
+			video = &copy
+		}
+		video.ID = request.ID
+		video.DriveID = c.cfg.Driver.ID()
+		video.FileID = fileID
+		if strings.TrimSpace(video.FileName) == "" {
+			video.FileName = strings.TrimSpace(request.FileName)
+		}
+		if strings.TrimSpace(video.FileName) == "" {
+			video.FileName = fileID
+		}
+		if strings.TrimSpace(video.Title) == "" {
+			video.Title = strings.TrimSuffix(video.FileName, filepath.Ext(video.FileName))
+		}
+		video.Ext = strings.TrimPrefix(strings.ToLower(filepath.Ext(fileID)), ".")
+		if request.Size != file.size {
+			video.SampledSHA256 = ""
+			video.FingerprintStatus = "pending"
+			video.FingerprintError = ""
+		}
+		video.Size = file.size
+		video.ThumbnailURL = ""
+		video.PreviewFileID = ""
+		video.PreviewLocal = ""
+		video.PreviewStatus = "pending"
+		if c.previewDisabled(ctx) {
+			video.PreviewStatus = "disabled"
+		}
+		video.TranscodeStatus = ""
+		video.TranscodeError = ""
+		video.TranscodedFileID = ""
+		video.TranscodedSize = 0
+		if video.PublishedAt.IsZero() {
+			video.PublishedAt = file.modTime
+		}
+		if video.CreatedAt.IsZero() {
+			video.CreatedAt = file.modTime
+		}
+		if c.restoreCrawlerThumbnail(video, fileID) {
+			video.ThumbnailURL = "/p/thumb/" + video.ID
+		}
+
+		if err := c.cfg.Catalog.UpsertVideo(ctx, video); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("restore %s: %w", request.ID, err))
+			continue
+		}
+		sourceID := strings.TrimPrefix(request.ID, BuildVideoID(c.cfg.Driver.ID(), ""))
+		if sourceID != "" {
+			if err := c.cfg.Catalog.MarkCrawlerSourceSeen(ctx, Kind, c.cfg.Driver.ID(), sourceID, "imported", video.ID, video.SampledSHA256, video.Size); err != nil {
+				restoreErrors = append(restoreErrors, fmt.Errorf("restore %s seen source: %w", request.ID, err))
+				continue
+			}
+		}
+		if err := c.cfg.Catalog.CompleteCrawlerRestore(ctx, request.ID); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("complete restore %s: %w", request.ID, err))
+			continue
+		}
+		restored++
+		log.Printf("[scriptcrawler] drive=%s restored retained video=%s file=%s size=%d", c.cfg.Driver.ID(), request.ID, fileID, file.size)
+	}
+	return restored, errors.Join(restoreErrors...)
+}
+
+func (c *Crawler) restoreCrawlerThumbnail(video *catalog.Video, fileID string) bool {
+	if video == nil || strings.TrimSpace(c.cfg.CommonThumbDir) == "" {
+		return false
+	}
+	stem := strings.TrimSuffix(fileID, filepath.Ext(fileID))
+	for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp"} {
+		source, err := c.cfg.Driver.ThumbPath(stem + ext)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(source)
+		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+			continue
+		}
+		if err := os.MkdirAll(c.cfg.CommonThumbDir, 0o755); err != nil {
+			return false
+		}
+		if err := copyFileAtomic(source, mediaasset.ThumbnailPathInDir(c.cfg.CommonThumbDir, video.ID)); err != nil {
+			log.Printf("[scriptcrawler] drive=%s restore thumbnail video=%s: %v", c.cfg.Driver.ID(), video.ID, err)
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func (c *Crawler) previewDisabled(ctx context.Context) bool {

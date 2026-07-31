@@ -29,8 +29,8 @@ import (
 const (
 	Kind = "p123"
 
-	defaultMainAPIBase  = "https://www.123pan.com/b/api"
-	defaultLoginAPIBase = "https://login.123pan.com/api"
+	defaultMainAPIBase  = "https://api.123278.com/b/api"
+	defaultLoginAPIBase = "https://api.123278.com/b/api"
 	defaultReferer      = "https://www.123pan.com/"
 	defaultPlatform     = "web"
 	defaultAppVersion   = "3"
@@ -1018,7 +1018,7 @@ func loginError(message string) error {
 	message = strings.TrimSpace(message)
 	if strings.Contains(message, "境外登录风险") ||
 		(strings.Contains(message, "短信验证码") && strings.Contains(message, "微信")) {
-		return errors.New("123pan login: 账号密码登录被 123网盘风控拦截，请在浏览器完成短信/微信验证后复制 access_token，并在后台编辑该 123网盘时只填写 access_token")
+		return errors.New("123pan login: 账号密码登录被 123网盘风控拦截，请改用扫码登录")
 	}
 	if message == "" {
 		message = "login failed"

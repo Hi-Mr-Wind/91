@@ -7,12 +7,34 @@ import {
 } from "react";
 import Artplayer, { type Option, type SettingOption } from "artplayer";
 import type Hls from "hls.js";
+import {
+  calculateFullscreenSubtitleBottom,
+  getFullscreenPlayerOrientation,
+} from "@/lib/fullscreenSubtitleLayout";
+import { diagnosePlaybackSource } from "@/lib/playbackError";
+import {
+  escapeHtml,
+  formatSubtitleLabel,
+  formatSubtitleOptionLabel,
+  formatSubtitleTooltipLabel,
+} from "@/lib/subtitleLabel";
+import {
+  isPortraitVideo,
+  TripleScreenRenderer,
+} from "@/lib/tripleScreen";
+import type { VideoSubtitle } from "@/types";
 
 type Props = {
   id?: string;
   src: string;
+  /**
+   * 仅由普通详情页对已确认的 PikPak MP4 开启。运行时仍会限制为
+   * iOS/iPadOS；分享页及短视频页不传此参数。
+   */
+  preferTypedMp4SourceOnIOS?: boolean;
   poster: string;
   previewSrc?: string;
+  loadSubtitles?: () => Promise<VideoSubtitle[]>;
   title: string;
   /**
    * 用户首次按下播放时触发。同一个 VideoPlayer 实例只会触发一次；
@@ -42,6 +64,7 @@ type PlayerSettings = {
   muted: boolean;
   playbackRate: number;
   brightness: number;
+  loop: boolean;
 };
 
 type VideoElementWithHls = HTMLVideoElement & {
@@ -51,6 +74,7 @@ type VideoElementWithHls = HTMLVideoElement & {
 type MobileGestureMode = "seek" | "volume" | "brightness";
 type MobileGestureSide = "left" | "right";
 type PlayerGestureHudKind = "volume" | "brightness";
+type KeyboardSeekKey = "ArrowLeft" | "ArrowRight";
 type MobileGestureState = {
   startX: number;
   startY: number;
@@ -94,15 +118,23 @@ const FAST_RATE = 2;
 const NORMAL_RATE = 1;
 /** ArtPlayer 内部播放失败自动重连次数。 */
 const ARTPLAYER_RECONNECT_TIME_MAX = 3;
+/** 播放状态下控制栏无操作后自动隐藏的时间。 */
+const ARTPLAYER_CONTROL_HIDE_TIME_MS = 2_000;
+/** 键盘左右键单次快进/快退秒数。 */
+const KEYBOARD_SEEK_SECONDS = 15;
+/** 浏览器丢失 keyup 时，最后一次重复按键后的兜底提交延迟。 */
+const KEYBOARD_SEEK_IDLE_COMMIT_MS = 1_500;
 
 Artplayer.FAST_FORWARD_VALUE = FAST_RATE;
 Artplayer.RECONNECT_TIME_MAX = ARTPLAYER_RECONNECT_TIME_MAX;
+Artplayer.CONTROL_HIDE_TIME = ARTPLAYER_CONTROL_HIDE_TIME_MS;
 
 const DEFAULT_SETTINGS: PlayerSettings = {
-  volume: 0.7,
+  volume: 1,
   muted: false,
   playbackRate: 1,
   brightness: 1,
+  loop: true,
 };
 const DEFAULT_SETTING_LAYOUT = {
   width: Artplayer.SETTING_WIDTH,
@@ -115,28 +147,58 @@ const COMPACT_SETTING_LAYOUT = {
   itemHeight: 30,
 };
 const ORIENTATION_CONTROL_NAME = "orientationToggle";
+const TRIPLE_SCREEN_CONTROL_NAME = "tripleScreen";
+const TRIPLE_SCREEN_RELAY_QUERY = "tripleScreenRelay";
 const MANUAL_ORIENTATION_CLASS = "art-manual-orientation";
+const TRIPLE_SCREEN_ACTIVE_CLASS = "art-triple-screen-active";
 const FAST_RATE_CLASS = "art-fast-rate-active";
 const FAST_RATE_HINT_CLASS = "video-player__art-rate-hint";
 const PLAYER_GESTURE_HUD_CLASS = "video-player__art-gesture-hud";
 const PLAYER_GESTURE_HUD_ICON_CLASS = "video-player__art-gesture-hud-icon";
 const PLAYER_GESTURE_HUD_VALUE_CLASS = "video-player__art-gesture-hud-value";
+const FULLSCREEN_SUBTITLE_BOTTOM_CSS_VAR =
+  "--video-player-subtitle-bottom";
+const FULLSCREEN_SUBTITLE_ORIENTATION_DATASET =
+  "videoPlayerSubtitleOrientation";
+const PLAYER_SPACE_HOTKEY_EXCLUDED_SELECTOR = [
+  "input",
+  "textarea",
+  "select",
+  "button",
+  "a[href]",
+  "[contenteditable]:not([contenteditable='false'])",
+  "[role='button']",
+  "[role='textbox']",
+  "[role='combobox']",
+  "[role='slider']",
+  "[role='menuitem']",
+  "[role='option']",
+  "[role='dialog']",
+].join(",");
+const ACTIVE_MODAL_SELECTOR =
+  'dialog[open], [role="dialog"][aria-modal="true"]';
 const PREVIEW_WIDTH = 168;
 const MEDIA_REFERRER_POLICY = "no-referrer";
+const TYPED_MP4_SOURCE_TYPE = "ios-pikpak-mp4-source";
+const TYPED_MP4_SOURCE_SELECTOR =
+  'source[data-video-player-typed-source="mp4"]';
 const BRIGHTNESS_MIN = 0.45;
 const BRIGHTNESS_MAX = 1.35;
 const GESTURE_ACTIVATION_PX = 12;
 const GESTURE_DIRECTION_LOCK_RATIO = 1.2;
 const GESTURE_VERTICAL_SCALE = 1.15;
-const GESTURE_SEEK_MIN_SECONDS = 30;
-const GESTURE_SEEK_MAX_SECONDS = 120;
-const GESTURE_SEEK_DURATION_RATIO = 0.12;
 const playerGestureHudTimers = new WeakMap<HTMLElement, number>();
+const tripleScreenBindings = new WeakMap<
+  Artplayer,
+  { toggle: () => void; destroy: () => void }
+>();
 
 export function VideoPlayer({
   src,
+  preferTypedMp4SourceOnIOS = false,
   poster,
   previewSrc,
+  loadSubtitles,
   title,
   onFirstPlay,
 }: Props) {
@@ -144,6 +206,7 @@ export function VideoPlayer({
   const artRef = useRef<Artplayer | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const onFirstPlayRef = useRef<Props["onFirstPlay"]>(onFirstPlay);
+  const loadSubtitlesRef = useRef<Props["loadSubtitles"]>(loadSubtitles);
   const playedRef = useRef(false);
   const [retryNonce, setRetryNonce] = useState(0);
   const [playerError, setPlayerError] = useState<PlayerError | null>(null);
@@ -156,6 +219,10 @@ export function VideoPlayer({
   }, [onFirstPlay]);
 
   useEffect(() => {
+    loadSubtitlesRef.current = loadSubtitles;
+  }, [loadSubtitles]);
+
+  useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
 
@@ -166,8 +233,10 @@ export function VideoPlayer({
     const cleanupPlayer = mountArtPlayer({
       mount,
       src,
+      preferTypedMp4SourceOnIOS,
       poster,
       title,
+      loadSubtitlesRef,
       artRef,
       playedRef,
       onFirstPlayRef,
@@ -178,7 +247,7 @@ export function VideoPlayer({
     });
 
     return cleanupPlayer;
-  }, [poster, retryNonce, src, title]);
+  }, [poster, preferTypedMp4SourceOnIOS, retryNonce, src, title]);
 
   useEffect(() => {
     return () => {
@@ -288,10 +357,11 @@ function inferSourceType(src: string) {
 
 function isBackendNativeVideoRoute(cleanPath: string) {
   const pathname = sourcePathname(cleanPath);
-	return (
-		pathname.startsWith("/p/stream/") ||
-		pathname.startsWith("/p/upload/")
-	);
+  return (
+    pathname.startsWith("/p/stream/") ||
+    pathname.startsWith("/p/upload/") ||
+    pathname.startsWith("/p/share/")
+  );
 }
 
 function sourcePathname(src: string) {
@@ -308,7 +378,9 @@ function sourcePathname(src: string) {
 function mountArtPlayer({
   mount,
   src,
+  preferTypedMp4SourceOnIOS,
   poster,
+  loadSubtitlesRef,
   title,
   artRef,
   playedRef,
@@ -320,7 +392,9 @@ function mountArtPlayer({
 }: {
   mount: HTMLDivElement;
   src: string;
+  preferTypedMp4SourceOnIOS: boolean;
   poster: string;
+  loadSubtitlesRef: MutableRefObject<Props["loadSubtitles"]>;
   title: string;
   artRef: MutableRefObject<Artplayer | null>;
   playedRef: MutableRefObject<boolean>;
@@ -330,10 +404,22 @@ function mountArtPlayer({
   onPreviewHover: (hover: PreviewHover | null) => void;
   onGestureHud: (label: string, duration?: number) => void;
 }) {
-  const sourceType = inferSourceType(src);
+  const useTypedMp4Source =
+    preferTypedMp4SourceOnIOS && isIOSPlaybackDevice();
+  const sourceType = useTypedMp4Source
+    ? TYPED_MP4_SOURCE_TYPE
+    : inferSourceType(src);
+  const subtitleState: SubtitleLoadState = { status: "idle", subtitles: [] };
   const fastActiveRef = { current: false };
   const loadHlsSource = createHlsSourceLoader(onError);
   const enableOrientationControl = shouldEnableMobileOrientationControl();
+  const enableTripleScreenControl = shouldEnableTripleScreenControl();
+  const enableWebFullscreen = shouldEnableWebFullscreen(enableOrientationControl);
+  let disposed = false;
+  let playbackErrorActive = false;
+  let diagnosticController: AbortController | null = null;
+  let diagnosticPromise: Promise<string | null> | null = null;
+  let diagnosticMessage: string | null = null;
   configureArtPlayerSettingLayout(
     shouldUseCompactPlayerSettings(mount, enableOrientationControl)
   );
@@ -351,11 +437,13 @@ function mountArtPlayer({
     playbackRate: true,
     aspectRatio: true,
     setting: true,
-    hotkey: true,
+    // 左右键需要在松键时只提交一次真实 seek，不能使用 ArtPlayer
+    // 每个 keydown 都改 currentTime 的内置实现。其它快捷键在下方重新绑定。
+    hotkey: false,
     pip: true,
     mutex: true,
     fullscreen: true,
-    fullscreenWeb: !enableOrientationControl,
+    fullscreenWeb: enableWebFullscreen,
     miniProgressBar: true,
     backdrop: false,
     playsInline: true,
@@ -366,13 +454,17 @@ function mountArtPlayer({
     customType: {
       hls: loadHlsSource,
       m3u8: loadHlsSource,
+      [TYPED_MP4_SOURCE_TYPE]: loadTypedMp4Source,
     },
     moreVideoAttr: {
       preload: "metadata",
       playsInline: true,
     },
-    settings: [createLoopSetting()],
-    controls: enableOrientationControl ? [createOrientationControl()] : [],
+    settings: createPlayerSettings(subtitleState, requestSubtitles),
+    controls: createPlayerControls(
+      enableOrientationControl,
+      enableTripleScreenControl
+    ),
     contextmenu: [],
     cssVar: {
       "--art-theme": "var(--video-player-progress)",
@@ -391,10 +483,44 @@ function mountArtPlayer({
   video.setAttribute("controlsList", "nodownload");
   video.setAttribute("webkit-playsinline", "true");
   video.disablePictureInPicture = false;
-  video.loop = false;
+  video.loop = DEFAULT_SETTINGS.loop;
   video.playbackRate = DEFAULT_SETTINGS.playbackRate;
   applyPlayerBrightness(art, DEFAULT_SETTINGS.brightness);
-  art.url = src;
+
+  async function requestSubtitles() {
+    if (
+      subtitleState.status === "loading" ||
+      subtitleState.status === "loaded" ||
+      subtitleState.status === "empty"
+    ) {
+      return;
+    }
+    const loader = loadSubtitlesRef.current;
+    if (!loader) {
+      subtitleState.status = "empty";
+      updateSubtitleSetting(art, subtitleState, requestSubtitles);
+      return;
+    }
+    subtitleState.status = "loading";
+    setSubtitleSettingTooltip(art, "加载中");
+    art.notice.show = "正在加载字幕";
+    try {
+      const subtitles = playableSubtitles(await loader());
+      if (disposed) return;
+      subtitleState.subtitles = subtitles;
+      subtitleState.status = subtitles.length > 0 ? "loaded" : "empty";
+      updateSubtitleSetting(art, subtitleState, requestSubtitles);
+      art.notice.show =
+        subtitles.length > 0
+          ? `已加载 ${subtitles.length} 条字幕`
+          : "暂无可用字幕";
+    } catch {
+      if (disposed) return;
+      subtitleState.status = "error";
+      updateSubtitleSetting(art, subtitleState, requestSubtitles);
+      art.notice.show = "字幕加载失败，点击字幕重试";
+    }
+  }
 
   function preventContextMenu(event: Event) {
     event.preventDefault();
@@ -405,22 +531,48 @@ function mountArtPlayer({
       playedRef.current = true;
       onFirstPlayRef.current?.();
     }
+    playbackErrorActive = false;
+    clearPlaybackDiagnostic();
     onError(null);
   }
 
   function handleLoadStart() {
+    playbackErrorActive = false;
     onError(null);
   }
 
   function handleReady() {
+    playbackErrorActive = false;
+    clearPlaybackDiagnostic();
     onError(null);
   }
 
   function handleVideoError() {
+    playbackErrorActive = true;
+    const fallbackMessage = mediaErrorMessage(video.error);
     onError({
       title: "视频源加载失败",
-      message: mediaErrorMessage(video.error),
+      message: diagnosticMessage || fallbackMessage,
     });
+    if (diagnosticPromise) return;
+
+    diagnosticController = new AbortController();
+    diagnosticPromise = diagnosePlaybackSource(src, {
+      signal: diagnosticController.signal,
+    });
+    void diagnosticPromise.then((message) => {
+      diagnosticMessage = message;
+      if (!disposed && playbackErrorActive && message) {
+        onError({ title: "视频源加载失败", message });
+      }
+    });
+  }
+
+  function clearPlaybackDiagnostic() {
+    diagnosticController?.abort();
+    diagnosticController = null;
+    diagnosticPromise = null;
+    diagnosticMessage = null;
   }
 
   function resetFastRate() {
@@ -448,6 +600,16 @@ function mountArtPlayer({
     mount,
     onPreviewHover
   );
+  const unbindKeyboardHotkeys = bindPlayerKeyboardHotkeys(art);
+  const unbindMobileFullscreenControlAutoHide =
+    bindMobileFullscreenControlAutoHide(art);
+  const unbindFullscreenSubtitleLayout = bindFullscreenSubtitleLayout(
+    art,
+    video
+  );
+  const unbindTripleScreen = enableTripleScreenControl
+    ? bindTripleScreen(art, video, src)
+    : noop;
   const unbindOrientationToggle = enableOrientationControl
     ? bindOrientationToggle(art)
     : noop;
@@ -463,15 +625,36 @@ function mountArtPlayer({
   art.on("video:play", handlePlay);
   art.on("video:pause", resetFastRate);
   art.on("video:ended", resetFastRate);
+  // 所有基于媒体生命周期的监听都挂好后再设置真实地址，避免本地缓存
+  // 极快返回 metadata 时错过方向识别或错误恢复事件。
+  if (useTypedMp4Source) {
+    // ArtPlayer 的 url getter 读取父级 video.src；使用子 <source> 时它为空。
+    // 主动保存 option.url，确保 ArtPlayer 内置的失败重连仍使用真实地址。
+    art.option.url = src;
+    loadTypedMp4Source(video, src, art);
+  } else {
+    art.url = src;
+  }
 
   return () => {
+    disposed = true;
+    clearPlaybackDiagnostic();
+    // ArtPlayer 的网页全屏会把播放器节点临时移动到 document.body。
+    // 路由回退时必须先退出网页全屏，把节点移回 mount，再执行 destroy；
+    // 否则 React 卸载详情页后，脱离组件树的全屏节点会继续覆盖新页面。
+    if (art.fullscreenWeb) art.fullscreenWeb = false;
     unbindFastRate();
     unbindMobileGestures();
     unbindProgressPreview();
+    unbindKeyboardHotkeys();
+    unbindMobileFullscreenControlAutoHide();
+    unbindFullscreenSubtitleLayout();
+    unbindTripleScreen();
     unbindOrientationToggle();
     setPlayerFastRateHint(art, false);
     mount.removeEventListener("contextmenu", preventContextMenu);
     destroyHls(video);
+    if (useTypedMp4Source) clearTypedMp4Source(video);
     art.off("video:loadstart", handleLoadStart);
     art.off("video:loadeddata", handleReady);
     art.off("video:canplay", handleReady);
@@ -489,13 +672,313 @@ function mountArtPlayer({
   };
 }
 
+function loadTypedMp4Source(
+  video: HTMLVideoElement,
+  url: string,
+  art: Artplayer
+) {
+  if (art.isDestroy || !video.isConnected) return;
+  video.removeAttribute("src");
+  clearTypedMp4Source(video);
+
+  const source = document.createElement("source");
+  source.src = url;
+  source.type = "video/mp4";
+  source.dataset.videoPlayerTypedSource = "mp4";
+  source.addEventListener(
+    "error",
+    (event) => {
+      // 使用 <source> 时，WebKit 会把资源选择错误派发到 source 节点；
+      // 转成 ArtPlayer 的媒体错误，沿用现有重试和诊断界面。
+      if (!art.isDestroy && source.isConnected) {
+        art.emit("video:error", event);
+      }
+    },
+    { once: true }
+  );
+  // ArtPlayer 已经放入了字幕 <track>；source 必须排在 track 前面。
+  video.insertBefore(source, video.firstChild);
+  video.load();
+}
+
+function clearTypedMp4Source(video: HTMLVideoElement) {
+  video
+    .querySelectorAll<HTMLSourceElement>(TYPED_MP4_SOURCE_SELECTOR)
+    .forEach((source) => source.remove());
+}
+
+function bindFullscreenSubtitleLayout(
+  art: Artplayer,
+  video: HTMLVideoElement
+) {
+  const player = art.template.$player;
+  let active = true;
+  let updateFrame: number | null = null;
+
+  function updateLayout() {
+    updateFrame = null;
+    if (!active) return;
+    const orientation = getFullscreenPlayerOrientation(
+      player.clientWidth,
+      player.clientHeight
+    );
+    if (orientation === null) {
+      delete player.dataset[FULLSCREEN_SUBTITLE_ORIENTATION_DATASET];
+    } else {
+      player.dataset[FULLSCREEN_SUBTITLE_ORIENTATION_DATASET] = orientation;
+    }
+    const bottom = calculateFullscreenSubtitleBottom(
+      player.clientWidth,
+      player.clientHeight,
+      video.videoWidth,
+      video.videoHeight
+    );
+    if (bottom === null) {
+      player.style.removeProperty(FULLSCREEN_SUBTITLE_BOTTOM_CSS_VAR);
+      return;
+    }
+    player.style.setProperty(
+      FULLSCREEN_SUBTITLE_BOTTOM_CSS_VAR,
+      `${bottom.toFixed(2)}px`
+    );
+  }
+
+  function scheduleUpdate() {
+    if (!active) return;
+    if (updateFrame !== null) window.cancelAnimationFrame(updateFrame);
+    updateFrame = window.requestAnimationFrame(updateLayout);
+  }
+
+  const resizeObserver =
+    typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(scheduleUpdate);
+  resizeObserver?.observe(player);
+
+  art.on("video:loadedmetadata", scheduleUpdate);
+  art.on("resize", scheduleUpdate);
+  art.on("fullscreen", scheduleUpdate);
+  art.on("fullscreenWeb", scheduleUpdate);
+  art.on("aspectRatio", scheduleUpdate);
+  scheduleUpdate();
+
+  return () => {
+    active = false;
+    if (updateFrame !== null) window.cancelAnimationFrame(updateFrame);
+    resizeObserver?.disconnect();
+    art.off("video:loadedmetadata", scheduleUpdate);
+    art.off("resize", scheduleUpdate);
+    art.off("fullscreen", scheduleUpdate);
+    art.off("fullscreenWeb", scheduleUpdate);
+    art.off("aspectRatio", scheduleUpdate);
+    player.style.removeProperty(FULLSCREEN_SUBTITLE_BOTTOM_CSS_VAR);
+    delete player.dataset[FULLSCREEN_SUBTITLE_ORIENTATION_DATASET];
+  };
+}
+
+function bindPlayerKeyboardHotkeys(art: Artplayer) {
+  let keyboardSeekTarget: number | null = null;
+  let keyboardSeekIdleTimer: number | null = null;
+  const heldSeekKeys = new Set<KeyboardSeekKey>();
+
+  function clearKeyboardSeekIdleTimer() {
+    if (keyboardSeekIdleTimer === null) return;
+    window.clearTimeout(keyboardSeekIdleTimer);
+    keyboardSeekIdleTimer = null;
+  }
+
+  function scheduleKeyboardSeekIdleCommit() {
+    clearKeyboardSeekIdleTimer();
+    keyboardSeekIdleTimer = window.setTimeout(() => {
+      keyboardSeekIdleTimer = null;
+      commitKeyboardSeek();
+    }, KEYBOARD_SEEK_IDLE_COMMIT_MS);
+  }
+
+  function renderKeyboardSeekTarget(showNotice: boolean) {
+    const duration = art.duration;
+    if (
+      keyboardSeekTarget === null ||
+      !Number.isFinite(duration) ||
+      duration <= 0
+    ) {
+      return;
+    }
+
+    keyboardSeekTarget = clamp(keyboardSeekTarget, 0, duration);
+    art.emit("setBar", "played", keyboardSeekTarget / duration);
+    if (showNotice) {
+      art.notice.show = `${formatClock(keyboardSeekTarget)} / ${formatClock(duration)}`;
+    }
+  }
+
+  function previewKeyboardSeek(delta: number, key: KeyboardSeekKey) {
+    const duration = art.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+
+    heldSeekKeys.add(key);
+    const baseTime = keyboardSeekTarget ?? art.currentTime;
+    keyboardSeekTarget = clamp(baseTime + delta, 0, duration);
+    renderKeyboardSeekTarget(true);
+    scheduleKeyboardSeekIdleCommit();
+  }
+
+  function commitKeyboardSeek() {
+    if (keyboardSeekTarget === null) return;
+
+    clearKeyboardSeekIdleTimer();
+    const duration = art.duration;
+    const target = Number.isFinite(duration) && duration > 0
+      ? clamp(keyboardSeekTarget, 0, duration)
+      : keyboardSeekTarget;
+    keyboardSeekTarget = null;
+    heldSeekKeys.clear();
+
+    art.seek = target;
+    if (Number.isFinite(duration) && duration > 0) {
+      art.emit("setBar", "played", target / duration);
+    }
+  }
+
+  const handleEscape = () => {
+    commitKeyboardSeek();
+    if (art.fullscreenWeb) art.fullscreenWeb = false;
+  };
+  const handleSpace = (event: KeyboardEvent) => {
+    if (event.repeat) return;
+    commitKeyboardSeek();
+    art.toggle();
+  };
+  const handleArrowUp = () => {
+    commitKeyboardSeek();
+    art.volume += Artplayer.VOLUME_STEP;
+  };
+  const handleArrowDown = () => {
+    commitKeyboardSeek();
+    art.volume -= Artplayer.VOLUME_STEP;
+  };
+  const handleArrowLeft = () => {
+    previewKeyboardSeek(-KEYBOARD_SEEK_SECONDS, "ArrowLeft");
+  };
+  const handleArrowRight = () => {
+    previewKeyboardSeek(KEYBOARD_SEEK_SECONDS, "ArrowRight");
+  };
+
+  function handlePageSpaceKeyDown(event: KeyboardEvent) {
+    if (event.code !== "Space" && event.key !== " ") return;
+    if (shouldIgnorePageSpaceHotkey(event)) return;
+
+    // ArtPlayer 的 hotkey 只有在播放器被点击后才生效。详情播放器挂载时
+    // 直接接管页面空格键，让首次按键也能播放，同时阻止浏览器翻页滚动。
+    event.preventDefault();
+    handleSpace(event);
+  }
+
+  function handleKeyUp(event: KeyboardEvent) {
+    if (event.code !== "ArrowLeft" && event.code !== "ArrowRight") return;
+    if (keyboardSeekTarget === null) return;
+
+    event.preventDefault();
+    heldSeekKeys.delete(event.code);
+    if (heldSeekKeys.size === 0) commitKeyboardSeek();
+  }
+
+  function handleTimeUpdate() {
+    // 播放中的 timeupdate 会把进度条写回真实媒体时间；按键尚未松开时，
+    // 再写回累计目标，确保长按预览不抖动。
+    if (keyboardSeekTarget !== null) renderKeyboardSeekTarget(false);
+  }
+
+  function handleVisibilityChange() {
+    if (document.hidden) commitKeyboardSeek();
+  }
+
+  art.hotkey.add("Escape", handleEscape);
+  art.hotkey.add("ArrowUp", handleArrowUp);
+  art.hotkey.add("ArrowDown", handleArrowDown);
+  art.hotkey.add("ArrowLeft", handleArrowLeft);
+  art.hotkey.add("ArrowRight", handleArrowRight);
+  art.on("video:timeupdate", handleTimeUpdate);
+  art.on("blur", commitKeyboardSeek);
+  document.addEventListener("keydown", handlePageSpaceKeyDown);
+  document.addEventListener("keyup", handleKeyUp);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("blur", commitKeyboardSeek);
+
+  return () => {
+    clearKeyboardSeekIdleTimer();
+    keyboardSeekTarget = null;
+    heldSeekKeys.clear();
+    art.hotkey.remove("Escape", handleEscape);
+    art.hotkey.remove("ArrowUp", handleArrowUp);
+    art.hotkey.remove("ArrowDown", handleArrowDown);
+    art.hotkey.remove("ArrowLeft", handleArrowLeft);
+    art.hotkey.remove("ArrowRight", handleArrowRight);
+    art.off("video:timeupdate", handleTimeUpdate);
+    art.off("blur", commitKeyboardSeek);
+    document.removeEventListener("keydown", handlePageSpaceKeyDown);
+    document.removeEventListener("keyup", handleKeyUp);
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
+    window.removeEventListener("blur", commitKeyboardSeek);
+  };
+}
+
+function shouldIgnorePageSpaceHotkey(event: KeyboardEvent) {
+  if (
+    event.defaultPrevented ||
+    event.isComposing ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey
+  ) {
+    return true;
+  }
+
+  // 弹窗打开但尚未把焦点移入弹窗时，也不能让空格控制背后的视频。
+  if (document.querySelector(ACTIVE_MODAL_SELECTOR)) return true;
+
+  return [event.target, document.activeElement].some(
+    (target) =>
+      target instanceof Element &&
+      target.closest(PLAYER_SPACE_HOTKEY_EXCLUDED_SELECTOR) !== null
+  );
+}
+
 function shouldEnableMobileOrientationControl() {
+  return isMobilePlaybackDevice() && !isApplePhoneDevice();
+}
+
+function shouldEnableTripleScreenControl() {
+  return !isMobilePlaybackDevice();
+}
+
+function shouldEnableWebFullscreen(enableOrientationControl: boolean) {
+  return !enableOrientationControl && !isAppleDevice();
+}
+
+function isMobilePlaybackDevice() {
   const coarsePointer = window.matchMedia?.(
     "(hover: none) and (pointer: coarse)"
   ).matches;
   if (coarsePointer) return true;
 
   return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+function isApplePhoneDevice() {
+  return /iPhone|iPod/i.test(navigator.userAgent);
+}
+
+function isIOSPlaybackDevice() {
+  return (
+    /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    (/Macintosh/i.test(navigator.userAgent) && navigator.maxTouchPoints > 1)
+  );
+}
+
+function isAppleDevice() {
+  return /iPhone|iPad|iPod|Macintosh/i.test(navigator.userAgent);
 }
 
 function shouldUseCompactPlayerSettings(
@@ -516,15 +999,15 @@ function configureArtPlayerSettingLayout(compact: boolean) {
 }
 
 function shouldEnableMobileGestures() {
-  return shouldEnableMobileOrientationControl();
+  return isMobilePlaybackDevice();
 }
 
 function createLoopSetting() {
   return {
     name: "mind-loop",
     html: "洗脑循环",
-    tooltip: "关",
-    switch: false,
+    tooltip: DEFAULT_SETTINGS.loop ? "开" : "关",
+    switch: DEFAULT_SETTINGS.loop,
     onSwitch(this: Artplayer, item: SettingOption) {
       const next = !item.switch;
       this.video.loop = next;
@@ -534,10 +1017,248 @@ function createLoopSetting() {
   };
 }
 
+/** ArtPlayer 设置面板宽度默认为 200px，字幕列表需要更宽一些。 */
+const SUBTITLE_PANEL_WIDTH = 240;
+
+type PlayerSubtitle = VideoSubtitle & { type: "vtt" | "srt" | "ass" };
+type PlayerSetting = NonNullable<Option["settings"]>[number];
+type SubtitleLoadStatus = "idle" | "loading" | "loaded" | "empty" | "error";
+type SubtitleLoadState = {
+  status: SubtitleLoadStatus;
+  subtitles: PlayerSubtitle[];
+};
+type ArtSettingWithRender = Artplayer["setting"] & {
+  render: (settings?: SettingOption[]) => void;
+};
+
+function playableSubtitles(subtitles: VideoSubtitle[]): PlayerSubtitle[] {
+  return subtitles.filter(
+    (subtitle): subtitle is PlayerSubtitle =>
+      Boolean(subtitle.url) &&
+      (subtitle.type === "vtt" ||
+        subtitle.type === "srt" ||
+        subtitle.type === "ass")
+  );
+}
+
+function subtitleOption(
+  subtitle: PlayerSubtitle
+): NonNullable<Option["subtitle"]> {
+  return {
+    url: subtitle.url,
+    name: formatSubtitleLabel(subtitle),
+    type: subtitle.type,
+    encoding: "utf-8",
+    escape: true,
+  };
+}
+
+function createPlayerSettings(
+  state: SubtitleLoadState,
+  requestSubtitles: () => Promise<void>
+) {
+  return [createLoopSetting(), createSubtitleSetting(state, requestSubtitles)];
+}
+
+function updateSubtitleSetting(
+  art: Artplayer,
+  state: SubtitleLoadState,
+  requestSubtitles: () => Promise<void>
+) {
+  const keepOpen = art.setting.show;
+  const setting = art.setting as ArtSettingWithRender;
+  setting.update(createSubtitleSetting(state, requestSubtitles));
+  if (!keepOpen) return;
+  const subtitleSetting = setting.find("online-subtitle");
+  if (subtitleSetting?.selector?.length) {
+    setting.render(subtitleSetting.selector);
+  }
+  setting.show = true;
+}
+
+function setSubtitleSettingTooltip(art: Artplayer, tooltip: string) {
+  const setting = art.setting.find("online-subtitle");
+  if (!setting) return;
+  setting.tooltip = tooltip;
+  if (setting.$tooltip) setting.$tooltip.textContent = tooltip;
+}
+
+function createSubtitleSetting(
+  state: SubtitleLoadState,
+  requestSubtitles: () => Promise<void>
+): PlayerSetting {
+  const subtitles = state.subtitles;
+  const tooltip =
+    state.status === "empty"
+      ? "无字幕"
+      : state.status === "error"
+        ? "加载失败"
+        : state.status === "loading"
+          ? "加载中"
+          : state.status === "idle"
+            ? ""
+            : "关闭";
+  return {
+    name: "online-subtitle",
+    html: "字幕",
+    tooltip,
+    // 二级面板要放下字幕名，比 ArtPlayer 默认的 200px 宽一些；
+    // 240px 在 360px 宽的手机竖屏里仍然放得下。
+    width: SUBTITLE_PANEL_WIDTH,
+    selector: [
+      {
+        name: "online-subtitle-option-off",
+        html: "关闭",
+        value: "off",
+        default: true,
+      },
+      ...subtitles.map((subtitle, index) => ({
+        name: `online-subtitle-option-${index}`,
+        html: subtitleOptionHtml(subtitle, index),
+        value: String(index),
+        default: false,
+      })),
+    ],
+    mounted(panel) {
+      panel.addEventListener("click", () => {
+        if (state.status === "idle" || state.status === "error") {
+          void requestSubtitles();
+        }
+      });
+    },
+    onSelect(this: Artplayer, item: SettingOption) {
+      const value = String(item.value ?? "");
+      if (value === "off") {
+        setSubtitleVisible(this, false);
+        return "关闭";
+      }
+
+      const index = Number(value);
+      const subtitle = subtitles[index];
+      if (!subtitle) {
+        return escapeHtml(this.option.subtitle?.name || "字幕");
+      }
+
+      setSubtitleVisible(this, true);
+      void this.subtitle.switch(subtitle.url, subtitleOption(subtitle));
+      return escapeHtml(formatSubtitleTooltipLabel(subtitle, index));
+    },
+  };
+}
+
+/**
+ * ArtPlayer 用 insertAdjacentHTML / innerHTML 渲染设置项，而字幕名字来自
+ * 第三方接口，必须转义后再交给它。完整名字放在 title 里，悬停仍可查看。
+ */
+function subtitleOptionHtml(subtitle: PlayerSubtitle, index: number) {
+  const label = escapeHtml(formatSubtitleOptionLabel(subtitle, index));
+  const title = escapeHtml(formatSubtitleLabel(subtitle, index));
+  return `<span class="video-player__subtitle-option" title="${title}">${label}</span>`;
+}
+
+function setSubtitleVisible(art: Artplayer, visible: boolean) {
+  (art.subtitle as typeof art.subtitle & { show: boolean }).show = visible;
+}
+
 function isPlayerExpanded(art: Artplayer) {
   return Boolean(
     art.fullscreen || art.fullscreenWeb || getNativeFullscreenElement()
   );
+}
+
+/**
+ * 安卓触摸全屏时可能留下一个不会再更新的 mousemove/hover 状态，导致
+ * ArtPlayer 内置的控制栏隐藏判断一直认为用户仍悬停在进度条上。
+ * 这里沿用 ArtPlayer 的隐藏延迟，但不依赖鼠标悬停状态做移动端兜底。
+ */
+function bindMobileFullscreenControlAutoHide(art: Artplayer) {
+  if (!isMobilePlaybackDevice()) return noop;
+
+  let hideTimer: number | null = null;
+
+  function clearHideTimer() {
+    if (hideTimer === null) return;
+    window.clearTimeout(hideTimer);
+    hideTimer = null;
+  }
+
+  function shouldWaitForInteraction() {
+    return (
+      art.setting.show ||
+      art.isInput ||
+      art.template.$player.classList.contains(FAST_RATE_CLASS)
+    );
+  }
+
+  function hideControls() {
+    hideTimer = null;
+    if (!isPlayerExpanded(art) || !art.playing || !art.controls.show) return;
+    if (shouldWaitForInteraction()) {
+      scheduleHide();
+      return;
+    }
+    art.controls.show = false;
+  }
+
+  function scheduleHide() {
+    clearHideTimer();
+    if (!isPlayerExpanded(art) || !art.playing || !art.controls.show) return;
+    hideTimer = window.setTimeout(hideControls, Artplayer.CONTROL_HIDE_TIME);
+  }
+
+  function handleExpandedChange() {
+    if (isPlayerExpanded(art)) {
+      scheduleHide();
+    } else {
+      clearHideTimer();
+    }
+  }
+
+  function handleControlChange(show: boolean) {
+    if (show) {
+      scheduleHide();
+    } else {
+      clearHideTimer();
+    }
+  }
+
+  function handleSettingChange(show: boolean) {
+    if (show) {
+      clearHideTimer();
+    } else {
+      scheduleHide();
+    }
+  }
+
+  function handlePlayerInteractionEnd(event: Event) {
+    const target = event.target;
+    if (!(target instanceof Node)) return;
+    if (!art.template.$player.contains(target)) return;
+    scheduleHide();
+  }
+
+  art.on("fullscreen", handleExpandedChange);
+  art.on("fullscreenWeb", handleExpandedChange);
+  art.on("video:playing", scheduleHide);
+  art.on("video:pause", clearHideTimer);
+  art.on("video:ended", clearHideTimer);
+  art.on("control", handleControlChange);
+  art.on("setting", handleSettingChange);
+  art.on("document:pointerup", handlePlayerInteractionEnd);
+  art.on("document:touchend", handlePlayerInteractionEnd);
+
+  return () => {
+    clearHideTimer();
+    art.off("fullscreen", handleExpandedChange);
+    art.off("fullscreenWeb", handleExpandedChange);
+    art.off("video:playing", scheduleHide);
+    art.off("video:pause", clearHideTimer);
+    art.off("video:ended", clearHideTimer);
+    art.off("control", handleControlChange);
+    art.off("setting", handleSettingChange);
+    art.off("document:pointerup", handlePlayerInteractionEnd);
+    art.off("document:touchend", handlePlayerInteractionEnd);
+  };
 }
 
 function setPlayerFastRateHint(art: Artplayer, active: boolean) {
@@ -643,6 +1364,291 @@ function playerGestureHudIcon(kind: PlayerGestureHudKind, value: string) {
 
 function noop() {
   // noop
+}
+
+type PlayerControl = NonNullable<Option["controls"]>[number];
+
+function createPlayerControls(
+  enableOrientationControl: boolean,
+  enableTripleScreenControl: boolean
+): PlayerControl[] {
+  const controls: PlayerControl[] = [];
+  if (enableTripleScreenControl) {
+    controls.push(createTripleScreenControl());
+  }
+  if (enableOrientationControl) {
+    controls.push(createOrientationControl());
+  }
+  return controls;
+}
+
+function createTripleScreenControl(): PlayerControl {
+  return {
+    name: TRIPLE_SCREEN_CONTROL_NAME,
+    position: "right",
+    index: 29,
+    tooltip: "三屏画面",
+    html: `
+      <span class="video-player__triple-screen-control-icon" aria-hidden="true">
+        <svg width="30" height="30" viewBox="6 6 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M10.5 9.875h3.125v12.25H10.5A1.125 1.125 0 0 1 9.375 21V11c0-.621.504-1.125 1.125-1.125z" stroke="currentColor" stroke-width="1.75"/>
+          <path d="M18.25 9.75v12.5h-4.5V9.75h4.5z" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M21.5 9.875c.621 0 1.125.504 1.125 1.125v10c0 .621-.504 1.125-1.125 1.125h-3.125V9.875H21.5z" stroke="currentColor" stroke-width="1.75"/>
+        </svg>
+      </span>
+    `,
+    mounted(element) {
+      element.dataset.tripleScreenControl = "";
+      element.dataset.tripleScreenEligible = "false";
+      element.setAttribute("role", "button");
+      element.setAttribute("tabindex", "0");
+      element.setAttribute("aria-pressed", "false");
+      element.setAttribute("aria-label", "三屏画面");
+      element.setAttribute("title", "三屏画面");
+      this.events.proxy(element, "keydown", (event) => {
+        const keyEvent = event as KeyboardEvent;
+        if (keyEvent.key !== "Enter" && keyEvent.key !== " ") return;
+        keyEvent.preventDefault();
+        tripleScreenBindings.get(this)?.toggle();
+      });
+    },
+    click() {
+      tripleScreenBindings.get(this)?.toggle();
+    },
+  };
+}
+
+function bindTripleScreen(art: Artplayer, video: HTMLVideoElement, src: string) {
+  const player = art.template.$player;
+  const relaySrc = tripleScreenRelaySrc(src);
+  const canvas = document.createElement("canvas");
+  canvas.className = "video-player__triple-screen-canvas";
+  canvas.setAttribute("aria-hidden", "true");
+  player.appendChild(canvas);
+
+  let eligible = false;
+  let pendingRelayEnable:
+    | { time: number; shouldPlay: boolean; url: string }
+    | null = null;
+  let activePlaybackSrc = src;
+  let pendingEnableSuccessNotice = false;
+  const renderer = new TripleScreenRenderer({
+    container: player,
+    video,
+    canvas,
+    onVisibilityChange(visible) {
+      player.classList.toggle(TRIPLE_SCREEN_ACTIVE_CLASS, visible);
+      if (visible && pendingEnableSuccessNotice) {
+        pendingEnableSuccessNotice = false;
+        art.notice.show = "已开启三屏画面";
+      }
+    },
+    onError(error) {
+      pendingEnableSuccessNotice = false;
+      console.warn("[triple-screen] render failed", error);
+      player.classList.remove(TRIPLE_SCREEN_ACTIVE_CLASS);
+      updateTripleScreenControl(art, eligible, false);
+      art.notice.show = tripleScreenErrorNotice(error);
+    },
+  });
+
+  function rememberRequestedSource() {
+    const requested = nonBlobPlaybackURL(art.url) ||
+      nonBlobPlaybackURL(video.currentSrc);
+    if (requested) activePlaybackSrc = requested;
+  }
+
+  function pendingSourceMatches(url: string) {
+    const requested = nonBlobPlaybackURL(art.url);
+    if (requested) return samePlaybackURL(requested, url);
+    const current = nonBlobPlaybackURL(video.currentSrc);
+    if (current) return samePlaybackURL(current, url);
+    return samePlaybackURL(activePlaybackSrc, url);
+  }
+
+  function clearPendingRelayEnable() {
+    pendingRelayEnable = null;
+    pendingEnableSuccessNotice = false;
+  }
+
+  function updateEligibility() {
+    rememberRequestedSource();
+    eligible = isPortraitVideo(video.videoWidth, video.videoHeight);
+    if (
+      pendingRelayEnable &&
+      (!eligible || !pendingSourceMatches(pendingRelayEnable.url))
+    ) {
+      clearPendingRelayEnable();
+    }
+    if (!eligible) {
+      renderer.disable();
+      pendingEnableSuccessNotice = false;
+    }
+    if (
+      pendingRelayEnable &&
+      Number.isFinite(pendingRelayEnable.time)
+    ) {
+      video.currentTime = pendingRelayEnable.time;
+    }
+    updateTripleScreenControl(art, eligible, renderer.enabled);
+  }
+
+  function enableRenderer(showSuccessNotice: boolean) {
+    pendingEnableSuccessNotice = showSuccessNotice;
+    const enabled = renderer.enable();
+    if (!enabled) pendingEnableSuccessNotice = false;
+    updateTripleScreenControl(art, true, enabled);
+    return enabled;
+  }
+
+  function enableAfterRelayReady() {
+    const pending = pendingRelayEnable;
+    if (!pending) return;
+    if (!eligible || !pendingSourceMatches(pending.url)) {
+      clearPendingRelayEnable();
+      return;
+    }
+    pendingRelayEnable = null;
+    if (enableRenderer(true) && pending.shouldPlay) {
+      void video.play().catch(() => undefined);
+    }
+  }
+
+  function resetForNewSource() {
+    rememberRequestedSource();
+    if (
+      pendingRelayEnable &&
+      !pendingSourceMatches(pendingRelayEnable.url)
+    ) {
+      clearPendingRelayEnable();
+    }
+    pendingEnableSuccessNotice = false;
+    eligible = false;
+    renderer.disable();
+    player.classList.remove(TRIPLE_SCREEN_ACTIVE_CLASS);
+    updateTripleScreenControl(art, false, false);
+  }
+
+  const binding = {
+    toggle() {
+      if (!eligible) return;
+      if (renderer.enabled) {
+        pendingEnableSuccessNotice = false;
+        renderer.disable();
+        updateTripleScreenControl(art, true, false);
+        art.notice.show = "已关闭三屏画面";
+        return;
+      }
+
+      if (relaySrc && !isTripleScreenRelayURL(activePlaybackSrc)) {
+        pendingRelayEnable = {
+          time: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+          shouldPlay: !video.paused,
+          url: relaySrc,
+        };
+        renderer.disable();
+        updateTripleScreenControl(art, true, false);
+        art.notice.show = "正在切换到三屏中转播放";
+        activePlaybackSrc = relaySrc;
+        art.url = relaySrc;
+        return;
+      }
+
+      enableRenderer(true);
+    },
+    destroy() {
+      clearPendingRelayEnable();
+      renderer.destroy();
+    },
+  };
+
+  tripleScreenBindings.set(art, binding);
+  art.on("video:loadstart", resetForNewSource);
+  art.on("video:loadedmetadata", updateEligibility);
+  art.on("video:loadeddata", enableAfterRelayReady);
+  art.on("video:canplay", enableAfterRelayReady);
+  updateEligibility();
+
+  return () => {
+    art.off("video:loadstart", resetForNewSource);
+    art.off("video:loadedmetadata", updateEligibility);
+    art.off("video:loadeddata", enableAfterRelayReady);
+    art.off("video:canplay", enableAfterRelayReady);
+    tripleScreenBindings.delete(art);
+    binding.destroy();
+    player.classList.remove(TRIPLE_SCREEN_ACTIVE_CLASS);
+  };
+}
+
+function tripleScreenRelaySrc(src: string) {
+  if (typeof window === "undefined") return null;
+  let url: URL;
+  try {
+    url = new URL(src, window.location.href);
+  } catch {
+    return null;
+  }
+  if (url.origin !== window.location.origin) return null;
+  const pathname = url.pathname.toLowerCase();
+  const canRelay =
+    pathname.startsWith("/p/stream/") ||
+    (pathname.startsWith("/p/share/") && pathname.endsWith("/stream"));
+  if (!canRelay) return null;
+  url.searchParams.set(TRIPLE_SCREEN_RELAY_QUERY, "1");
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function isTripleScreenRelayURL(src: string) {
+  if (!src || typeof window === "undefined") return false;
+  try {
+    return new URL(src, window.location.href).searchParams.get(
+      TRIPLE_SCREEN_RELAY_QUERY
+    ) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function nonBlobPlaybackURL(src: unknown) {
+  if (typeof src !== "string" || !src || src.startsWith("blob:")) return "";
+  return src;
+}
+
+function samePlaybackURL(left: string, right: string) {
+  if (!left || !right || typeof window === "undefined") return left === right;
+  try {
+    return new URL(left, window.location.href).href ===
+      new URL(right, window.location.href).href;
+  } catch {
+    return left === right;
+  }
+}
+
+function tripleScreenErrorNotice(error: Error) {
+  if (
+    error.name === "SecurityError" ||
+    /cross-origin|cross origin|origin-clean|tainted|security/i.test(error.message)
+  ) {
+    return "当前视频源受跨域限制，无法开启三屏画面";
+  }
+  return "当前浏览器或视频源不支持三屏画面";
+}
+
+function updateTripleScreenControl(
+  art: Artplayer,
+  eligible: boolean,
+  enabled: boolean
+) {
+  const controls = (art as Artplayer & {
+    controls?: Record<string, HTMLElement | undefined>;
+  }).controls;
+  const element = controls?.[TRIPLE_SCREEN_CONTROL_NAME];
+  if (!element) return;
+
+  element.dataset.tripleScreenEligible = eligible ? "true" : "false";
+  element.setAttribute("aria-pressed", enabled ? "true" : "false");
+  element.setAttribute("aria-label", "三屏画面");
+  element.setAttribute("title", "三屏画面");
 }
 
 function createOrientationControl(): NonNullable<Option["controls"]>[number] {
@@ -944,17 +1950,6 @@ function getPlayerBrightness(art: Artplayer) {
   return Number.isFinite(value)
     ? clamp(value, BRIGHTNESS_MIN, BRIGHTNESS_MAX)
     : DEFAULT_SETTINGS.brightness;
-}
-
-function mobileGestureSeekSpan(duration: number) {
-  return Math.min(
-    duration,
-    clamp(
-      duration * GESTURE_SEEK_DURATION_RATIO,
-      GESTURE_SEEK_MIN_SECONDS,
-      GESTURE_SEEK_MAX_SECONDS
-    )
-  );
 }
 
 function seekGestureLabel(
@@ -1295,9 +2290,8 @@ function bindMobilePlayerGestures(
     const duration = video.duration;
     if (!Number.isFinite(duration) || duration <= 0) return;
     const rect = player.getBoundingClientRect();
-    const span = mobileGestureSeekSpan(duration);
     const targetTime = clamp(
-      state.startTime + (dx / Math.max(1, rect.width)) * span,
+      state.startTime + (dx / Math.max(1, rect.width)) * duration,
       0,
       duration
     );
@@ -1427,7 +2421,7 @@ function mediaErrorMessage(error: MediaError | null) {
     case MediaError.MEDIA_ERR_DECODE:
       return "视频编码无法解码，可能需要转码或换用浏览器。";
     case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
-      return "视频源暂不可用或格式不受当前浏览器支持。";
+      return "浏览器未能加载视频源，可能是网盘连接、地址失效或视频格式问题。";
     default:
       return "视频源暂时无法播放，请重试或复制地址排查。";
   }

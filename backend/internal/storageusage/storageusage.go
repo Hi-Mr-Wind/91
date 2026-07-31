@@ -3,9 +3,9 @@ package storageusage
 import (
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/video-site/backend/internal/localpath"
 	"github.com/video-site/backend/internal/mediaasset"
 )
 
@@ -73,7 +73,7 @@ func Compute(
 			continue
 		}
 		driveUsage := out.Drives[ref.DriveID]
-		for _, thumbPath := range mediaasset.ThumbnailPathCandidates(localDir, ref.ID) {
+		for _, thumbPath := range mediaasset.ThumbnailAssetPathCandidates(localDir, ref.ID) {
 			if size, exists, err := regularFileSize(thumbPath); err != nil {
 				return Usage{}, err
 			} else if exists {
@@ -124,20 +124,5 @@ func regularFileSize(path string) (int64, bool, error) {
 }
 
 func pathWithin(root, path string) (string, bool) {
-	if strings.TrimSpace(path) == "" {
-		return "", false
-	}
-	rootAbs, err := filepath.Abs(root)
-	if err != nil {
-		return "", false
-	}
-	pathAbs, err := filepath.Abs(path)
-	if err != nil {
-		return "", false
-	}
-	rel, err := filepath.Rel(rootAbs, pathAbs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", false
-	}
-	return pathAbs, true
+	return localpath.Within(root, path)
 }

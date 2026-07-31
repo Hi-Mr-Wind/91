@@ -16,33 +16,34 @@ import (
 	"github.com/video-site/backend/internal/drives"
 )
 
-func TestInitUsesOnlineRenewAPI(t *testing.T) {
+func TestInitUsesCustomOAuthClient(t *testing.T) {
 	var savedAccess, savedRefresh string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/renew" {
+		if r.URL.Path != "/token" || r.Method != http.MethodPost {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		if got := r.URL.Query().Get("refresh_ui"); got != "old-refresh" {
-			t.Fatalf("refresh_ui = %q", got)
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
 		}
-		if got := r.URL.Query().Get("server_use"); got != "true" {
-			t.Fatalf("server_use = %q", got)
+		if got := r.Form.Get("refresh_token"); got != "old-refresh" {
+			t.Fatalf("refresh_token = %q", got)
 		}
-		if got := r.URL.Query().Get("driver_txt"); got != "googleui_go" {
-			t.Fatalf("driver_txt = %q", got)
+		if got := r.Form.Get("client_id"); got != "client-id" {
+			t.Fatalf("client_id = %q", got)
 		}
-		writeTestJSON(w, tokenResp{
-			AccessToken:  "new-access",
-			RefreshToken: "new-refresh",
-		})
+		if got := r.Form.Get("client_secret"); got != "client-secret" {
+			t.Fatalf("client_secret = %q", got)
+		}
+		writeTestJSON(w, tokenResp{AccessToken: "new-access"})
 	}))
 	defer srv.Close()
 
 	d := New(Config{
 		ID:           "g",
 		RefreshToken: "old-refresh",
-		UseOnlineAPI: true,
-		RenewAPIURL:  srv.URL + "/renew",
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		OAuthURL:     srv.URL + "/token",
 		OnTokenUpdate: func(access, refresh string) {
 			savedAccess = access
 			savedRefresh = refresh
@@ -51,10 +52,10 @@ func TestInitUsesOnlineRenewAPI(t *testing.T) {
 	if err := d.Init(context.Background()); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
-	if d.accessToken != "new-access" || d.refreshToken != "new-refresh" {
+	if d.accessToken != "new-access" || d.refreshToken != "old-refresh" {
 		t.Fatalf("tokens not applied: access=%q refresh=%q", d.accessToken, d.refreshToken)
 	}
-	if savedAccess != "new-access" || savedRefresh != "new-refresh" {
+	if savedAccess != "new-access" || savedRefresh != "old-refresh" {
 		t.Fatalf("tokens not persisted: access=%q refresh=%q", savedAccess, savedRefresh)
 	}
 }
@@ -270,11 +271,8 @@ func TestRequestRefreshesOnUnauthorized(t *testing.T) {
 	var fileCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/renew":
-			writeTestJSON(w, tokenResp{
-				AccessToken:  "new-access",
-				RefreshToken: "new-refresh",
-			})
+		case "/token":
+			writeTestJSON(w, tokenResp{AccessToken: "new-access"})
 		case "/drive/v3/files/file-1":
 			fileCalls++
 			if fileCalls == 1 {
@@ -297,8 +295,9 @@ func TestRequestRefreshesOnUnauthorized(t *testing.T) {
 	d := New(Config{
 		ID:           "g",
 		RefreshToken: "old-refresh",
-		UseOnlineAPI: true,
-		RenewAPIURL:  srv.URL + "/renew",
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		OAuthURL:     srv.URL + "/token",
 		APIBaseURL:   srv.URL + "/drive/v3",
 	})
 	d.accessToken = "old-access"
@@ -309,7 +308,7 @@ func TestRequestRefreshesOnUnauthorized(t *testing.T) {
 	if fileCalls != 2 {
 		t.Fatalf("fileCalls = %d", fileCalls)
 	}
-	if d.accessToken != "new-access" || d.refreshToken != "new-refresh" {
+	if d.accessToken != "new-access" || d.refreshToken != "old-refresh" {
 		t.Fatalf("tokens not refreshed: access=%q refresh=%q", d.accessToken, d.refreshToken)
 	}
 }

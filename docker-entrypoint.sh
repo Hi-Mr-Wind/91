@@ -18,9 +18,7 @@ if [ ! -f "$CONFIG" ]; then
   mkdir -p "$(dirname "$CONFIG")"
   cp "$EXAMPLE" "$CONFIG"
 
-  SECRET="$(openssl rand -hex 32)"
   sed -i -E "s#^([[:space:]]*listen:[[:space:]]*).*\$#\1\"0.0.0.0:${PORT}\"#" "$CONFIG"
-  sed -i -E "s#^([[:space:]]*session_secret:[[:space:]]*).*\$#\1\"${SECRET}\"#" "$CONFIG"
   sed -i -E "s#^([[:space:]]*db_path:[[:space:]]*).*\$#\1\"${DATA_DIR}/video-site.db\"#" "$CONFIG"
   sed -i -E "s#^([[:space:]]*local_preview_dir:[[:space:]]*).*\$#\1\"${DATA_DIR}/previews\"#" "$CONFIG"
   chmod 600 "$CONFIG"

@@ -26,7 +26,14 @@ async function request<T>(
   }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(text || `HTTP ${res.status}`);
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Keep a plain-text error response as-is.
+    }
+    throw new Error(message || `HTTP ${res.status}`);
   }
   if (res.status === 204) return undefined as T;
   const ct = res.headers.get("content-type") ?? "";
@@ -67,6 +74,7 @@ export type UpdateCheck = {
   latestVersion: string;
   hasUpdate: boolean;
   releaseUrl?: string;
+  releaseNotes?: string;
   checkedAt: string;
 };
 
@@ -74,11 +82,208 @@ export function checkUpdate() {
   return request<UpdateCheck>("/update/check");
 }
 
+// ---------- Full backup / migration restore ----------
+
+export type BackupEstimate = {
+  fileCount: number;
+  totalBytes: number;
+  availableBytes: number;
+  requiredBytes: number;
+};
+
+export type BackupTask = {
+  id: string;
+  state: string;
+  phase?: string;
+  name?: string;
+  startedAt: string;
+  finishedAt?: string;
+  fileCount: number;
+  processedFiles: number;
+  totalBytes: number;
+  processedBytes: number;
+  bytesPerSecond: number;
+  error?: string;
+  cancellable: boolean;
+};
+
+export type BackupRecord = {
+  id: string;
+  name: string;
+  size: number;
+  sha256?: string;
+  createdAt: string;
+  verificationStatus: "verified" | "unchecked" | "invalid" | string;
+  verificationError?: string;
+  imported: boolean;
+  appVersion?: string;
+  sourceDataRoot?: string;
+  fileCount?: number;
+  expandedSize?: number;
+  included?: string[];
+};
+
+export type BackupList = {
+  backups: BackupRecord[];
+  current?: BackupTask;
+  restoreProgress?: BackupOperationProgress;
+  estimate: BackupEstimate;
+  restartManaged: boolean;
+  pendingRestore: boolean;
+};
+
+export type BackupOperationProgress = {
+  phase: string;
+  processedBytes: number;
+  totalBytes: number;
+  processedFiles: number;
+  totalFiles: number;
+};
+
+export type BackupUploadChunk = {
+  index: number;
+  size: number;
+  sha256: string;
+};
+
+export type BackupUploadSession = {
+  id: string;
+  fileName: string;
+  size: number;
+  sha256?: string;
+  chunkSize: number;
+  totalChunks: number;
+  received: BackupUploadChunk[];
+  state: string;
+  progress?: BackupOperationProgress;
+  createdAt: string;
+  expiresAt: string;
+};
+
+export type BackupManifest = {
+  formatVersion: number;
+  appVersion: string;
+  createdAt: string;
+  sourceDataRoot: string;
+  fileCount: number;
+  totalSize: number;
+  included: string[];
+};
+
+export type RestoreReport = {
+  manifest: BackupManifest;
+  verificationStatus: string;
+  pathRewrites?: string[];
+  localStorageWarnings?: string[];
+  missingAssets?: string[];
+  warnings?: string[];
+};
+
+export function listBackups() {
+  return request<BackupList>("/backups");
+}
+
+export function createBackup() {
+  return request<BackupTask>("/backups", { method: "POST" });
+}
+
+export function cancelBackup() {
+  return request<{ ok: boolean }>("/backups/current/cancel", { method: "POST" });
+}
+
+export function deleteBackup(id: string) {
+  return request<{ ok: boolean }>(`/backups/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function backupDownloadURL(id: string) {
+  return `${BASE}/backups/${encodeURIComponent(id)}/download`;
+}
+
+export function beginBackupUpload(input: {
+  fileName: string;
+  size: number;
+  sha256?: string;
+}) {
+  return request<BackupUploadSession>("/backup-uploads", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function getBackupUpload(id: string) {
+  return request<BackupUploadSession>(`/backup-uploads/${encodeURIComponent(id)}`);
+}
+
+export async function putBackupUploadChunk(
+  id: string,
+  index: number,
+  chunk: Blob,
+  sha256: string,
+  signal?: AbortSignal
+): Promise<BackupUploadSession> {
+  const res = await fetch(
+    `${BASE}/backup-uploads/${encodeURIComponent(id)}/chunks/${index}`,
+    {
+      method: "PUT",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Chunk-SHA256": sha256,
+      },
+      body: chunk,
+      signal,
+    }
+  );
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Keep plain text.
+    }
+    throw new Error(message || `HTTP ${res.status}`);
+  }
+  return (await res.json()) as BackupUploadSession;
+}
+
+export function finalizeBackupUpload(id: string) {
+  return request<BackupRecord>(
+    `/backup-uploads/${encodeURIComponent(id)}/finalize`,
+    { method: "POST" }
+  );
+}
+
+export function cancelBackupUpload(id: string) {
+  return request<{ ok: boolean }>(`/backup-uploads/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function restoreBackup(
+  id: string,
+  input: { confirmation: string }
+) {
+  return request<{
+    ok: boolean;
+    restarting: boolean;
+    restartManaged: boolean;
+    report: RestoreReport;
+  }>(`/backups/${encodeURIComponent(id)}/restore`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 // ---------- Drives ----------
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "webdav" | "localstorage";
   name: string;
   rootId: string;
   status: string;
@@ -92,10 +297,6 @@ export type AdminDrive = {
    * 替代旧版硬编码 p115 "影视" 目录例外分支。
    */
   skipDirIds: string[];
-  // Google Drive 是否使用 OpenList 在线续期 API；未配置时后端按 true 返回。
-  googleDriveUseOnlineAPI?: boolean;
-  // Google Drive OpenList 在线续期 API 地址；为空时后端使用驱动默认值。
-  googleDriveOpenListApiUrl?: string;
   // localstorage 的 .strm 是否允许指向存储根目录之外；未配置时后端按 false 返回。
   strmAllowOutsideRoot?: boolean;
   scanGenerationStatus?: DriveGenerationStatus;
@@ -135,6 +336,12 @@ export function listDrives() {
   return request<AdminDrive[]>("/drives");
 }
 
+export function getDriveCredentials(id: string) {
+  return request<{ credentials: Record<string, string> }>(
+    `/drives/${encodeURIComponent(id)}/credentials`
+  );
+}
+
 export type DriveStorageUsage = {
   thumbnailBytes: number;
   teaserBytes: number;
@@ -153,7 +360,7 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "webdav" | "localstorage";
   name: string;
   rootId: string;
   credentials: Record<string, string>;
@@ -210,6 +417,7 @@ export type AdminCrawler = {
   proxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
+  paused: boolean;
   teaserEnabled: boolean;
   lastCrawlAt?: number;
   scanGenerationStatus?: DriveGenerationStatus;
@@ -327,9 +535,74 @@ export function stopCrawlerTasks(id: string) {
   );
 }
 
+export function setCrawlerPaused(id: string, paused: boolean) {
+  return request<{ ok: boolean; paused: boolean }>(
+    `/crawlers/${encodeURIComponent(id)}/paused`,
+    {
+      method: "POST",
+      body: JSON.stringify({ paused }),
+    }
+  );
+}
+
 export function deleteCrawler(id: string) {
   return request<{ ok: boolean; deletedVideos: number; deletedScript?: boolean; warning?: string }>(`/crawlers/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+}
+
+export type QuarkQRSession = {
+  token: string;
+  qrCodeUrl: string;
+  qrImageDataUrl: string;
+  expiresAt: string;
+};
+
+export type QuarkQRStatus = {
+  state: "waiting" | "success" | "expired" | "error";
+  status: number;
+  statusText: string;
+  cookie?: string;
+};
+
+export function startQuarkQRLogin() {
+  return request<QuarkQRSession>("/drives/quark/qr", { method: "POST" });
+}
+
+export function getQuarkQRStatus(token: string) {
+  return request<QuarkQRStatus>("/drives/quark/qr/status", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+}
+
+export type P115QRSession = {
+  uid: string;
+  time: number;
+  sign: string;
+  qrCodeUrl: string;
+  qrImageDataUrl: string;
+};
+
+export type P115QRStatus = {
+  state: "waiting" | "scanned" | "success" | "expired" | "canceled" | "error";
+  status: number;
+  statusText: string;
+  cookie?: string;
+};
+
+export function startP115QRLogin() {
+  return request<P115QRSession>("/drives/p115/qr", { method: "POST" });
+}
+
+export function getP115QRStatus(session: Pick<P115QRSession, "uid" | "time" | "sign">) {
+  return request<P115QRStatus>("/drives/p115/qr/status", {
+    method: "POST",
+    body: JSON.stringify({
+      uid: session.uid,
+      time: session.time,
+      sign: session.sign,
+    }),
   });
 }
 
@@ -519,6 +792,8 @@ export type AdminVideo = {
   title: string;
   author: string;
   tags: string[];
+  tagSources?: Record<string, string>;
+  tagEvidence?: Record<string, string>;
   durationSeconds: number;
   size: number;
   ext: string;
@@ -542,11 +817,28 @@ export type AdminVideoList = {
   size: number;
 };
 
+export type AdminVideoListParams = {
+  driveId?: string;
+  crawlerId?: string;
+  createdFrom?: string;
+  createdTo?: string;
+  durationMinMinutes?: string;
+  durationMaxMinutes?: string;
+  page?: number;
+  size?: number;
+  keyword?: string;
+};
+
 export function listVideos(
-  params: { driveId?: string; page?: number; size?: number; keyword?: string } = {}
+  params: AdminVideoListParams = {}
 ) {
   const qs = new URLSearchParams();
   if (params.driveId) qs.set("driveId", params.driveId);
+  if (params.crawlerId) qs.set("crawlerId", params.crawlerId);
+  if (params.createdFrom) qs.set("createdFrom", params.createdFrom);
+  if (params.createdTo) qs.set("createdTo", params.createdTo);
+  if (params.durationMinMinutes) qs.set("durationMinMinutes", params.durationMinMinutes);
+  if (params.durationMaxMinutes) qs.set("durationMaxMinutes", params.durationMaxMinutes);
   if (params.page) qs.set("page", String(params.page));
   if (params.size) qs.set("size", String(params.size));
   if (params.keyword) qs.set("keyword", params.keyword);
@@ -565,7 +857,7 @@ export function getVideoStats() {
 }
 
 // 黑名单（被拉黑/手动删除、扫盘不再入库的视频）。原始记录已删除，
-// 只剩文件名/来源盘/大小/拉黑时间。
+// 这里只保留重新发现所需信息和恢复策略；源文件删除成功后记录会被移除。
 export type AdminDeletedVideo = {
   id: string;
   driveId: string;
@@ -573,6 +865,10 @@ export type AdminDeletedVideo = {
   fileName: string;
   size: number;
   reason?: string;
+  sourceDeleted: boolean;
+  canonicalVideoId?: string;
+  canonicalTitle?: string;
+  restorePolicy: "none" | "scan" | "crawler";
   deletedAt: number;
 };
 
@@ -595,16 +891,48 @@ export function listBlacklist(
   return request<AdminBlacklistList>(`/blacklist${suffix}`);
 }
 
-// 把视频移出黑名单（删除墓碑），下次扫盘会重新入库。
+// 允许视频在后续手动/定时任务中重新入库；此操作不会立即触发扫盘或爬取。
 export function removeBlacklist(id: string) {
   return request<{ ok: boolean }>(`/blacklist/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
 }
 
+export type BlacklistSourceDeleteStatus = {
+  state: "idle" | "running" | "completed" | "failed" | "canceled";
+  running: boolean;
+  pending: number;
+  total: number;
+  processed: number;
+  deleted: number;
+  failed: number;
+  currentFile?: string;
+  lastError?: string;
+  startedAt?: string;
+  lastFinishedAt?: string;
+};
+
+export function getBlacklistSourceDeleteStatus() {
+  return request<BlacklistSourceDeleteStatus>("/blacklist/source-delete/status");
+}
+
+export function startBlacklistSourceDelete(
+  options: { deleteAllSources?: boolean; ids?: string[] } = { deleteAllSources: true }
+) {
+  const ids = Array.from(new Set((options.ids ?? []).map((id) => id.trim()).filter(Boolean)));
+  const body = options.ids !== undefined ? { ids } : { deleteAllSources: options.deleteAllSources ?? true };
+  return request<{
+    ok: boolean;
+    accepted: boolean;
+    message?: string;
+    status: BlacklistSourceDeleteStatus;
+  }>("/blacklist/source-delete", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 export type UpdateVideoInput = Partial<{
-  title: string;
-  author: string;
   tags: string[];
   badges: string[];
   description: string;
@@ -637,25 +965,85 @@ export function regenPreview(id: string) {
   );
 }
 
+// ---------- 疑似重复复核 ----------
+
+export type DuplicateReviewVideo = {
+  id: string;
+  title: string;
+  driveId: string;
+  size: number;
+  durationSeconds: number;
+  thumbnailUrl: string;
+  views: number;
+  likes: number;
+  createdAt: number;
+};
+
+export type DuplicateReviewPair = {
+  id: number;
+  medianSsim: number;
+  minSsim: number;
+  comparisons: number;
+  status: "pending" | "merged" | "dismissed";
+  createdAt: number;
+  updatedAt: number;
+  left: DuplicateReviewVideo | null;
+  right: DuplicateReviewVideo | null;
+};
+
+export function listDuplicateReviews(status: string, page: number) {
+  const params = new URLSearchParams({ status, page: String(page) });
+  return request<{ items: DuplicateReviewPair[]; total: number }>(
+    `/duplicate-reviews?${params.toString()}`
+  );
+}
+
+export function resolveDuplicateReview(
+  id: number,
+  action: "keep-left" | "keep-right" | "dismiss"
+) {
+  return request<{ ok: boolean }>(
+    `/duplicate-reviews/${id}/resolve`,
+    { method: "POST", body: JSON.stringify({ action }) }
+  );
+}
+
 // ---------- Tags ----------
 
 export type AdminTag = {
   id: number;
   label: string;
-  aliases?: string[];
+  matchRules?: {
+    keywords?: string[];
+    matchAvCode?: boolean;
+    avCodePrefixes?: string[];
+  };
   source: string;
   count: number;
+  crawlerOwned?: boolean;
 };
+
+export type TagMatchRules = NonNullable<AdminTag["matchRules"]>;
 
 export function listTags() {
   return request<AdminTag[]>("/tags");
 }
 
-export function createTag(label: string, aliases: string[]) {
+export function createTag(label: string) {
   return request<{ label: string; classified: number }>("/tags", {
     method: "POST",
-    body: JSON.stringify({ label, aliases }),
+    body: JSON.stringify({ label }),
   });
+}
+
+export function updateTag(id: number, matchRules: TagMatchRules) {
+  return request<{ tag: AdminTag }>(
+    `/tags/${encodeURIComponent(String(id))}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ matchRules }),
+    }
+  );
 }
 
 export function deleteTag(id: number) {

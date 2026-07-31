@@ -3,16 +3,6 @@ import { QrCode } from "lucide-react";
 import * as api from "../api";
 import { useToast } from "../ToastContext";
 
-function wopanQRStatusClass(
-  status: api.WopanQRStatus | null,
-  completed: boolean,
-  error: string
-): string {
-  if (completed || status?.state === 3) return "is-ok";
-  if (error || status?.state === 4) return "is-error";
-  return "is-pending";
-}
-
 export function WopanQRCodeLogin({
   onCredentials,
 }: {
@@ -92,11 +82,6 @@ export function WopanQRCodeLogin({
     };
   }, [session, completed, onCredentials, show]);
 
-  const statusText = completed
-    ? "已获取凭证"
-    : pollingError || status?.statusText || (session ? "等待扫码" : "未生成二维码");
-  const statusClass = wopanQRStatusClass(status, completed, pollingError);
-
   return (
     <div className="admin-form__row">
       <label>扫码登录</label>
@@ -111,7 +96,6 @@ export function WopanQRCodeLogin({
             <QrCode size={14} />
             {starting ? "生成中..." : session ? "重新生成二维码" : "生成二维码"}
           </button>
-          <span className={`admin-status ${statusClass}`}>{statusText}</span>
         </div>
 
         {session && (
@@ -122,9 +106,11 @@ export function WopanQRCodeLogin({
               alt="联通网盘扫码登录二维码"
             />
             <div className="admin-p123-qr__meta">
-              <div className="admin-form__help">
-                使用联通网盘 App 扫码并确认登录；确认后系统会自动填入 access_token 和 refresh_token。
-              </div>
+              {pollingError && (
+                <div className="admin-form__help">
+                  {pollingError}
+                </div>
+              )}
               {session.expiresAt && (
                 <div className="admin-form__help">
                   过期时间：{new Date(session.expiresAt).toLocaleTimeString("zh-CN", {

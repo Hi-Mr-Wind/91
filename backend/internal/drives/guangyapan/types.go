@@ -49,6 +49,7 @@ type fileItem struct {
 	ParentID string `json:"parentId"`
 	FileName string `json:"fileName"`
 	FileSize int64  `json:"fileSize"`
+	GCID     string `json:"gcid"`
 	ResType  int    `json:"resType"`
 	CTime    int64  `json:"ctime"`
 	UTime    int64  `json:"utime"`

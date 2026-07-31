@@ -1,79 +1,102 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { Link, useNavigate } from "react-router-dom";
 import {
   ChevronLeft,
   Heart,
-  Maximize,
-  Minimize,
+  Play,
   Volume2,
   VolumeX,
   EyeOff,
   Info,
-  Sparkles,
   AlertCircle,
+  Share2,
 } from "lucide-react";
+import { hideVideo, type ShortsItem } from "@/data/videos";
 import {
-  fetchShortsNext,
-  hideVideo,
-  type ShortsItem,
-} from "@/data/videos";
+  averageBytesPerSecond,
+  clamp,
+  getVideoWindowBounds,
+  preloadBufferSecondsFor,
+  preloadKeepSecondsFor,
+  videoBufferIsCritical,
+  videoHasBufferedData,
+  videoHasComfortableBuffer,
+} from "@/shorts/mediaBuffer";
+import {
+  isIOSStandbyPreloadDisabled,
+  isLegacyShortsVideoTransitionEnabled,
+  isWindowsPlatform,
+  shouldUseDocumentScrollForShorts,
+  shouldUseIOSSharedVideo,
+} from "@/shorts/platform";
+import {
+  isShortsDebugEnabled,
+  ShortsDebugHud,
+  type ShortsLoopDebugProbe,
+} from "@/shorts/ShortsDebugHud";
+import { useShortsFeed } from "@/shorts/useShortsFeed";
+import {
+  getShortsQueueTrimCount,
+  shortsQueueItemKey,
+} from "@/shorts/shortsFeed";
+import {
+  useShortsKeyboard,
+  type ShortsKeyboardSeekPreview,
+} from "@/shorts/useShortsKeyboard";
+import { useShortsSlideGestures } from "@/shorts/useShortsSlideGestures";
+import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
+import { useAuth } from "@/admin/AuthContext";
+import {
+  copyExistingVideoShareURL,
+  createAndCopyVideoShare,
+} from "@/lib/videoShareClipboard";
 import "@/styles/shorts.css";
-
-// 短视频"已看过"列表存在 localStorage，与普通详情页历史完全独立。
-const SEEN_STORAGE_KEY = "shorts_seen_ids_v1";
-
-// 每次向后端取多少条续到队列尾。值不要太大避免一次返回过多浪费；
-// 也不要太小导致频繁请求和滑动卡顿。
-const BATCH_SIZE = 5;
-
-// 当队列里"还没看过的视频"少于这个数时，提前请求下一批。
-const PREFETCH_THRESHOLD = 2;
-
-// 当前视频至少有这么多秒的前向缓冲后，才允许后续视频开始预加载。
-const ACTIVE_PRELOAD_BUFFER_SECONDS = 12;
 
 // 当前视频流畅播放后，向后预加载多少条视频。
 const PRELOAD_AHEAD_COUNT = 2;
 
-// 预加载授权一旦发出，只有当前视频前向缓冲跌破这个秒数（或发生 stall）
-// 才收回。高低水位之间不动作，避免缓冲量在 12s 附近波动时
-// 反复绑定/剥离后续视频的 src、丢弃已预加载的数据。
-const ACTIVE_PRELOAD_KEEP_SECONDS = 4;
+// 距当前屏多少条以内的 slide 才渲染真正的内容（背景、海报、文案、操作栏）。
+// 即使队列已经有几十条，也只让附近 slide 持有位图和完整子树；窗口外退化成
+// 等高空壳，滚动几何和 IntersectionObserver 的观测目标都不受影响，滑回来
+// 时重新挂载内容，海报走 HTTP 缓存不会有二次请求。
+//
+// 半径不能收到 1：iOS 那两个持久 video 元素寄放在 slide 的插槽 div 里，
+// 插槽随内容一起卸载，而元素一旦被移出 DOM，WebKit 授予它的有声播放
+// 权限就没了。两个元素的落点始终在 activeIndex ±1（刚提升时备用元素会
+// 短暂停在 activeIndex-1，直到预载把它挪到 activeIndex+1），留足余量。
+const SLIDE_CONTENT_WINDOW_RADIUS = 3;
 
-// 维护一个固定大小的视频窗口：窗口内才 mount 真实 <video> 壳。
-// 当前屏先绑定 src；后续预加载要等当前屏缓冲健康后才开始。
-// 窗口内只要已经产生过可复用缓冲，就保留 src 复用浏览器缓存。
-const VIDEO_WINDOW_SIZE = 6;
-
-function loadSeenIds(): string[] {
-  try {
-    const raw = localStorage.getItem(SEEN_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((x): x is string => typeof x === "string");
-  } catch {
-    return [];
-  }
-}
-
-function saveSeenIds(ids: string[]) {
-  try {
-    localStorage.setItem(SEEN_STORAGE_KEY, JSON.stringify(ids));
-  } catch {
-    // 配额满或隐私模式：忽略，最多导致下一轮可能重复，不影响功能
-  }
-}
+// iOS 的 AVPlayer 在向后 seek 以开始下一轮时，偶尔会保持“逻辑上正在播放”
+// 但迟迟没有新画面。先走普通 seek；超过这个时间仍未呈现首帧时，才对同一
+// media element 做一次 load() 自救，避免每轮都重新请求视频。
+const IOS_LOOP_FRAME_WATCHDOG_MS = 1200;
+const IOS_LOOP_RELOAD_TIMEOUT_MS = 6000;
+// WebKit 会在极短的解码抖动中发 waiting。延迟一点再展示，避免视频画面
+// 仍在连续推进时闪出或残留加载图标。
+const SHORTS_BUFFERING_INDICATOR_DELAY_MS = 180;
 
 export default function ShortsPage() {
-  // 已加入页面的视频队列（按出现顺序）
-  const [items, setItems] = useState<ShortsItem[]>([]);
+  const { isAdmin } = useAuth();
+  const navigate = useNavigate();
   // 当前在视口里的视频索引
   const [activeIndex, setActiveIndex] = useState(0);
+  // 队列因空库被丢弃时回到第一屏
+  const handleQueueReset = useCallback(() => setActiveIndex(0), []);
+  // 已加入页面的视频队列（按出现顺序）与拉取状态
+  const { items, loading, empty, loadError, loadMore, trimQueueBefore } =
+    useShortsFeed(activeIndex, handleQueueReset);
+  const activeItemKey = items[activeIndex]
+    ? shortsQueueItemKey(items[activeIndex])
+    : "";
   // 是否静音；首次必须静音才能 autoplay，用户点击后切换
   const [muted, setMuted] = useState(true);
-  // 音量大小 (0 ~ 1)
-  const [volume, setVolume] = useState(0.8);
   // 全局 Toast / HUD 提醒文字
   const [hudText, setHudText] = useState<{ id: number; text: string; icon?: React.ReactNode } | null>(null);
   const hudTimeoutRef = useRef<number | null>(null);
@@ -90,57 +113,39 @@ export default function ShortsPage() {
     e.stopPropagation();
   }, []);
 
-  const handleVolumeButtonClick = useCallback(() => {
-    const activeVideo = videoRefs.current.get(activeIndex);
+  const handleMuteButtonClick = useCallback(() => {
+    const activeVideo = getVideoAtIndex(activeIndex);
     const canResumeActiveVideo = () =>
       Boolean(activeVideo) &&
-      videoRefs.current.get(activeIndexRef.current) === activeVideo &&
+      getVideoAtIndex(activeIndexRef.current) === activeVideo &&
       userPausedIndexRef.current !== activeIndexRef.current;
-    const wasPlaying = Boolean(activeVideo) && canResumeActiveVideo() && !activeVideo?.paused;
-    setMuted((v) => {
-      const next = !v;
-      if (activeVideo) {
-        normalizeVideoPlaybackRate(activeVideo);
-        applyVideoAudioState(activeVideo, next, volume);
-        stabilizeVideoAfterAudioToggle(
-          activeVideo,
-          () => wasPlaying && canResumeActiveVideo()
-        );
-      }
-      showHud(
-        next ? "已静音" : "音量已开启",
-        next ? <VolumeX size={16} /> : <Volume2 size={16} />
-      );
-      return next;
-    });
-  }, [activeIndex, showHud, volume]);
-
-  const handleVolumeSliderChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseFloat(e.target.value);
-    setVolume(val);
-    if (val > 0) {
-      setMuted(false);
-    } else {
-      setMuted(true);
-    }
-    // Update active video volume directly
-    const activeVideo = videoRefs.current.get(activeIndex);
+    const next = !muted;
     if (activeVideo) {
       normalizeVideoPlaybackRate(activeVideo);
-      applyVideoAudioState(activeVideo, val === 0, val);
-      const wasPlaying =
-        videoRefs.current.get(activeIndexRef.current) === activeVideo &&
-        userPausedIndexRef.current !== activeIndexRef.current &&
-        !activeVideo.paused;
+      applyVideoMutedState(activeVideo, next);
+      // 必须直接发生在这个 click 回调中：这一次 play() 给 iOS 的持久
+      // media element 授予有声播放权限，之后切 src 仍复用同一元素。
+      if (canResumeActiveVideo()) {
+        activeVideo.play().catch(() => undefined);
+      }
       stabilizeVideoAfterAudioToggle(
         activeVideo,
-        () =>
-          wasPlaying &&
-          videoRefs.current.get(activeIndexRef.current) === activeVideo &&
-          userPausedIndexRef.current !== activeIndexRef.current
+        canResumeActiveVideo
       );
     }
-  }, [activeIndex]);
+    // 预载用的备用元素之后会被提升为播放元素，而 WebKit 的有声播放授权是
+    // 按 media element 记账的。趁这次用户手势一并给它授权，否则它接管播放
+    // 的那一刻会被当成"没有手势的有声自动播放"直接拒掉。
+    const standbyVideo = iosStandbyVideoRef.current;
+    if (standbyVideo && standbyVideo !== activeVideo) {
+      unlockVideoAudioPlayback(standbyVideo);
+    }
+    setMuted(next);
+    showHud(
+      next ? "已静音" : "音量已开启",
+      next ? <VolumeX size={16} /> : <Volume2 size={16} />
+    );
+  }, [activeIndex, muted, showHud]);
 
   // 组件卸载时清理 HUD 定时器
   useEffect(() => {
@@ -149,56 +154,99 @@ export default function ShortsPage() {
     };
   }, []);
 
-  // 是否正在加载下一批，避免并发请求
-  const [loading, setLoading] = useState(false);
-  // 后端报告"本轮已耗尽"，下次请求前会自动重置
-  const [roundComplete, setRoundComplete] = useState(false);
-  // 没有任何视频可放（库为空 / 全部隐藏）
-  const [empty, setEmpty] = useState(false);
-
-  // seenIds 用 ref 维护，方便在异步 callback 里读到最新值
-  const seenIdsRef = useRef<string[]>(loadSeenIds());
-
   const containerRef = useRef<HTMLDivElement | null>(null);
-  // 整个页面根元素，用于 requestFullscreen
-  const pageRef = useRef<HTMLDivElement | null>(null);
+  const itemsLengthRef = useRef(items.length);
+  itemsLengthRef.current = items.length;
+  // 整页只建一个 slide 观察器，新批次到达时增量补充观察目标。
+  const slideObserverRef = useRef<IntersectionObserver | null>(null);
+  const observedSlidesRef = useRef<WeakSet<Element>>(new WeakSet());
   // index → video element，用来精确控制播放/暂停
   const videoRefs = useRef<Map<number, HTMLVideoElement>>(new Map());
+  const videoRefCallbacks = useRef<
+    Map<number, (el: HTMLVideoElement | null) => void>
+  >(new Map());
+  const iosSharedVideoRef = useRef<HTMLVideoElement | null>(null);
+  // iOS 用两个持久 media element 做乒乓：一个播当前，一个提前把下一条拉下来，
+  // 滑动到位时只交换角色。iosSharedVideoRef 永远指向"正在播放的那个"，
+  // 因此这次交换对 ShortsSlide 完全透明。
+  const iosStandbyVideoRef = useRef<HTMLVideoElement | null>(null);
+  // 两个元素各自"是为哪一屏准备的"。队列里同一个视频 id 可能重复出现，
+  // 只比对 id 会在相邻两条恰好同源时把备用元素误提升，导致当前这条从头
+  // 重播；索引对上了才是真正预载好的那一屏。
+  const iosSharedVideoIndexRef = useRef(-1);
+  const iosStandbyVideoIndexRef = useRef(-1);
+  const iosSharedVideoSlots = useRef<Map<number, HTMLDivElement>>(new Map());
+  const iosSharedVideoSlotCallbacks = useRef<
+    Map<number, (el: HTMLDivElement | null) => void>
+  >(new Map());
   const activeIndexRef = useRef(0);
+  const queueTrimInProgressRef = useRef(false);
+  const pendingQueueTrimRef = useRef<{
+    anchorKey: string;
+    activeIndex: number;
+  } | null>(null);
+  // Windows 退出浏览器全屏时视口高度会改变。调整滚动位置期间锁住当前
+  // slide，避免 IntersectionObserver 把新的像素位置误判成后续视频。
+  const viewportResizeAnchorIndexRef = useRef<number | null>(null);
   const userPausedIndexRef = useRef<number | null>(null);
-  const ignoreIntersectionUntilRef = useRef(0);
-  const fullscreenRestoreTimersRef = useRef<number[]>([]);
-  const fullscreenPointerHandledRef = useRef(false);
   const [activeReadyForPreload, setActiveReadyForPreload] = useState(false);
-  const [userPausedIndex, setUserPausedIndexState] = useState<number | null>(null);
+  const [, setUserPausedIndexState] = useState<number | null>(null);
   const [cacheableSourceIds, setCacheableSourceIds] = useState<Set<string>>(
     () => new Set()
   );
   const [cacheWindowHighIndex, setCacheWindowHighIndex] = useState(-1);
 
-  // 当前是否处在浏览器全屏（Fullscreen API）状态。
-  // iPhone Safari 不支持网页元素级全屏；那种环境下改用页面滚动让浏览器栏随刷动收起。
-  const useDocumentScroll = shouldUseDocumentScrollForShorts();
-  const [canRequestFullscreen, setCanRequestFullscreen] = useState(() =>
-    supportsElementFullscreenAPI()
+  // ?debug=1 时叠加只读观测面板；开关在页面生命周期内固定。
+  const [debugHudEnabled] = useState(isShortsDebugEnabled);
+  // 当前活跃 slide 注册的循环重启状态读取器，只供调试面板轮询。
+  const loopDebugProbeRef = useRef<ShortsLoopDebugProbe | null>(null);
+  // ?iosPreload=0 时完全不启用备用元素，用于对照实验。
+  const [iosStandbyPreloadDisabled] = useState(isIOSStandbyPreloadDisabled);
+  // 默认走稳定合成层；查询参数仅供 iOS 真机 A/B/紧急回退。
+  const [legacyVideoTransitionEnabled] = useState(
+    isLegacyShortsVideoTransitionEnabled
   );
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  // iPhone 浏览器里改用页面滚动，让 Safari 工具栏能随刷动收起。
+  const useDocumentScroll = shouldUseDocumentScrollForShorts();
+  // Windows 短视频页只保留静音图标；不挂载桌面 hover 音量条，避免点击
+  // 图标时因鼠标仍停留在按钮上而展开滑杆。
+  const isWindowsShortsPlatform = isWindowsPlatform();
+  // iOS/WebKit 的有声播放授权按 media element 管理。iOS 分支始终复用
+  // 同一个真实 <video>，滑动时只移动节点并更换 src。
+  const useIOSSharedVideo = shouldUseIOSSharedVideo();
+
+  const handleBackToHomeClick = useCallback(
+    (event: React.MouseEvent<HTMLAnchorElement>) => {
+      // 主页导航点击 documentElement 后进入的是“文档全屏”，SPA 路由切换
+      // 不会自动退出。先等待 Fullscreen API 完成，再渲染首页，避免首页继承
+      // 短视频的全屏状态或先以全屏闪现。
+      const exitRequest = exitDocumentFullscreen();
+      if (!exitRequest) return;
+
+      event.preventDefault();
+      const returnHome = () => navigate("/");
+      void exitRequest.then(returnHome, returnHome);
+    },
+    [navigate]
+  );
+
+  function getVideoAtIndex(index: number) {
+    if (useIOSSharedVideo && index === activeIndexRef.current) {
+      return iosSharedVideoRef.current ?? undefined;
+    }
+    return videoRefs.current.get(index);
+  }
 
   // 本次会话内已经点过赞的视频 id 集合。
   // 与后端的真实 likes 字段同步——后端是单纯计数器，前端在这里防重避免连发。
   // 用户在操作栏点取消时会从这里移除，允许之后再次点赞。
   const likedIdsRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => {
+  // 事件监听器和 iOS 持久 video effect 都通过 ref 读取当前索引。放在最前面的
+  // layout effect 可避免长队列裁剪与上一轮 passive effect 交错时写回旧值。
+  useLayoutEffect(() => {
     activeIndexRef.current = activeIndex;
   }, [activeIndex]);
-
-  useEffect(() => {
-    const page = pageRef.current;
-    if (page && supportsElementFullscreenAPI(page)) {
-      setCanRequestFullscreen(true);
-    }
-  }, []);
 
   const updateUserPausedIndex = useCallback((index: number | null) => {
     userPausedIndexRef.current = index;
@@ -221,9 +269,23 @@ export default function ShortsPage() {
     []
   );
 
+  // 键盘快捷键：↑↓切换、空格播放/暂停（双空格点赞）、←→累计快进、M/L
+  const { keyboardSeekPreview, registerKeyboardLikeHandler } =
+    useShortsKeyboard({
+      containerRef,
+      activeIndexRef,
+      itemsLengthRef,
+      getVideoAtIndex,
+      isVideoPausedByUser,
+      setUserPausedForIndex,
+      onToggleMute: handleMuteButtonClick,
+      showHud,
+      isWindowsShortsPlatform,
+    });
+
   useEffect(() => {
     updateUserPausedIndex(null);
-  }, [activeIndex, updateUserPausedIndex]);
+  }, [activeItemKey, updateUserPausedIndex]);
 
   const handleActiveReadyForPreload = useCallback((index: number) => {
     if (index === activeIndexRef.current) {
@@ -292,80 +354,205 @@ export default function ShortsPage() {
     []
   );
 
-  /**
-   * 向后端请求下一批不重复的短视频，追加到 items 末尾。
-   */
-  const loadMore = useCallback(async () => {
-    if (loading) return;
-    setLoading(true);
-    try {
-      const seen = seenIdsRef.current;
-      const resp = await fetchShortsNext(seen, BATCH_SIZE);
-      if (resp.items.length === 0) {
-        setEmpty((prev) => prev || true /* 维持 true 即可 */);
-        setRoundComplete(true);
-        return;
-      }
-      setEmpty(false);
-      setItems((prev) => {
-        const existing = new Set(prev.map((v) => v.id));
-        const fresh = resp.items.filter((v) => !existing.has(v.id));
-        return [...prev, ...fresh];
-      });
-      setRoundComplete(resp.roundComplete);
-    } finally {
-      setLoading(false);
-    }
-  }, [loading]);
-
-  // 首次加载
-  useEffect(() => {
-    void loadMore();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // 仅当 items 还是空时，把 empty 设回 false 是没必要的；上面 loadMore 已处理
-  useEffect(() => {
-    if (items.length > 0) setEmpty(false);
-  }, [items.length]);
-
-  // 把当前活跃视频的 id 写入已看列表，并在剩余不足时续取
-  useEffect(() => {
-    const active = items[activeIndex];
-    if (!active) return;
-
+  // 记录实际到达过的最远索引，驱动固定大小的视频缓存窗口。
+  useLayoutEffect(() => {
+    if (!items[activeIndex]) return;
     setCacheWindowHighIndex((prev) => Math.max(prev, activeIndex));
+  }, [activeIndex, items]);
 
-    if (!seenIdsRef.current.includes(active.id)) {
-      seenIdsRef.current = [...seenIdsRef.current, active.id];
-      saveSeenIds(seenIdsRef.current);
+  // 队列超过上限时整批裁掉很久以前的空壳 slide。一次保留 20 条回看历史，
+  // 避免每滑一屏都触发 DOM 结构变化；当前项及 iOS 两个持久 video 的插槽
+  // 始终处于保留区内。
+  useLayoutEffect(() => {
+    if (
+      queueTrimInProgressRef.current ||
+      viewportResizeAnchorIndexRef.current !== null ||
+      getShortsQueueTrimCount(activeIndex, items.length) === 0
+    ) {
+      return;
     }
 
-    const remaining = items.length - 1 - activeIndex;
-    if (remaining < PREFETCH_THRESHOLD && !loading) {
-      if (roundComplete) {
-        // 上一次后端说"本轮已耗尽"时，必须等用户真正滑到当前队列最后一条
-        // 再清空已看记录开新一轮。否则退出后重新进入会把未完成轮次提前重置，
-        // 导致刚刷过的视频再次出现在下一次会话里。
-        if (remaining > 0) return;
-        seenIdsRef.current = [];
-        saveSeenIds([]);
-        setRoundComplete(false);
+    const activeItem = items[activeIndex];
+    if (!activeItem) return;
+    const removeCount = getShortsQueueTrimCount(activeIndex, items.length);
+    const nextActiveIndex = activeIndex - removeCount;
+    queueTrimInProgressRef.current = true;
+    pendingQueueTrimRef.current = {
+      anchorKey: shortsQueueItemKey(activeItem),
+      activeIndex: nextActiveIndex,
+    };
+
+    // IntersectionObserver 会持有 target；被裁掉前显式 unobserve，避免旧空壳
+    // 继续留在观察器内部。裁剪期间忽略迟到的 observer 回调。
+    const root = containerRef.current;
+    const observer = slideObserverRef.current;
+    if (root && observer) {
+      const slides =
+        root.querySelectorAll<HTMLElement>("[data-shorts-slide]");
+      for (
+        let index = 0;
+        index < removeCount && index < slides.length;
+        index += 1
+      ) {
+        observer.unobserve(slides[index]);
       }
-      void loadMore();
     }
-  }, [activeIndex, items, loading, roundComplete, loadMore]);
+
+    // ref setter 闭包捕获的是旧 index。清空后让保留下来的 keyed slide 在下次
+    // commit 领取新 setter；真实 video 节点本身仍由 React/WebKit 保留。
+    videoRefs.current.clear();
+    videoRefCallbacks.current.clear();
+    iosSharedVideoSlots.current.clear();
+    iosSharedVideoSlotCallbacks.current.clear();
+
+    const rebaseMediaIndex = (value: number) =>
+      value < removeCount ? -1 : value - removeCount;
+    iosSharedVideoIndexRef.current = rebaseMediaIndex(
+      iosSharedVideoIndexRef.current
+    );
+    iosStandbyVideoIndexRef.current = rebaseMediaIndex(
+      iosStandbyVideoIndexRef.current
+    );
+    activeIndexRef.current = nextActiveIndex;
+    setCacheWindowHighIndex((previous) =>
+      previous < removeCount ? -1 : previous - removeCount
+    );
+
+    const pausedIndex = userPausedIndexRef.current;
+    if (pausedIndex !== null) {
+      updateUserPausedIndex(
+        pausedIndex < removeCount ? null : pausedIndex - removeCount
+      );
+    }
+
+    const retainedVideoIDs = new Set(
+      items.slice(removeCount).map((item) => item.id)
+    );
+    setCacheableSourceIds((previous) => {
+      const retained = new Set(
+        [...previous].filter((videoID) => retainedVideoIDs.has(videoID))
+      );
+      return retained.size === previous.size ? previous : retained;
+    });
+
+    trimQueueBefore(removeCount);
+    setActiveIndex(nextActiveIndex);
+  }, [
+    activeIndex,
+    items,
+    trimQueueBefore,
+    updateUserPausedIndex,
+  ]);
+
+  // DOM 已按新索引提交后，把同一个逻辑视频重新贴到视口起点。用实际 offset
+  // 而不是“删除条数 × 视口高度”，可覆盖 iPhone 动态工具栏改变 100dvh 的情况。
+  useLayoutEffect(() => {
+    const pending = pendingQueueTrimRef.current;
+    if (!pending || activeIndex !== pending.activeIndex) return;
+    const activeItem = items[activeIndex];
+    if (!activeItem || shortsQueueItemKey(activeItem) !== pending.anchorKey) {
+      pendingQueueTrimRef.current = null;
+      queueTrimInProgressRef.current = false;
+      return;
+    }
+
+    const root = containerRef.current;
+    const slide = root
+      ? [...root.querySelectorAll<HTMLElement>("[data-shorts-slide]")].find(
+          (element) => element.dataset.feedKey === pending.anchorKey
+        )
+      : undefined;
+    if (root && slide) {
+      if (useDocumentScroll) {
+        const top = window.scrollY + slide.getBoundingClientRect().top;
+        window.scrollTo({ top, behavior: "auto" });
+      } else {
+        root.scrollTop = slide.offsetTop;
+      }
+    }
+    pendingQueueTrimRef.current = null;
+    queueTrimInProgressRef.current = false;
+  }, [activeIndex, items, useDocumentScroll]);
+
+  // 全屏与窗口模式的可用高度不同。Chrome/Edge 退出全屏后会保留原来的
+  // scrollTop 像素值，而每条 slide 的 100svh 已经变矮；索引越靠后，误差
+  // 累积越大，最终会露出下一条并触发切源。视口 resize 期间始终用当前索引
+  // 的新 offsetTop 重新对齐，待尺寸稳定后再交还给正常的滑动观察器。
+  useEffect(() => {
+    if (!isWindowsShortsPlatform) return;
+    const root = containerRef.current;
+    if (!root) return;
+
+    let alignmentFrame: number | null = null;
+    let settleTimer: number | null = null;
+
+    const alignAnchoredSlide = () => {
+      const anchorIndex = viewportResizeAnchorIndexRef.current;
+      if (anchorIndex === null) return;
+      const activeSlide = root.querySelector<HTMLElement>(
+        `[data-shorts-slide][data-index="${anchorIndex}"]`
+      );
+      if (!activeSlide) return;
+      root.scrollTop = activeSlide.offsetTop;
+    };
+
+    const handleViewportResize = () => {
+      if (viewportResizeAnchorIndexRef.current === null) {
+        viewportResizeAnchorIndexRef.current = activeIndexRef.current;
+      }
+
+      // resize 事件触发时 viewport unit 通常已经更新，先同步对齐一次；下一帧
+      // 再对齐可覆盖浏览器工具栏完成布局后的第二次尺寸计算。
+      alignAnchoredSlide();
+      if (alignmentFrame !== null) {
+        window.cancelAnimationFrame(alignmentFrame);
+      }
+      alignmentFrame = window.requestAnimationFrame(() => {
+        alignmentFrame = null;
+        alignAnchoredSlide();
+      });
+
+      if (settleTimer !== null) window.clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(() => {
+        settleTimer = null;
+        alignAnchoredSlide();
+        viewportResizeAnchorIndexRef.current = null;
+      }, 240);
+    };
+
+    window.addEventListener("resize", handleViewportResize);
+    document.addEventListener("fullscreenchange", handleViewportResize);
+    return () => {
+      window.removeEventListener("resize", handleViewportResize);
+      document.removeEventListener("fullscreenchange", handleViewportResize);
+      if (alignmentFrame !== null) {
+        window.cancelAnimationFrame(alignmentFrame);
+      }
+      if (settleTimer !== null) window.clearTimeout(settleTimer);
+      viewportResizeAnchorIndexRef.current = null;
+    };
+  }, [isWindowsShortsPlatform]);
 
   // 用 IntersectionObserver 找出当前进入视口的 item。
   // root 直接用 viewport：普通模式和 iPhone 页面滚动模式都能正确观测。
+  //
+  // 观察器只建一次。正常取批只追加并增量 observe；长会话裁剪会在删除旧
+  // slide 前显式 unobserve，保留下来的 keyed <article> 节点不替换。
+  // 早先的写法把它挂在 [items.length] 上，每 5 条就 disconnect 再整队重新
+  // observe 一遍——代价随队列长度上涨，而且偏偏发生在用户滑到队尾触发预取
+  // 的那一刻。
   useEffect(() => {
     const root = containerRef.current;
     if (!root) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
-        if (Date.now() < ignoreIntersectionUntilRef.current) return;
-
+        if (
+          viewportResizeAnchorIndexRef.current !== null ||
+          queueTrimInProgressRef.current
+        ) {
+          return;
+        }
         let bestIndex = -1;
         let bestRatio = 0.6;
         for (const entry of entries) {
@@ -379,6 +566,8 @@ export default function ShortsPage() {
         }
         if (bestIndex >= 0 && bestIndex !== activeIndexRef.current) {
           activeIndexRef.current = bestIndex;
+          const sharedVideo = iosSharedVideoRef.current;
+          if (sharedVideo && !sharedVideo.paused) sharedVideo.pause();
           setActiveReadyForPreload(false);
           setActiveIndex(bestIndex);
         }
@@ -389,113 +578,69 @@ export default function ShortsPage() {
       }
     );
 
+    slideObserverRef.current = observer;
+    return () => {
+      slideObserverRef.current = null;
+      observedSlidesRef.current = new WeakSet();
+      observer.disconnect();
+    };
+  }, []);
+
+  // 新一批 slide 进入 DOM 后补充观察。WeakSet 记账避免对同一节点重复调用，
+  // 节点被 React 丢弃时条目自动消失。
+  useEffect(() => {
+    const observer = slideObserverRef.current;
+    const root = containerRef.current;
+    if (!observer || !root) return;
     const slides = root.querySelectorAll<HTMLElement>("[data-shorts-slide]");
-    slides.forEach((el) => observer.observe(el));
-    return () => observer.disconnect();
+    slides.forEach((el) => {
+      if (observedSlidesRef.current.has(el)) return;
+      observedSlidesRef.current.add(el);
+      observer.observe(el);
+    });
   }, [items.length]);
 
-  // 控制每个 video 的播放状态：只有 activeIndex 对应的在播。
-  // 声音切换不要进入这里，否则移动端切换 muted 时可能额外触发 play/pause。
+  // 先停掉所有非当前屏。当前屏的 play() 由 ShortsSlide 负责，
+  // 那里能在 Safari 拒绝/中断播放时同步 UI，并在 canplay 后安全重试。
   useEffect(() => {
     videoRefs.current.forEach((video, idx) => {
-      if (idx === activeIndex) {
-        if (userPausedIndex === idx) {
-          if (!video.paused) video.pause();
-        } else if (video.paused) {
-          video.play().catch(() => undefined);
-        }
-      } else {
-        if (!video.paused) video.pause();
-      }
+      if (idx !== activeIndex && !video.paused) video.pause();
     });
-  }, [activeIndex, items.length, userPausedIndex]);
+  }, [activeIndex, items.length]);
 
-  // 单独同步音频属性。这里不做 play/pause，避免手机端切换静音时打断播放节奏。
+  // 只同步静音属性。页面不读写 video.volume，实际响度完全交给系统音量。
+  // 这里不做 play/pause，避免手机端切换静音时打断播放节奏。
   useEffect(() => {
+    const sharedVideo = iosSharedVideoRef.current;
+    if (sharedVideo) applyVideoMutedState(sharedVideo, muted);
+    // 备用元素只负责预载，任何时候都保持静音；它被提升为播放元素时才会
+    // 拿到页面当前的静音状态。
+    const standbyVideo = iosStandbyVideoRef.current;
+    if (standbyVideo) applyVideoMutedState(standbyVideo, true);
     videoRefs.current.forEach((video) => {
-      applyVideoAudioState(video, muted, volume);
+      applyVideoMutedState(video, muted);
     });
-  }, [muted, volume, items.length]);
-
-  // 键盘快捷键监听
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const activeEl = document.activeElement;
-      if (activeEl && (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA")) {
-        return;
-      }
-
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        const nextIdx = activeIndex + 1;
-        if (nextIdx < items.length) {
-          const nextSlide = containerRef.current?.querySelector(`[data-index="${nextIdx}"]`);
-          if (nextSlide) {
-            nextSlide.scrollIntoView({ behavior: "smooth" });
-          }
-        }
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        const prevIdx = activeIndex - 1;
-        if (prevIdx >= 0) {
-          const prevSlide = containerRef.current?.querySelector(`[data-index="${prevIdx}"]`);
-          if (prevSlide) {
-            prevSlide.scrollIntoView({ behavior: "smooth" });
-          }
-        }
-      } else if (e.key === " ") {
-        e.preventDefault();
-        const activeVideo = videoRefs.current.get(activeIndex);
-        if (activeVideo) {
-          const shouldResume =
-            userPausedIndexRef.current === activeIndex ||
-            (activeVideo.paused && activeVideo.readyState >= 3);
-          if (shouldResume) {
-            setUserPausedForIndex(activeIndex, false);
-            activeVideo.play().catch(() => undefined);
-          } else {
-            setUserPausedForIndex(activeIndex, true);
-            activeVideo.pause();
-          }
-        }
-      } else if (e.key === "m" || e.key === "M") {
-        e.preventDefault();
-        handleVolumeButtonClick();
-      } else if (e.key === "f" || e.key === "F") {
-        e.preventDefault();
-        toggleFullscreen();
-      } else if (e.key === "l" || e.key === "L") {
-        e.preventDefault();
-        const heartBtn = containerRef.current?.querySelector(`[data-index="${activeIndex}"] .shorts-slide__action`) as HTMLButtonElement | null;
-        if (heartBtn) {
-          heartBtn.click();
-        }
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        const activeVideo = videoRefs.current.get(activeIndex);
-        if (activeVideo && activeVideo.duration) {
-          const newTime = Math.min(activeVideo.duration, activeVideo.currentTime + 5);
-          activeVideo.currentTime = newTime;
-          showHud("+5秒", <Sparkles size={16} />);
-        }
-      } else if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        const activeVideo = videoRefs.current.get(activeIndex);
-        if (activeVideo && activeVideo.duration) {
-          const newTime = Math.max(0, activeVideo.currentTime - 5);
-          activeVideo.currentTime = newTime;
-          showHud("-5秒", <Sparkles size={16} />);
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [activeIndex, items, toggleFullscreen, showHud, handleVolumeButtonClick, setUserPausedForIndex]);
+  }, [muted, items.length, useIOSSharedVideo]);
 
   // 页面卸载时暂停所有
   useEffect(() => {
     return () => {
+      const sharedVideo = iosSharedVideoRef.current;
+      if (sharedVideo) {
+        try {
+          sharedVideo.pause();
+        } catch {
+          // ignore
+        }
+      }
+      const standbyVideo = iosStandbyVideoRef.current;
+      if (standbyVideo) {
+        try {
+          standbyVideo.pause();
+        } catch {
+          // ignore
+        }
+      }
       videoRefs.current.forEach((v) => {
         try {
           v.pause();
@@ -506,16 +651,192 @@ export default function ShortsPage() {
     };
   }, []);
 
-  const setVideoRef = useCallback(
-    (index: number) => (el: HTMLVideoElement | null) => {
+  const setVideoRef = useCallback((index: number) => {
+    const existing = videoRefCallbacks.current.get(index);
+    if (existing) return existing;
+    const callback = (el: HTMLVideoElement | null) => {
       if (el) videoRefs.current.set(index, el);
       else videoRefs.current.delete(index);
+    };
+    videoRefCallbacks.current.set(index, callback);
+    return callback;
+  }, []);
+
+  const setIOSSharedVideoSlotRef = useCallback((index: number) => {
+    const existing = iosSharedVideoSlotCallbacks.current.get(index);
+    if (existing) return existing;
+    const callback = (el: HTMLDivElement | null) => {
+      if (el) iosSharedVideoSlots.current.set(index, el);
+      else iosSharedVideoSlots.current.delete(index);
+    };
+    iosSharedVideoSlotCallbacks.current.set(index, callback);
+    return callback;
+  }, []);
+
+  // iOS 全程只创建这两个真实 video。不给节点设置 React key，也不在切屏时
+  // remove/recreate，保留 WebKit 已授予这些 media element 的有声播放权限。
+  const acquireIOSVideoElement = useCallback(
+    (elementRef: React.MutableRefObject<HTMLVideoElement | null>) => {
+      let video = elementRef.current;
+      if (!video) {
+        video = document.createElement("video");
+        video.className =
+          "shorts-slide__video shorts-slide__video--ios-shared";
+        // WebKit 原生 loop 会在内部做一次不可观察的 backward seek；媒体时钟
+        // 可能已经开始下一轮，但新帧尚未送到合成器。iOS 改由 ShortsSlide
+        // 在 ended 后受控重播，桌面/Android 的 JSX video 仍保留原生 loop。
+        video.loop = false;
+        video.playsInline = true;
+        video.preload = "auto";
+        video.disablePictureInPicture = true;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("webkit-playsinline", "");
+        video.setAttribute("controlslist", "nodownload");
+        video.setAttribute("aria-hidden", "true");
+        video.addEventListener("contextmenu", preventMediaContextMenu);
+        elementRef.current = video;
+      }
+      return video;
     },
     []
   );
 
+  // 当前屏：优先把已经预载好这一条的备用元素提升为播放元素，其余情况
+  // 才回到"给播放元素换 src"的老路径。
+  useLayoutEffect(() => {
+    if (!useIOSSharedVideo) return;
+    const item = items[activeIndex];
+    const slot = iosSharedVideoSlots.current.get(activeIndex);
+    if (!item || !slot) return;
+
+    // 备用元素已经把这一条拉起来（而且就停在这一屏的插槽里）时，只交换两个
+    // ref 的角色：src 不重设、已缓冲的数据全部留用，滑动到位即可出画。
+    // 两个都是持久节点，交换不会丢掉 WebKit 的有声播放授权。
+    const preloaded = iosStandbyVideoRef.current;
+    if (
+      preloaded &&
+      iosStandbyVideoIndexRef.current === activeIndex &&
+      preloaded.dataset.shortsVideoId === item.id
+    ) {
+      const demoted = iosSharedVideoRef.current;
+      iosSharedVideoRef.current = preloaded;
+      iosStandbyVideoRef.current = demoted;
+      iosStandbyVideoIndexRef.current = iosSharedVideoIndexRef.current;
+      if (demoted) {
+        try {
+          demoted.pause();
+        } catch {
+          // ignore
+        }
+        // 降级后先留在原来那一屏的插槽里，还带着上一条的缓冲：紧接着回滑
+        // 一屏同样能走上面的提升路径。真正的移动交给下面的预载 effect。
+        applyIOSVideoRole(demoted, "standby");
+      }
+    }
+
+    const video = acquireIOSVideoElement(iosSharedVideoRef);
+    applyIOSVideoRole(video, "active");
+    iosSharedVideoIndexRef.current = activeIndex;
+    // 备用元素必须尽早存在：静音按钮要在同一次用户手势里把有声播放
+    // 授权一并发给它，否则它接管播放时会被 WebKit 拒绝。
+    if (!iosStandbyPreloadDisabled) {
+      applyIOSVideoRole(acquireIOSVideoElement(iosStandbyVideoRef), "standby");
+    }
+
+    // 已经在正确的插槽里就不要重新 appendChild：那是一次 remove + insert，
+    // 会无谓地扰动 WebKit 的播放管线。
+    if (video.parentElement !== slot) slot.appendChild(video);
+    applyVideoMutedState(video, muted);
+    try {
+      video.defaultMuted = muted;
+    } catch {
+      // ignore
+    }
+
+    if (video.dataset.shortsVideoId !== item.id) {
+      try {
+        video.pause();
+      } catch {
+        // ignore
+      }
+      video.dataset.shortsVideoId = item.id;
+      video.poster = item.poster;
+      video.src = item.videoSrc;
+      video.load();
+    } else if (video.getAttribute("poster") !== item.poster) {
+      video.poster = item.poster;
+    }
+  }, [
+    acquireIOSVideoElement,
+    activeIndex,
+    iosStandbyPreloadDisabled,
+    items,
+    muted,
+    useIOSSharedVideo,
+  ]);
+
+  // 下一屏：用备用元素提前把下一条视频拉起来。iOS 分支此前完全没有预加载，
+  // 唯一的 media element 要等滑动到位后才换 src，网盘取链 + 首帧解码整条
+  // 串行发生在用户眼前；桌面/Android 早就预载了 PRELOAD_AHEAD_COUNT 条。
+  // 开始时机沿用同一套高低水位（activeReadyForPreload），当前视频缓冲不
+  // 健康时不去抢它的带宽。
+  //
+  // 这里是普通 useEffect 而不是 useLayoutEffect：备用元素处于隐藏角色，
+  // 移动插槽和起 src 都没有当帧的视觉后果，没必要把一次 appendChild 和一次
+  // load()（会立刻发网络请求）压进浏览器绘制前的同步块里。上面那个提升
+  // effect 必须保持 useLayoutEffect——活跃元素得在这一帧画出来之前就位。
   useEffect(() => {
-    document.title = "短视频 · 91";
+    if (!useIOSSharedVideo || iosStandbyPreloadDisabled || !activeReadyForPreload) {
+      return;
+    }
+    const nextIndex = activeIndex + 1;
+    const nextItem = items[nextIndex];
+    const nextSlot = iosSharedVideoSlots.current.get(nextIndex);
+    if (!nextItem || !nextSlot) return;
+
+    const standby = acquireIOSVideoElement(iosStandbyVideoRef);
+    // 角色刚交换、两个 ref 还指向同一个节点时什么都不做，等下一轮 effect。
+    if (standby === iosSharedVideoRef.current) return;
+
+    applyIOSVideoRole(standby, "standby");
+    // 直接停进下一屏的插槽：滑动到位后连 DOM 移动都省了。
+    if (standby.parentElement !== nextSlot) nextSlot.appendChild(standby);
+    iosStandbyVideoIndexRef.current = nextIndex;
+
+    if (standby.dataset.shortsVideoId === nextItem.id) return;
+    try {
+      standby.pause();
+    } catch {
+      // ignore
+    }
+    standby.dataset.shortsVideoId = nextItem.id;
+    standby.poster = nextItem.poster;
+    standby.src = nextItem.videoSrc;
+    standby.load();
+  }, [
+    acquireIOSVideoElement,
+    activeIndex,
+    activeReadyForPreload,
+    iosStandbyPreloadDisabled,
+    items,
+    useIOSSharedVideo,
+  ]);
+
+  useLayoutEffect(() => {
+    return () => {
+      for (const elementRef of [iosSharedVideoRef, iosStandbyVideoRef]) {
+        const video = elementRef.current;
+        if (!video) continue;
+        video.removeEventListener("contextmenu", preventMediaContextMenu);
+        releaseVideoSource(video);
+        video.remove();
+        elementRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    document.title = "短视频";
   }, []);
 
   // 沉浸式：默认锁住 body 滚动；iPhone 浏览器里放开根页面滚动，让 Safari 工具栏能随刷动收起。
@@ -564,183 +885,48 @@ export default function ShortsPage() {
     };
   }, [useDocumentScroll]);
 
-  function clearFullscreenRestoreTimers() {
-    for (const timer of fullscreenRestoreTimersRef.current) {
-      window.clearTimeout(timer);
-    }
-    fullscreenRestoreTimersRef.current = [];
-  }
-
-  function restoreActiveSlideIntoView() {
-    const idx = activeIndexRef.current;
-    const slide = containerRef.current?.querySelector<HTMLElement>(
-      `[data-index="${idx}"]`
-    );
-    if (!slide) return;
-    slide.scrollIntoView({ block: "start", inline: "nearest", behavior: "auto" });
-  }
-
-  function scheduleFullscreenActiveRestore() {
-    ignoreIntersectionUntilRef.current = Date.now() + 700;
-    clearFullscreenRestoreTimers();
-    restoreActiveSlideIntoView();
-    fullscreenRestoreTimersRef.current = [80, 220, 520].map((delay) =>
-      window.setTimeout(restoreActiveSlideIntoView, delay)
-    );
-  }
-
-  // ---- 浏览器全屏（Fullscreen API） ----
-  // 监听全屏状态变化，保持 React state 同步。
-  // 用户按 ESC / 系统返回 / 浏览器退出全屏按钮 时也会走这里。
-  useEffect(() => {
-    function handleChange() {
-      scheduleFullscreenActiveRestore();
-      setIsFullscreen(
-        document.fullscreenElement !== null ||
-          // Safari (desktop) 旧前缀
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (document as any).webkitFullscreenElement != null
-      );
-    }
-    document.addEventListener("fullscreenchange", handleChange);
-    document.addEventListener("webkitfullscreenchange", handleChange);
-    return () => {
-      document.removeEventListener("fullscreenchange", handleChange);
-      document.removeEventListener("webkitfullscreenchange", handleChange);
-      clearFullscreenRestoreTimers();
-    };
+  // 用稳定 feed key 在真实 DOM 中找下一条；不闭包 items/index，既能跨队列
+  // 裁剪，也不会每取回一批就换回调引用、击穿 ShortsSlide 的 memo。
+  const handleHideSuccess = useCallback((itemKey: string) => {
+    setTimeout(() => {
+      const root = containerRef.current;
+      if (!root) return;
+      const current = [
+        ...root.querySelectorAll<HTMLElement>("[data-shorts-slide]"),
+      ].find((element) => element.dataset.feedKey === itemKey);
+      const nextSlide = current?.nextElementSibling;
+      if (
+        nextSlide instanceof HTMLElement &&
+        nextSlide.dataset.shortsSlide !== undefined
+      ) {
+        nextSlide.scrollIntoView({ behavior: "smooth" });
+      }
+    }, 700);
   }, []);
-
-  // 路由离开 / 组件卸载时主动退出全屏，避免残留全屏态
-  useEffect(() => {
-    return () => {
-      try {
-        if (document.fullscreenElement) {
-          void document.exitFullscreen();
-        }
-      } catch {
-        // ignore
-      }
-    };
-  }, []);
-
-  function requestPageFullscreen() {
-    if (!canRequestFullscreen) return;
-    const page = pageRef.current;
-    if (!page) return;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const anyPage = page as any;
-    const fn: (() => Promise<void>) | undefined =
-      page.requestFullscreen?.bind(page) ||
-      anyPage.webkitRequestFullscreen?.bind(page);
-    if (!fn) return;
-    try {
-      const ret = fn();
-      if (ret && typeof ret.then === "function") {
-        ret.catch(() => {
-          // iOS Safari 或被拒绝：静默忽略，沉浸样式仍然生效
-        });
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  function exitPageFullscreen() {
-    try {
-      if (document.exitFullscreen) {
-        void document.exitFullscreen();
-      } else {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const anyDoc = document as any;
-        if (typeof anyDoc.webkitExitFullscreen === "function") {
-          anyDoc.webkitExitFullscreen();
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  function toggleFullscreen() {
-    scheduleFullscreenActiveRestore();
-    if (canRequestFullscreen) {
-      if (isFullscreen) exitPageFullscreen();
-      else requestPageFullscreen();
-      return;
-    }
-    if (useDocumentScroll) {
-      restoreActiveSlideIntoView();
-    }
-  }
-
-  function handleFullscreenButtonPointerDown(
-    e: React.PointerEvent<HTMLButtonElement>
-  ) {
-    e.preventDefault();
-    e.stopPropagation();
-    fullscreenPointerHandledRef.current = true;
-    toggleFullscreen();
-  }
-
-  function handleFullscreenButtonClick(e: React.MouseEvent<HTMLButtonElement>) {
-    e.preventDefault();
-    e.stopPropagation();
-    if (fullscreenPointerHandledRef.current) {
-      fullscreenPointerHandledRef.current = false;
-      return;
-    }
-    toggleFullscreen();
-  }
-
-  const handleHideSuccess = useCallback((idx: number) => {
-    showHud("已选择不再展示，正在滑至下一首...", <EyeOff size={16} />);
-    const nextIdx = idx + 1;
-    if (nextIdx < items.length) {
-      setTimeout(() => {
-        const nextSlide = containerRef.current?.querySelector(`[data-index="${nextIdx}"]`);
-        if (nextSlide) {
-          nextSlide.scrollIntoView({ behavior: "smooth" });
-        }
-      }, 700);
-    }
-  }, [items.length, showHud]);
 
   const videoWindow = getVideoWindowBounds(cacheWindowHighIndex, items.length);
+  // 只给 ?debug=1 的面板显示当前这条的码率；真正的门槛由各 slide 自己算。
+  const activeItemBytesPerSecond = averageBytesPerSecond(
+    items[activeIndex] ?? {}
+  );
 
   return (
     <div
-      className={`shorts-page${useDocumentScroll ? " is-document-scroll" : ""}`}
-      ref={pageRef}
+      className={`shorts-page${useDocumentScroll ? " is-document-scroll" : ""}${
+        legacyVideoTransitionEnabled ? " has-video-transition" : ""
+      }`}
     >
       <header className="shorts-header">
-        <Link to="/" className="shorts-header__back" aria-label="返回首页">
+        <Link
+          to="/"
+          className="shorts-header__back"
+          aria-label="返回首页"
+          onClick={handleBackToHomeClick}
+        >
           <ChevronLeft size={22} />
         </Link>
         <div className="shorts-header__actions">
-          <button
-            type="button"
-            className="shorts-header__icon-btn"
-            aria-label={isFullscreen ? "退出全屏" : "进入全屏"}
-            onPointerDown={handleFullscreenButtonPointerDown}
-            onClick={handleFullscreenButtonClick}
-          >
-            {isFullscreen ? <Minimize size={20} /> : <Maximize size={20} />}
-          </button>
-          
-          <div className="shorts-header__volume-group">
-            <div className="shorts-header__volume-slider-container">
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={muted ? 0 : volume}
-                onChange={handleVolumeSliderChange}
-                className="shorts-header__volume-slider"
-                aria-label="音量调节"
-              />
-            </div>
+          {items.length > 0 && (
             <button
               type="button"
               className="shorts-header__icon-btn"
@@ -753,12 +939,12 @@ export default function ShortsPage() {
               onMouseDown={stopHeaderControlPropagation}
               onClick={(e) => {
                 e.stopPropagation();
-                handleVolumeButtonClick();
+                handleMuteButtonClick();
               }}
             >
-              {muted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+              {muted ? <VolumeX size={20} /> : <Volume2 size={20} />}
             </button>
-          </div>
+          )}
         </div>
       </header>
 
@@ -769,51 +955,133 @@ export default function ShortsPage() {
         </div>
       )}
 
+      {isWindowsShortsPlatform &&
+        keyboardSeekPreview?.videoIndex === activeIndex && (
+        <div className="shorts-keyboard-seek-time" aria-live="polite">
+          {formatClock(keyboardSeekPreview.currentTime)} / {formatClock(keyboardSeekPreview.duration)}
+        </div>
+      )}
+
+      {debugHudEnabled && (
+        <ShortsDebugHud
+          activeIndex={activeIndex}
+          itemCount={items.length}
+          itemId={items[activeIndex]?.id ?? null}
+          getActiveVideo={() => getVideoAtIndex(activeIndexRef.current) ?? null}
+          getStandbyVideo={() => iosStandbyVideoRef.current}
+          getLoopState={() => loopDebugProbeRef.current?.() ?? null}
+          windowStart={videoWindow.start}
+          windowEnd={videoWindow.end}
+          activeReadyForPreload={activeReadyForPreload}
+          preloadBufferSeconds={preloadBufferSecondsFor(
+            activeItemBytesPerSecond
+          )}
+          activeBytesPerSecond={activeItemBytesPerSecond}
+          cachedSourceCount={cacheableSourceIds.size}
+          muted={muted}
+          usesIOSSharedVideo={useIOSSharedVideo}
+          usesDocumentScroll={useDocumentScroll}
+        />
+      )}
+
       <div className="shorts-feed" ref={containerRef}>
-        {empty && (
+        {loading && items.length === 0 && !empty && !loadError && (
+          <div className="shorts-empty shorts-loading" aria-live="polite">
+            <div className="shorts-empty__content">
+              <ShortsLoadingSpinner size={30} />
+              <p>正在加载短视频</p>
+            </div>
+          </div>
+        )}
+
+        {loadError && items.length === 0 && (
+          <div className="shorts-empty" role="alert">
+            <div className="shorts-empty__content">
+              <p>短视频加载失败，请检查网络后重试</p>
+              <button
+                type="button"
+                className="shorts-empty__link"
+                onClick={() => void loadMore()}
+              >
+                重新加载
+              </button>
+            </div>
+          </div>
+        )}
+
+        {empty && items.length === 0 && (
           <div className="shorts-empty">
-            <p>当前没有可播放的视频</p>
-            <Link to="/" className="shorts-empty__link">
-              返回首页
-            </Link>
+            <AdminEmptyVisual
+              variant="empty"
+              text="当前库中没有视频"
+              className="shorts-empty__visual"
+            />
           </div>
         )}
 
         {items.map((item, index) => {
+          const itemKey = shortsQueueItemKey(item);
           const isActiveSlide = index === activeIndex;
           const isInCacheWindow =
             index >= videoWindow.start && index <= videoWindow.end;
           const preloadOffset = index - activeIndex;
           const shouldPreload =
+            !useIOSSharedVideo &&
             activeReadyForPreload &&
             preloadOffset > 0 &&
             preloadOffset <= PRELOAD_AHEAD_COUNT;
-          const shouldMount = isActiveSlide || isInCacheWindow || shouldPreload;
+          const shouldMount =
+            isActiveSlide ||
+            (!useIOSSharedVideo && (isInCacheWindow || shouldPreload));
           // 视频窗口内已经缓冲过的视频保留 src：
           // 在窗口内来回切换时，直接复用浏览器已缓冲数据。
           const shouldRetainCached =
-            isInCacheWindow && !isActiveSlide && cacheableSourceIds.has(item.id);
+            !useIOSSharedVideo &&
+            isInCacheWindow &&
+            !isActiveSlide &&
+            cacheableSourceIds.has(item.id);
           const shouldLoad = isActiveSlide || shouldPreload || shouldRetainCached;
           const shouldEagerLoad = isActiveSlide || shouldPreload;
+          // 视口附近的照常渲染；再加上所有还挂着 <video> 的 slide——那些是
+          // 有意保留的缓冲，不能因为离开视口就被拆掉。两者之和有上限，
+          // 与队列长度无关。
+          const shouldRenderContent =
+            Math.abs(preloadOffset) <= SLIDE_CONTENT_WINDOW_RADIUS ||
+            shouldMount ||
+            shouldRetainCached;
           return (
             <ShortsSlide
-              key={item.id}
+              key={itemKey}
               item={item}
+              itemKey={itemKey}
               index={index}
               isActive={isActiveSlide}
-              // 固定 6 条视频窗口内才挂载 <video> 壳；
+              // 固定 4 条视频窗口内才挂载 <video> 壳；
               // 当前屏先绑定 src；后两个视频等当前屏缓冲健康后再预加载；
               // 已缓冲过的窗口内视频保留 src，便于来回切换复用缓存。
               shouldMount={shouldMount}
               shouldLoad={shouldLoad}
               shouldEagerLoad={shouldEagerLoad}
+              shouldRenderContent={shouldRenderContent}
+              keyboardSeekPreview={
+                keyboardSeekPreview?.videoIndex === index
+                  ? keyboardSeekPreview
+                  : undefined
+              }
+              sharedVideoRef={
+                useIOSSharedVideo ? iosSharedVideoRef : undefined
+              }
+              sharedVideoSlotRef={
+                useIOSSharedVideo
+                  ? setIOSSharedVideoSlotRef(index)
+                  : undefined
+              }
               muted={muted}
-              volume={volume}
-              setMuted={setMuted}
-              setVolume={setVolume}
               videoRef={setVideoRef(index)}
               onLikeToggle={handleLikeToggle}
               hasLiked={hasLiked}
+              registerKeyboardLikeHandler={registerKeyboardLikeHandler}
+              canHide={isAdmin}
               onHideSuccess={handleHideSuccess}
               onActiveReadyForPreload={handleActiveReadyForPreload}
               onActiveNeedsPriority={handleActiveNeedsPriority}
@@ -821,9 +1089,27 @@ export default function ShortsPage() {
               onUserPausedChange={setUserPausedForIndex}
               isVideoPausedByUser={isVideoPausedByUser}
               showHud={showHud}
+              loopDebugProbeRef={
+                debugHudEnabled ? loopDebugProbeRef : undefined
+              }
             />
           );
         })}
+
+        {loadError && items.length > 0 && (
+          <div className="shorts-empty" role="alert">
+            <div className="shorts-empty__content">
+              <p>后续视频加载失败</p>
+              <button
+                type="button"
+                className="shorts-empty__link"
+                onClick={() => void loadMore()}
+              >
+                重新加载
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -831,15 +1117,28 @@ export default function ShortsPage() {
 
 type SlideProps = {
   item: ShortsItem;
+  /** 服务端 feed 内的稳定身份；队列裁剪后 index 会变化，但这个 key 不变。 */
+  itemKey: string;
   index: number;
   isActive: boolean;
   shouldMount: boolean;
   shouldLoad: boolean;
   shouldEagerLoad: boolean;
+  /**
+   * 是否渲染 slide 的实际内容。false 时只留一个等高空壳，把模糊背景层、
+   * 海报位图和整套浮层从 DOM 里摘掉，避免长队列把它们无限累积下去。
+   */
+  shouldRenderContent: boolean;
+  /** 键盘长按左右键期间的累计目标，用来稳定驱动底部进度条。 */
+  keyboardSeekPreview?: Pick<
+    ShortsKeyboardSeekPreview,
+    "currentTime" | "duration"
+  >;
+  /** iOS 所有 slide 共用的同一个持久 video DOM 节点 */
+  sharedVideoRef?: React.RefObject<HTMLVideoElement>;
+  /** 持久 video 当前应移动到的 slide 插槽 */
+  sharedVideoSlotRef?: (el: HTMLDivElement | null) => void;
   muted: boolean;
-  volume: number;
-  setMuted: (muted: boolean) => void;
-  setVolume: (volume: number) => void;
   videoRef: (el: HTMLVideoElement | null) => void;
   /**
    * 切换点赞。第二参数 true 表示点赞，false 表示取消。
@@ -848,7 +1147,13 @@ type SlideProps = {
   onLikeToggle: (videoId: string, liked: boolean) => Promise<number | null>;
   /** 父组件查询某 id 是否已经在本次会话内点过赞 */
   hasLiked: (videoId: string) => boolean;
-  onHideSuccess: (index: number) => void;
+  /** 注册该 slide 的键盘点赞入口，供父级双空格快捷键直接调用。 */
+  registerKeyboardLikeHandler: (
+    index: number,
+    handler: (() => void) | null
+  ) => void;
+  canHide: boolean;
+  onHideSuccess: (itemKey: string) => void;
   onActiveReadyForPreload: (index: number) => void;
   onActiveNeedsPriority: (index: number) => void;
   /** 本条视频在浏览器里已有可复用缓冲，之后在视频窗口内保留 src */
@@ -856,29 +1161,36 @@ type SlideProps = {
   onUserPausedChange: (index: number, isPaused: boolean) => void;
   isVideoPausedByUser: (index: number) => boolean;
   showHud: (text: string, icon?: React.ReactNode) => void;
+  /** ?debug=1 时活跃 slide 在这里挂一个循环重启状态读取器，供面板轮询。 */
+  loopDebugProbeRef?: React.MutableRefObject<ShortsLoopDebugProbe | null>;
 };
 
 /**
  * 一屏短视频。
  *
  * - 长按 ≥400ms 进入 2 倍速，松手恢复（与详情页 VideoPlayer 行为一致）
+ * - 横向滑动按当前播放点相对快进 / 快退，纵向滑动仍用于切换上下视频
  * - 单击切换播放 / 暂停
  * - 长按弹出的下载/分享菜单通过 contextmenu + CSS 屏蔽
  */
-function ShortsSlide({
+function ShortsSlideImpl({
   item,
+  itemKey,
   index,
   isActive,
   shouldMount,
   shouldLoad,
   shouldEagerLoad,
+  shouldRenderContent,
+  keyboardSeekPreview,
+  sharedVideoRef,
+  sharedVideoSlotRef,
   muted,
-  volume,
-  setMuted,
-  setVolume,
   videoRef,
   onLikeToggle,
   hasLiked,
+  registerKeyboardLikeHandler,
+  canHide,
   onHideSuccess,
   onActiveReadyForPreload,
   onActiveNeedsPriority,
@@ -886,28 +1198,247 @@ function ShortsSlide({
   onUserPausedChange,
   isVideoPausedByUser,
   showHud,
+  loopDebugProbeRef,
 }: SlideProps) {
+  const slideRef = useRef<HTMLElement | null>(null);
   const localRef = useRef<HTMLVideoElement | null>(null);
+  const keyboardLikeHandlerRef = useRef<() => void>(() => undefined);
+  const isActiveRef = useRef(isActive);
+  const shouldLoadRef = useRef(shouldLoad);
+  const shouldMountRef = useRef(shouldMount);
+  const mutedRef = useRef(muted);
+  const hasStartedPlayingRef = useRef(false);
+  const loopRestartPendingRef = useRef(false);
+  const loopRestartAwaitingFrameRef = useRef(false);
+  const loopRestartReloadedRef = useRef(false);
+  const loopRestartAttemptRef = useRef(0);
+  const loopRestartTimerRef = useRef<number | null>(null);
+  const loopFrameBarrierRef = useRef<number | null>(null);
+  const lastObservedMediaTimeRef = useRef<number | null>(null);
+  const lastPresentedMediaTimeRef = useRef<number | null>(null);
+  const playbackMotionFrameCountRef = useRef(0);
+  const bufferingIndicatorTimerRef = useRef<number | null>(null);
+  isActiveRef.current = isActive;
+  shouldLoadRef.current = shouldLoad;
+  shouldMountRef.current = shouldMount;
+  mutedRef.current = muted;
+  const usesSharedVideo = Boolean(sharedVideoRef);
+  const getVideoElement = useCallback(() => {
+    if (sharedVideoRef) {
+      return isActiveRef.current ? sharedVideoRef.current : null;
+    }
+    return localRef.current;
+  }, [sharedVideoRef]);
   const [paused, setPaused] = useState(false);
   const [fastActive, setFastActive] = useState(false);
 
   // 视频缓冲状态
-  const [isBuffering, setIsBuffering] = useState(false);
+  const [isBuffering, setIsBufferingState] = useState(false);
+  const isBufferingRef = useRef(false);
   // 是否已经被隐藏/拉黑
   const [isMarkedHidden, setIsMarkedHidden] = useState(false);
+  const [isSharing, setIsSharing] = useState(false);
+  const pendingShareURLRef = useRef("");
 
-  // 进度状态。播放时由 timeupdate 更新；拖动时由用户输入更新
+  useEffect(() => {
+    pendingShareURLRef.current = "";
+  }, [item.id]);
+
+  // 这一条的预加载高低水位。按平均码率把固定的字节预算换算成秒数，
+  // 高码率片子不必先囤十几 MB 才肯放行预载；元数据缺失时自动退回原有的
+  // 12s / 4s。纯算术且只依赖 item，放在渲染体里即可。
+  const preloadBufferSeconds = preloadBufferSecondsFor(
+    averageBytesPerSecond(item)
+  );
+  const preloadKeepSeconds = preloadKeepSecondsFor(preloadBufferSeconds);
+
+  // 时长是低频元数据，保留在 state。播放进度是高频信号：放进 ref 并直接
+  // 写进度条 CSS 变量，避免 timeupdate/rVFC 让整棵 ShortsSlide 每秒重渲染。
   const [duration, setDuration] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
+  const durationRef = useRef(0);
+  const currentTimeRef = useRef(0);
+  const progressTrackRef = useRef<HTMLDivElement | null>(null);
+  const progressTimeRef = useRef<HTMLDivElement | null>(null);
   const [scrubbing, setScrubbing] = useState(false);
   const scrubbingRef = useRef(false);
-  // 拖动开始时是否在播：用于拖完后判断要不要 resume
-  const wasPlayingRef = useRef(true);
+  const lastKeyboardSeekPreviewTimeRef = useRef<number | null>(null);
+  const keyboardSeekPreviewRef = useRef(keyboardSeekPreview);
+  keyboardSeekPreviewRef.current = keyboardSeekPreview;
 
-  // 点赞数和"是否已点过赞"状态。
-  // 初始 likes 取自后端返回的列表项；isLiked 仅控制视觉态，
-  // 真正的防重在父组件 likedIdsRef 里，这里只信任父返回的回执。
-  const [likes, setLikes] = useState(item.likes ?? 0);
+  const writeProgressDisplay = useCallback(
+    (time: number, knownDuration = durationRef.current) => {
+      const safeTime = Number.isFinite(time) && time > 0 ? time : 0;
+      const safeDuration =
+        Number.isFinite(knownDuration) && knownDuration > 0 ? knownDuration : 0;
+      const ratio =
+        safeDuration > 0 ? clamp(safeTime / safeDuration, 0, 1) : 0;
+      progressTrackRef.current?.style.setProperty(
+        "--progress-pct",
+        `${ratio * 100}%`
+      );
+      if (progressTimeRef.current) {
+        progressTimeRef.current.textContent =
+          `${formatClock(safeTime)} / ${formatClock(safeDuration)}`;
+      }
+    },
+    []
+  );
+
+  const updateCurrentTime = useCallback(
+    (nextTime: number, forceDisplay = false) => {
+      const safeTime = Number.isFinite(nextTime) && nextTime > 0 ? nextTime : 0;
+      currentTimeRef.current = safeTime;
+      // 键盘累计 seek 期间，底部进度条必须停在累计目标，不能被尚未完成的
+      // timeupdate 拉回真实媒体时钟。松键后会 force 写入最终目标。
+      if (!forceDisplay && keyboardSeekPreviewRef.current) return;
+      writeProgressDisplay(safeTime);
+    },
+    [writeProgressDisplay]
+  );
+
+  const updateDuration = useCallback(
+    (nextDuration: number) => {
+      const safeDuration =
+        Number.isFinite(nextDuration) && nextDuration > 0 ? nextDuration : 0;
+      durationRef.current = safeDuration;
+      setDuration((previous) =>
+        previous === safeDuration ? previous : safeDuration
+      );
+      writeProgressDisplay(currentTimeRef.current, safeDuration);
+    },
+    [writeProgressDisplay]
+  );
+
+  useLayoutEffect(() => {
+    if (keyboardSeekPreview) {
+      lastKeyboardSeekPreviewTimeRef.current = keyboardSeekPreview.currentTime;
+      writeProgressDisplay(
+        keyboardSeekPreview.currentTime,
+        keyboardSeekPreview.duration
+      );
+      return;
+    }
+
+    const lastPreviewTime = lastKeyboardSeekPreviewTimeRef.current;
+    if (lastPreviewTime === null) return;
+    lastKeyboardSeekPreviewTimeRef.current = null;
+    // 松键提示消失时 seek 可能还在等待网络。先保留累计目标，避免底部进度条
+    // 回跳到长按前的 timeupdate；之后由真实媒体时间自然接管。
+    updateCurrentTime(lastPreviewTime, true);
+  }, [keyboardSeekPreview, updateCurrentTime, writeProgressDisplay]);
+
+  // 进度条/时间提示只在活跃态挂载。DOM 刚出现时在绘制前补上 ref 中的最新值。
+  useLayoutEffect(() => {
+    if (keyboardSeekPreview) {
+      writeProgressDisplay(
+        keyboardSeekPreview.currentTime,
+        keyboardSeekPreview.duration
+      );
+      return;
+    }
+    writeProgressDisplay(currentTimeRef.current, durationRef.current);
+  }, [
+    duration,
+    isActive,
+    isMarkedHidden,
+    keyboardSeekPreview,
+    scrubbing,
+    shouldLoad,
+    writeProgressDisplay,
+  ]);
+
+  const clearBufferingIndicatorTimer = useCallback(() => {
+    if (bufferingIndicatorTimerRef.current === null) return;
+    window.clearTimeout(bufferingIndicatorTimerRef.current);
+    bufferingIndicatorTimerRef.current = null;
+  }, []);
+
+  const setIsBuffering = useCallback(
+    (next: boolean) => {
+      if (!next) clearBufferingIndicatorTimer();
+      if (next) playbackMotionFrameCountRef.current = 0;
+      isBufferingRef.current = next;
+      setIsBufferingState(next);
+    },
+    [clearBufferingIndicatorTimer]
+  );
+
+  // 延迟展示加载圈。WebKit 会在极短的解码抖动里发 waiting，iOS 的循环重启
+  // 也几乎总能在这个窗口内出下一轮首帧——顺利的那些就完全不该看到圈。
+  // 真卡住时定时器照常到期；提前恢复的话 setIsBuffering(false) 会清掉它。
+  const scheduleBufferingIndicator = useCallback(
+    (shouldStillShow: () => boolean) => {
+      if (isBufferingRef.current) return;
+      if (bufferingIndicatorTimerRef.current !== null) return;
+      bufferingIndicatorTimerRef.current = window.setTimeout(() => {
+        bufferingIndicatorTimerRef.current = null;
+        if (!shouldStillShow()) return;
+        setIsBuffering(true);
+      }, SHORTS_BUFFERING_INDICATOR_DELAY_MS);
+    },
+    [setIsBuffering]
+  );
+
+  const clearLoopRestartWatchdog = useCallback(() => {
+    if (loopRestartTimerRef.current === null) return;
+    window.clearTimeout(loopRestartTimerRef.current);
+    loopRestartTimerRef.current = null;
+  }, []);
+
+  const resetLoopRestartState = useCallback(() => {
+    clearLoopRestartWatchdog();
+    loopRestartAttemptRef.current += 1;
+    loopRestartPendingRef.current = false;
+    loopRestartAwaitingFrameRef.current = false;
+    loopRestartReloadedRef.current = false;
+    loopFrameBarrierRef.current = null;
+    lastObservedMediaTimeRef.current = null;
+    lastPresentedMediaTimeRef.current = null;
+    playbackMotionFrameCountRef.current = 0;
+  }, [clearLoopRestartWatchdog]);
+
+  const confirmPresentedPlayback = useCallback(
+    (mediaTime?: number) => {
+      clearLoopRestartWatchdog();
+      loopRestartPendingRef.current = false;
+      loopRestartAwaitingFrameRef.current = false;
+      loopRestartReloadedRef.current = false;
+      hasStartedPlayingRef.current = true;
+      playbackMotionFrameCountRef.current = 0;
+      setPaused(false);
+      setIsBuffering(false);
+      if (
+        mediaTime !== undefined &&
+        Number.isFinite(mediaTime) &&
+        !scrubbingRef.current
+      ) {
+        updateCurrentTime(mediaTime);
+      }
+    },
+    [clearLoopRestartWatchdog, setIsBuffering, updateCurrentTime]
+  );
+
+  useEffect(() => clearBufferingIndicatorTimer, [clearBufferingIndicatorTimer]);
+
+  // 只有活跃 slide 注册循环状态读取器。纯只读，不参与任何播放控制。
+  // React 先跑完本次提交的所有清理再跑新的 effect，所以切屏时不会出现
+  // 旧 slide 把新 slide 刚注册的读取器清掉的顺序问题。
+  useEffect(() => {
+    if (!loopDebugProbeRef || !isActive) return;
+    loopDebugProbeRef.current = () => ({
+      pending: loopRestartPendingRef.current,
+      awaitingFrame: loopRestartAwaitingFrameRef.current,
+      reloaded: loopRestartReloadedRef.current,
+      attempt: loopRestartAttemptRef.current,
+      barrierSet: loopFrameBarrierRef.current !== null,
+    });
+    return () => {
+      loopDebugProbeRef.current = null;
+    };
+  }, [isActive, loopDebugProbeRef]);
+
+  // 是否已点过赞。真正的防重在父组件 likedIdsRef 里，
+  // 这里仅控制视觉态并依据父组件返回的回执处理失败回滚。
   const [isLiked, setIsLiked] = useState(false);
   // 屏幕中央的心形飞起动画（双击点赞时显示）
   const [heartBurst, setHeartBurst] = useState<{
@@ -916,20 +1447,17 @@ function ShortsSlide({
     y: number;
   } | null>(null);
 
-  // 单击和双击的延迟分发：第一次点击挂在定时器里，
-  // 300ms 内有第二次就当双击点赞，否则当单击 toggle play
-  const clickTimerRef = useRef<number | null>(null);
-  const lastClickAtRef = useRef(0);
-
-  // 切换视频时把 likes 同步到新视频的初始值；
-  // isLiked 取自父组件的全局集合，这样切走再切回 / 同一 id 重复出现仍能保持视觉态
+  // isLiked 取自父组件的全局集合，这样切走再切回 / 同一 id 重复出现仍能保持视觉态。
   useEffect(() => {
-    setLikes(item.likes ?? 0);
     setIsLiked(hasLiked(item.id));
-  }, [item.id, item.likes, hasLiked]);
+  }, [item.id, hasLiked]);
 
   const setRef = useCallback(
     (el: HTMLVideoElement | null) => {
+      const previous = localRef.current;
+      if (!el && previous && !shouldMountRef.current) {
+        releaseVideoSource(previous);
+      }
       localRef.current = el;
       videoRef(el);
     },
@@ -938,49 +1466,393 @@ function ShortsSlide({
 
   // 非当前屏/后续预加载/视频窗口内缓存视频不保留媒体源，确保离开窗口后浏览器中止原始网盘流。
   useEffect(() => {
+    if (usesSharedVideo) {
+      if (!shouldLoad) {
+        resetLoopRestartState();
+        hasStartedPlayingRef.current = false;
+        updateDuration(0);
+        updateCurrentTime(0);
+        setIsBuffering(false);
+      }
+      return;
+    }
     if (shouldLoad) return;
     const video = localRef.current;
     if (!video) return;
-    try {
-      video.pause();
-      video.removeAttribute("src");
-      video.load();
-    } catch {
-      // ignore
-    }
-    setDuration(0);
-    setCurrentTime(0);
+    releaseVideoSource(video);
+    hasStartedPlayingRef.current = false;
+    updateDuration(0);
+    updateCurrentTime(0);
     setIsBuffering(false);
-  }, [shouldLoad, item.id]);
+  }, [
+    item.id,
+    resetLoopRestartState,
+    shouldLoad,
+    updateCurrentTime,
+    updateDuration,
+    usesSharedVideo,
+  ]);
+
+  // 每次成为当前屏都明确发起播放。Safari 可能在 src/load
+  // 切换时以 AbortError 中断第一次请求，因此在 canplay/loadeddata
+  // 后会再试；NotAllowedError 则立即显示可点击的播放态。
+  useEffect(() => {
+    const video = getVideoElement();
+    if (!video || !isActive || !shouldLoad) return;
+
+    let disposed = false;
+    let retryCount = 0;
+    let retryTimer: number | null = null;
+
+    const canContinue = () =>
+      !disposed &&
+      getVideoElement() === video &&
+      isActiveRef.current &&
+      shouldLoadRef.current &&
+      (!usesSharedVideo || video.dataset.shortsVideoId === item.id) &&
+      !isVideoPausedByUser(index);
+
+    const markPlayBlocked = () => {
+      if (!canContinue()) return;
+      setIsBuffering(false);
+      setPaused(true);
+      onActiveNeedsPriority(index);
+    };
+
+    const attemptPlay = () => {
+      if (!canContinue() || !video.paused) return;
+      applyVideoMutedState(video, mutedRef.current);
+      video.playsInline = true;
+      try {
+        video.defaultMuted = mutedRef.current;
+      } catch {
+        // ignore
+      }
+
+      setPaused(false);
+      if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+        setIsBuffering(true);
+      }
+
+      let request: Promise<void> | undefined;
+      try {
+        request = video.play();
+      } catch {
+        markPlayBlocked();
+        return;
+      }
+
+      request?.catch((error: unknown) => {
+        if (!canContinue()) return;
+        const errorName = getMediaErrorName(error);
+        if (errorName === "AbortError" && retryCount < 2) {
+          retryCount += 1;
+          if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+            setIsBuffering(true);
+          }
+          retryTimer = window.setTimeout(attemptPlay, retryCount * 120);
+          return;
+        }
+        markPlayBlocked();
+      });
+    };
+
+    const retryWhenReady = () => {
+      if (canContinue() && video.paused) attemptPlay();
+    };
+
+    video.addEventListener("loadeddata", retryWhenReady);
+    video.addEventListener("canplay", retryWhenReady);
+    if (isVideoPausedByUser(index)) {
+      video.pause();
+      setPaused(true);
+      setIsBuffering(false);
+    } else if (video.paused) {
+      attemptPlay();
+    } else {
+      setPaused(false);
+      setIsBuffering(video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA);
+    }
+
+    return () => {
+      disposed = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      video.removeEventListener("loadeddata", retryWhenReady);
+      video.removeEventListener("canplay", retryWhenReady);
+    };
+  }, [
+    getVideoElement,
+    index,
+    isActive,
+    isVideoPausedByUser,
+    item.id,
+    onActiveNeedsPriority,
+    shouldLoad,
+    updateCurrentTime,
+    usesSharedVideo,
+  ]);
+
+  // iOS 不使用 WebKit 原生 loop：片尾后显式 seek 到 0，并等待下一轮首帧
+  // 真正进入合成器。普通 seek 迟迟不出帧时，只对同一个持久 video 做一次
+  // load() 自救；media element 不重建，因此不会丢失用户授予的有声播放权限。
+  useEffect(() => {
+    if (!usesSharedVideo || !isActive || !shouldLoad) return;
+    const video = getVideoElement();
+    if (!video || video.dataset.shortsVideoId !== item.id) return;
+
+    let disposed = false;
+    video.loop = false;
+    resetLoopRestartState();
+    const canObservePresentedFrames =
+      typeof video.requestVideoFrameCallback === "function" &&
+      typeof video.cancelVideoFrameCallback === "function";
+
+    const belongsToCurrentSlide = () =>
+      !disposed &&
+      getVideoElement() === video &&
+      isActiveRef.current &&
+      shouldLoadRef.current &&
+      video.dataset.shortsVideoId === item.id;
+
+    const canContinueRestart = (attempt: number) =>
+      belongsToCurrentSlide() &&
+      loopRestartPendingRef.current &&
+      loopRestartAttemptRef.current === attempt &&
+      !scrubbingRef.current &&
+      !isVideoPausedByUser(index);
+
+    const failRestart = (attempt: number) => {
+      if (!canContinueRestart(attempt)) return;
+      try {
+        video.pause();
+      } catch {
+        // ignore
+      }
+      resetLoopRestartState();
+      setIsBuffering(false);
+      setPaused(true);
+      onActiveNeedsPriority(index);
+    };
+
+    const attemptRestart = (attempt: number) => {
+      if (!canContinueRestart(attempt)) return;
+      normalizeVideoPlaybackRate(video);
+      applyVideoMutedState(video, mutedRef.current);
+
+      let request: Promise<void> | undefined;
+      try {
+        request = video.play();
+      } catch {
+        failRestart(attempt);
+        return;
+      }
+      request?.catch((error: unknown) => {
+        if (!canContinueRestart(attempt)) return;
+        // currentTime=0 / load() 都可能中断前一次 play。seeked/canplay
+        // 会再次调用 attemptRestart，因此 AbortError 不应暴露成暂停态。
+        if (getMediaErrorName(error) === "AbortError") return;
+        failRestart(attempt);
+      });
+    };
+
+    const startFrameWatchdog = (attempt: number) => {
+      clearLoopRestartWatchdog();
+      const timeoutMs = loopRestartReloadedRef.current
+        ? IOS_LOOP_RELOAD_TIMEOUT_MS
+        : IOS_LOOP_FRAME_WATCHDOG_MS;
+      loopRestartTimerRef.current = window.setTimeout(() => {
+        loopRestartTimerRef.current = null;
+        if (!canContinueRestart(attempt) || !loopRestartAwaitingFrameRef.current) {
+          return;
+        }
+
+        // 同一节点已经重建过一次播放管线仍没有任何呈现帧，就退出永久
+        // buffering，展示可点击的暂停态，让用户可以主动重试。
+        if (loopRestartReloadedRef.current) {
+          failRestart(attempt);
+          return;
+        }
+
+        loopRestartReloadedRef.current = true;
+        loopFrameBarrierRef.current = null;
+        try {
+          video.pause();
+          // 保留 src 和同一个 DOM 节点，只重建 WebKit 内部播放管线。
+          video.load();
+        } catch {
+          failRestart(attempt);
+          return;
+        }
+        attemptRestart(attempt);
+        startFrameWatchdog(attempt);
+      }, timeoutMs);
+    };
+
+    const handleIOSLoopEnded = () => {
+      if (
+        !belongsToCurrentSlide() ||
+        scrubbingRef.current ||
+        isVideoPausedByUser(index)
+      ) {
+        return;
+      }
+
+      // 已经在等上一轮的呈现帧却再次跑到 ended，说明只有媒体时钟在走，
+      // 不能把它当成一次全新的循环并反复 load。
+      if (loopRestartPendingRef.current) {
+        failRestart(loopRestartAttemptRef.current);
+        return;
+      }
+
+      clearLoopRestartWatchdog();
+      const attempt = loopRestartAttemptRef.current + 1;
+      loopRestartAttemptRef.current = attempt;
+      loopRestartPendingRef.current = true;
+      loopRestartAwaitingFrameRef.current = true;
+      loopRestartReloadedRef.current = false;
+      loopFrameBarrierRef.current = null;
+      lastObservedMediaTimeRef.current = null;
+      hasStartedPlayingRef.current = false;
+      normalizeVideoPlaybackRate(video);
+      setFastActive(false);
+      updateCurrentTime(0);
+      setPaused(false);
+      // 循环重启几乎总能在延迟窗口内出下一轮首帧。立刻点亮加载圈会让每循环
+      // 一轮都闪一次——短视频循环频繁，这是 iOS 上最显眼的残留噪音。
+      scheduleBufferingIndicator(
+        () => canContinueRestart(attempt) && loopRestartAwaitingFrameRef.current
+      );
+      onActiveNeedsPriority(index);
+
+      if (canObservePresentedFrames) {
+        try {
+          video.currentTime = 0;
+        } catch {
+          // 某些 WebKit readyState 下不能直接 seek，watchdog 会用 load() 恢复。
+        }
+      } else {
+        // Safari 15.3 及更早没有可观察的呈现帧信号，无法可靠区分
+        // “媒体时钟前进”和“画面已更新”。这类版本每轮直接重建同一节点
+        // 的内部播放管线，避免再次走容易卡住的 backward seek。
+        loopRestartReloadedRef.current = true;
+        try {
+          video.load();
+        } catch {
+          failRestart(attempt);
+          return;
+        }
+      }
+      startFrameWatchdog(attempt);
+      attemptRestart(attempt);
+    };
+
+    const retryRestartWhenReady = () => {
+      if (!loopRestartPendingRef.current) return;
+      attemptRestart(loopRestartAttemptRef.current);
+    };
+
+    const handleRestartSeeked = () => {
+      if (
+        loopRestartPendingRef.current &&
+        loopFrameBarrierRef.current === null
+      ) {
+        // presentationTime 与 performance.now() 使用同一个高精度时间轴。
+        // 只有在本轮 seek 完成后提交给合成器的帧才可以结束重启态。
+        loopFrameBarrierRef.current = performance.now();
+      }
+      retryRestartWhenReady();
+    };
+
+    const handleRestartCanPlay = () => {
+      if (
+        loopRestartPendingRef.current &&
+        loopRestartReloadedRef.current &&
+        loopFrameBarrierRef.current === null
+      ) {
+        // load() 会建立新的媒体时间线，不一定再发对应的 seeked。
+        loopFrameBarrierRef.current = performance.now();
+      }
+      retryRestartWhenReady();
+    };
+
+    const handleIOSLoopPlay = () => {
+      if (
+        !loopRestartPendingRef.current ||
+        !belongsToCurrentSlide() ||
+        isVideoPausedByUser(index)
+      ) {
+        return;
+      }
+      // 重启期间的 play 同样只表示媒体管线准备继续，不代表画面已经推进；
+      // 加载圈走和 ended 相同的延迟展示。
+      const attempt = loopRestartAttemptRef.current;
+      setPaused(false);
+      scheduleBufferingIndicator(
+        () => canContinueRestart(attempt) && loopRestartAwaitingFrameRef.current
+      );
+      startFrameWatchdog(attempt);
+    };
+
+    video.addEventListener("ended", handleIOSLoopEnded);
+    video.addEventListener("seeked", handleRestartSeeked);
+    video.addEventListener("loadeddata", handleRestartCanPlay);
+    video.addEventListener("canplay", handleRestartCanPlay);
+    video.addEventListener("play", handleIOSLoopPlay);
+
+    return () => {
+      disposed = true;
+      video.removeEventListener("ended", handleIOSLoopEnded);
+      video.removeEventListener("seeked", handleRestartSeeked);
+      video.removeEventListener("loadeddata", handleRestartCanPlay);
+      video.removeEventListener("canplay", handleRestartCanPlay);
+      video.removeEventListener("play", handleIOSLoopPlay);
+      resetLoopRestartState();
+    };
+  }, [
+    clearLoopRestartWatchdog,
+    getVideoElement,
+    index,
+    isActive,
+    isVideoPausedByUser,
+    item.id,
+    onActiveNeedsPriority,
+    resetLoopRestartState,
+    scheduleBufferingIndicator,
+    shouldLoad,
+    usesSharedVideo,
+  ]);
 
   // 离开活跃后清掉本地的暂停状态，避免回来时 UI 还显示着 paused
   useEffect(() => {
     if (!isActive) {
+      if (usesSharedVideo) resetLoopRestartState();
+      hasStartedPlayingRef.current = false;
       setPaused(false);
       setScrubbing(false);
       scrubbingRef.current = false;
       setIsBuffering(false);
     }
-  }, [isActive]);
+  }, [isActive, resetLoopRestartState, usesSharedVideo]);
 
-  // Sync volume state directly
+  // 只同步静音；媒体音量保持浏览器默认值，由系统控制实际响度。
   useEffect(() => {
-    const video = localRef.current;
+    const video = getVideoElement();
     if (video && isActive) {
-      applyVideoAudioState(video, muted, volume);
+      applyVideoMutedState(video, muted);
     }
-  }, [muted, volume, isActive]);
+  }, [getVideoElement, muted, isActive]);
 
   // 离开活跃或者被隐藏时暂停视频
   useEffect(() => {
-    if (isMarkedHidden && localRef.current) {
+    const video = getVideoElement();
+    if (isMarkedHidden && video) {
       try {
-        localRef.current.pause();
+        video.pause();
       } catch {
         // ignore
       }
     }
-  }, [isMarkedHidden]);
+  }, [getVideoElement, isMarkedHidden]);
 
   // 监听 video 的时长 / 进度 / 缓冲状态 / 音量物理键变化。
   // VIDEO_WINDOW_SIZE 会让窗口外的 slide 先以海报占位，之后才挂载 video 壳；
@@ -988,47 +1860,136 @@ function ShortsSlide({
   // 因此这里必须跟随 shouldMount 重新绑定，否则后续视频没有 timeupdate 事件。
   useEffect(() => {
     if (!shouldMount) {
-      setDuration(0);
-      setCurrentTime(0);
+      updateDuration(0);
+      updateCurrentTime(0);
       setIsBuffering(false);
       return;
     }
-    const video = localRef.current;
+    const video = getVideoElement();
     if (!video) return;
+    const usesPresentedFrameProgress =
+      usesSharedVideo &&
+      typeof video.requestVideoFrameCallback === "function" &&
+      typeof video.cancelVideoFrameCallback === "function";
+    const belongsToSlide = () =>
+      !usesSharedVideo ||
+      (isActiveRef.current && video.dataset.shortsVideoId === item.id);
     const handleLoaded = () => {
+      if (!belongsToSlide()) return;
       if (Number.isFinite(video.duration) && video.duration > 0) {
-        setDuration(video.duration);
+        updateDuration(video.duration);
       } else {
-        setDuration(0);
+        updateDuration(0);
       }
-      if (!scrubbingRef.current) setCurrentTime(video.currentTime || 0);
+      if (
+        !usesPresentedFrameProgress &&
+        !loopRestartPendingRef.current &&
+        !video.seeking &&
+        !scrubbingRef.current
+      ) {
+        updateCurrentTime(video.currentTime || 0);
+      }
     };
     const handleTime = () => {
-      // 拖动期间不要被 timeupdate 覆盖 UI
-      if (!scrubbingRef.current) setCurrentTime(video.currentTime);
+      if (!belongsToSlide()) return;
+      const mediaTime = video.currentTime || 0;
+      const previousMediaTime = lastObservedMediaTimeRef.current;
+      lastObservedMediaTimeRef.current = mediaTime;
+      const mediaTimeAdvanced =
+        previousMediaTime !== null &&
+        (mediaTime > previousMediaTime + 0.001 ||
+          (!usesSharedVideo && mediaTime + 0.25 < previousMediaTime));
+
+      // iOS 上 currentTime/timeupdate 可先于真正绘制的视频帧前进。
+      // 有 rVFC 时只让帧回调写进度；旧版浏览器则在非 seek/非循环
+      // 重启阶段退化为媒体时钟，并用时间确实推进来自愈残留 spinner。
+      if (
+        !usesPresentedFrameProgress &&
+        !loopRestartPendingRef.current &&
+        !video.seeking &&
+        !scrubbingRef.current
+      ) {
+        updateCurrentTime(mediaTime);
+      }
+      if (
+        !usesPresentedFrameProgress &&
+        mediaTimeAdvanced &&
+        !video.paused &&
+        !video.ended &&
+        !video.seeking &&
+        !isVideoPausedByUser(index) &&
+        (loopRestartPendingRef.current ||
+          !hasStartedPlayingRef.current ||
+          isBufferingRef.current)
+      ) {
+        confirmPresentedPlayback(mediaTime);
+      }
       syncActivePreloadReadiness(video);
     };
     const handleWaiting = () => {
+      if (!belongsToSlide()) return;
       if (video.paused || isVideoPausedByUser(index)) {
         setIsBuffering(false);
         return;
       }
-      setIsBuffering(true);
+      hasStartedPlayingRef.current = false;
+      playbackMotionFrameCountRef.current = 0;
       if (isActive) onActiveNeedsPriority(index);
+      scheduleBufferingIndicator(
+        () =>
+          belongsToSlide() &&
+          !hasStartedPlayingRef.current &&
+          !video.paused &&
+          !video.ended &&
+          !isVideoPausedByUser(index)
+      );
     };
-    const handlePlayingOrCanPlay = () => {
+    const cacheAvailableSource = () => {
+      if (!belongsToSlide()) return;
       // 已经能解码播放，说明浏览器里有了值得复用的数据。
       if (shouldLoad) onSourceCached(item.id);
+    };
+    const handleCanPlay = () => {
+      if (!belongsToSlide()) return;
+      if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
+      cacheAvailableSource();
       if (isActive && isVideoPausedByUser(index)) {
         video.pause();
         setPaused(true);
         setIsBuffering(false);
         return;
       }
-      setIsBuffering(false);
+      // canplay 只代表已有可解码数据，不代表播放真正开始。
+      // 激活播放 effect 会在这个事件后重试 play()；iOS spinner
+      // 必须等实际帧/媒体时间继续推进后才能清掉。
+      syncActivePreloadReadiness(video);
+    };
+    const handlePlaying = () => {
+      if (!belongsToSlide()) return;
+      if (video.paused) return;
+      cacheAvailableSource();
+      if (isActive && isVideoPausedByUser(index)) {
+        video.pause();
+        setPaused(true);
+        setIsBuffering(false);
+        return;
+      }
+      const waitForIOSPlaybackMotion = usesSharedVideo;
+      if (isActive) {
+        if (waitForIOSPlaybackMotion) {
+          // iOS 的 playing 只表示媒体管线准备继续，并不保证画面已经推进。
+          // spinner 必须等 rVFC/timeupdate 观察到新的媒体时间后才能清掉。
+          setPaused(false);
+        } else {
+          confirmPresentedPlayback();
+        }
+      } else {
+        setIsBuffering(false);
+      }
       syncActivePreloadReadiness(video);
     };
     const handleProgress = () => {
+      if (!belongsToSlide()) return;
       syncActivePreloadReadiness(video);
       // 窗口内视频只要已经产生缓冲，就标记为可复用；
       // 之后预加载授权被收回时不再丢弃它的 src 和已缓冲数据。
@@ -1036,18 +1997,8 @@ function ShortsSlide({
         onSourceCached(item.id);
       }
     };
-    const handleVolumeChange = () => {
-      if (!isActive) return;
-      // 当检测到 video 自身的 mute 状态或 volume 改变时，同步更新 React 状态。
-      // 这可以在移动端浏览器支持物理音量键调整时，自动反向取消静音并展示音量 HUD。
-      if (video.muted !== muted) {
-        setMuted(video.muted);
-      }
-      if (video.volume !== volume) {
-        setVolume(video.volume);
-      }
-    };
     const handlePlay = () => {
+      if (!belongsToSlide()) return;
       if (!isActive) return;
       if (isVideoPausedByUser(index)) {
         video.pause();
@@ -1056,18 +2007,72 @@ function ShortsSlide({
         return;
       }
       setPaused(false);
+      if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+        hasStartedPlayingRef.current = false;
+        setIsBuffering(true);
+      }
     };
     const handlePause = () => {
+      if (!belongsToSlide()) return;
+      if (loopRestartPendingRef.current) {
+        // watchdog 的 pause()+load() 不应把自救流程显示成用户暂停；但用户
+        // 在循环重启期间主动暂停时，仍要立刻隐藏 spinner 并显示播放按钮。
+        if (isVideoPausedByUser(index)) {
+          clearLoopRestartWatchdog();
+          hasStartedPlayingRef.current = false;
+          setPaused(true);
+          setIsBuffering(false);
+        }
+        return;
+      }
+      hasStartedPlayingRef.current = false;
       if (!isActive || video.ended) return;
       setPaused(true);
       setIsBuffering(false);
+      onActiveNeedsPriority(index);
+    };
+    const handleLoadStart = () => {
+      if (!belongsToSlide()) return;
+      if (!isActive || isVideoPausedByUser(index)) return;
+      hasStartedPlayingRef.current = false;
+      setPaused(false);
+      setIsBuffering(true);
+      onActiveNeedsPriority(index);
+    };
+    const handleStalled = () => {
+      if (!belongsToSlide()) return;
+      if (!isActive || video.paused || isVideoPausedByUser(index)) return;
+      // stalled 只表示暂时没有新的网络数据到达；已有缓冲足够时画面仍会
+      // 正常播放，也不会再发 playing。不能据此永久展示 spinner。
+      onActiveNeedsPriority(index);
+    };
+    const handleError = () => {
+      if (!belongsToSlide()) return;
+      if (usesSharedVideo && !video.error) return;
+      if (!isActive) return;
+      if (usesSharedVideo) resetLoopRestartState();
+      hasStartedPlayingRef.current = false;
+      setIsBuffering(false);
+      setPaused(true);
+      onActiveNeedsPriority(index);
     };
 
     function syncActivePreloadReadiness(currentVideo: HTMLVideoElement) {
       if (!isActive) return;
-      if (videoHasComfortableBuffer(currentVideo)) {
+      // 有缓冲不等于已经播放。iOS 上预加载视频可能停在首帧，
+      // 此时继续给后两条绑定 src 会加重媒体资源竞争。
+      if (
+        currentVideo.paused ||
+        currentVideo.ended ||
+        !hasStartedPlayingRef.current ||
+        isVideoPausedByUser(index)
+      ) {
+        onActiveNeedsPriority(index);
+        return;
+      }
+      if (videoHasComfortableBuffer(currentVideo, preloadBufferSeconds)) {
         onActiveReadyForPreload(index);
-      } else if (videoBufferIsCritical(currentVideo)) {
+      } else if (videoBufferIsCritical(currentVideo, preloadKeepSeconds)) {
         // 高低水位滞回：只有缓冲真正告急才收回预加载授权，
         // 在两个水位之间维持现状，避免阈值附近来回抖动。
         onActiveNeedsPriority(index);
@@ -1080,12 +2085,14 @@ function ShortsSlide({
     video.addEventListener("durationchange", handleLoaded);
     video.addEventListener("timeupdate", handleTime);
     video.addEventListener("waiting", handleWaiting);
-    video.addEventListener("playing", handlePlayingOrCanPlay);
-    video.addEventListener("canplay", handlePlayingOrCanPlay);
+    video.addEventListener("playing", handlePlaying);
+    video.addEventListener("canplay", handleCanPlay);
     video.addEventListener("progress", handleProgress);
-    video.addEventListener("volumechange", handleVolumeChange);
     video.addEventListener("play", handlePlay);
     video.addEventListener("pause", handlePause);
+    video.addEventListener("loadstart", handleLoadStart);
+    video.addEventListener("stalled", handleStalled);
+    video.addEventListener("error", handleError);
 
     // 挂载时如果已经在播放但是状态不到 ready 则置 buffering
     if (video.readyState < 3 && !video.paused) {
@@ -1097,85 +2104,168 @@ function ShortsSlide({
       video.removeEventListener("durationchange", handleLoaded);
       video.removeEventListener("timeupdate", handleTime);
       video.removeEventListener("waiting", handleWaiting);
-      video.removeEventListener("playing", handlePlayingOrCanPlay);
-      video.removeEventListener("canplay", handlePlayingOrCanPlay);
+      video.removeEventListener("playing", handlePlaying);
+      video.removeEventListener("canplay", handleCanPlay);
       video.removeEventListener("progress", handleProgress);
-      video.removeEventListener("volumechange", handleVolumeChange);
       video.removeEventListener("play", handlePlay);
       video.removeEventListener("pause", handlePause);
+      video.removeEventListener("loadstart", handleLoadStart);
+      video.removeEventListener("stalled", handleStalled);
+      video.removeEventListener("error", handleError);
     };
-  }, [shouldMount, shouldLoad, item.id, index, isActive, muted, volume, setMuted, setVolume, onActiveReadyForPreload, onActiveNeedsPriority, onSourceCached, isVideoPausedByUser]);
+  }, [
+    clearBufferingIndicatorTimer,
+    clearLoopRestartWatchdog,
+    confirmPresentedPlayback,
+    getVideoElement,
+    index,
+    isActive,
+    isVideoPausedByUser,
+    item.id,
+    onActiveNeedsPriority,
+    onActiveReadyForPreload,
+    onSourceCached,
+    preloadBufferSeconds,
+    preloadKeepSeconds,
+    resetLoopRestartState,
+    scheduleBufferingIndicator,
+    setIsBuffering,
+    shouldLoad,
+    shouldMount,
+    updateCurrentTime,
+    updateDuration,
+    usesSharedVideo,
+  ]);
 
-  // 长按 2 倍速：直接绑原生事件
+  // Safari 15.4+ 可以在视频帧真正送到合成器时回调。iOS 共享 video 的
+  // 进度以这里的 mediaTime 为准，而不是可能先行的 currentTime；同一个
+  // 信号也负责在 waiting/loadstart 恢复后清掉过期的缓冲状态。
   useEffect(() => {
-    const video = localRef.current;
-    if (!video) return;
-    let timer: number | null = null;
-    let active = false;
+    if (!usesSharedVideo || !isActive || !shouldLoad || !shouldMount) return;
+    const video = getVideoElement();
+    if (
+      !video ||
+      video.dataset.shortsVideoId !== item.id ||
+      typeof video.requestVideoFrameCallback !== "function" ||
+      typeof video.cancelVideoFrameCallback !== "function"
+    ) {
+      return;
+    }
 
-    const clearTimer = () => {
-      if (timer !== null) {
-        window.clearTimeout(timer);
-        timer = null;
+    let disposed = false;
+    let frameCallbackId: number | null = null;
+    let lastProgressUpdateAt = -Infinity;
+
+    const belongsToSlide = () =>
+      !disposed &&
+      getVideoElement() === video &&
+      isActiveRef.current &&
+      shouldLoadRef.current &&
+      video.dataset.shortsVideoId === item.id;
+
+    const requestNextFrame = () => {
+      if (!belongsToSlide()) return;
+      frameCallbackId = video.requestVideoFrameCallback(handlePresentedFrame);
+    };
+
+    const handlePresentedFrame: VideoFrameRequestCallback = (
+      now,
+      metadata
+    ) => {
+      frameCallbackId = null;
+      if (!belongsToSlide()) return;
+
+      const mediaTime = metadata.mediaTime;
+      if (loopRestartPendingRef.current) {
+        const frameBarrier = loopFrameBarrierRef.current;
+        const isNewLoopFrame =
+          frameBarrier !== null && metadata.presentationTime >= frameBarrier;
+        // ended 后可能还收到上一轮末帧的迟到回调；它既不能推动进度，
+        // 也不能提前撤掉 spinner。
+        if (!isNewLoopFrame) {
+          requestNextFrame();
+          return;
+        }
       }
-    };
-    const start = () => {
-      if (video.paused || video.ended) return;
-      clearTimer();
-      timer = window.setTimeout(() => {
-        timer = null;
-        if (video.paused || video.ended) return;
-        video.playbackRate = 2;
-        active = true;
-        setFastActive(true);
-      }, 400);
-    };
-    const end = () => {
-      clearTimer();
-      if (active) {
-        active = false;
-        video.playbackRate = 1;
-        setFastActive(false);
+
+      const previousPresentedMediaTime = lastPresentedMediaTimeRef.current;
+      const presentedFrameAdvanced =
+        previousPresentedMediaTime !== null &&
+        Math.abs(mediaTime - previousPresentedMediaTime) > 0.001;
+      lastPresentedMediaTimeRef.current = mediaTime;
+
+      const canConfirmPlaybackMotion =
+        presentedFrameAdvanced &&
+        !video.paused &&
+        !video.ended &&
+        !video.seeking &&
+        !scrubbingRef.current &&
+        !isVideoPausedByUser(index);
+      const playbackNeedsMotionConfirmation =
+        loopRestartPendingRef.current ||
+        !hasStartedPlayingRef.current ||
+        isBufferingRef.current;
+
+      if (playbackNeedsMotionConfirmation) {
+        if (canConfirmPlaybackMotion) {
+          playbackMotionFrameCountRef.current += 1;
+        }
+        if (playbackMotionFrameCountRef.current >= 2) {
+          lastProgressUpdateAt = now;
+          confirmPresentedPlayback(mediaTime);
+          requestNextFrame();
+          return;
+        }
+      } else {
+        playbackMotionFrameCountRef.current = 0;
       }
+
+      const shouldCommitProgress =
+        now - lastProgressUpdateAt >= 100;
+      if (shouldCommitProgress) {
+        lastProgressUpdateAt = now;
+        if (!scrubbingRef.current) {
+          updateCurrentTime(mediaTime);
+        }
+      }
+
+      requestNextFrame();
     };
 
-    const handleTouchStart = () => start();
-    const handleMouseDown = (e: MouseEvent) => {
-      if (e.button === 0) start();
-    };
-
-    video.addEventListener("touchstart", handleTouchStart, { passive: true });
-    video.addEventListener("touchend", end);
-    video.addEventListener("touchcancel", end);
-    video.addEventListener("mousedown", handleMouseDown);
-    video.addEventListener("mouseup", end);
-    video.addEventListener("mouseleave", end);
-    video.addEventListener("pause", end);
-    video.addEventListener("ended", end);
-
+    requestNextFrame();
     return () => {
-      clearTimer();
-      video.removeEventListener("touchstart", handleTouchStart);
-      video.removeEventListener("touchend", end);
-      video.removeEventListener("touchcancel", end);
-      video.removeEventListener("mousedown", handleMouseDown);
-      video.removeEventListener("mouseup", end);
-      video.removeEventListener("mouseleave", end);
-      video.removeEventListener("pause", end);
-      video.removeEventListener("ended", end);
+      disposed = true;
+      if (frameCallbackId !== null) {
+        video.cancelVideoFrameCallback(frameCallbackId);
+      }
     };
-  }, [shouldMount]);
+  }, [
+    confirmPresentedPlayback,
+    getVideoElement,
+    index,
+    isActive,
+    isVideoPausedByUser,
+    item.id,
+    shouldLoad,
+    shouldMount,
+    updateCurrentTime,
+    usesSharedVideo,
+  ]);
 
   function togglePlayInternal() {
-    const video = localRef.current;
+    const video = getVideoElement();
     if (!video) return;
     const shouldResume =
-      isVideoPausedByUser(index) || (video.paused && paused && !isBuffering);
+      isVideoPausedByUser(index) || (video.paused && !isBuffering);
     if (shouldResume) {
       onUserPausedChange(index, false);
-      video.play().catch(() => undefined);
       setPaused(false);
       if (video.readyState < 3) setIsBuffering(true);
+      video.play().catch(() => {
+        if (getVideoElement() !== video || !isActiveRef.current) return;
+        setPaused(true);
+        setIsBuffering(false);
+      });
     } else {
       onUserPausedChange(index, true);
       video.pause();
@@ -1184,47 +2274,48 @@ function ShortsSlide({
     }
   }
 
-  function clearClickTimer() {
-    if (clickTimerRef.current !== null) {
-      window.clearTimeout(clickTimerRef.current);
-      clickTimerRef.current = null;
-    }
+  // Safari 的有声播放权限按 media element 授予。自动播放被拒后，用户的
+  // 首次点击必须在原始 click 回调内直接 play()；分发时序见 useShortsSlideGestures。
+  function shouldResumeImmediatelyOnClick() {
+    const video = getVideoElement();
+    return Boolean(video?.paused && !isBuffering);
   }
 
-  /**
-   * 单击 / 双击分发：
-   * - 第一次点击：挂一个 280ms 定时器，到时如果还没第二次点击就 toggle 播放
-   * - 第二次点击（280ms 内）：清掉定时器，当作双击点赞，不切换播放状态
-   */
-  function handleSlideClick(e: React.MouseEvent<HTMLElement>) {
-    // 隐藏状态下不处理点击
-    if (isMarkedHidden) return;
-
-    const now = Date.now();
-    const delta = now - lastClickAtRef.current;
-    lastClickAtRef.current = now;
-
-    // 双击命中
-    if (delta < 280 && clickTimerRef.current !== null) {
-      clearClickTimer();
-      // 在双击位置弹心形动画
-      const rect = e.currentTarget.getBoundingClientRect();
-      handleDoubleClickLike(e.clientX - rect.left, e.clientY - rect.top);
-      return;
+  function handleImmediateResume() {
+    const video = getVideoElement();
+    if (!video) return;
+    onUserPausedChange(index, false);
+    setPaused(false);
+    if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+      setIsBuffering(true);
     }
-
-    // 单击挂起，等是否有第二次
-    clearClickTimer();
-    clickTimerRef.current = window.setTimeout(() => {
-      clickTimerRef.current = null;
-      togglePlayInternal();
-    }, 280);
+    video.play().catch(() => {
+      if (getVideoElement() !== video || !isActiveRef.current) return;
+      setPaused(true);
+      setIsBuffering(false);
+    });
   }
 
-  // 组件卸载时清理定时器
-  useEffect(() => {
-    return () => clearClickTimer();
-  }, []);
+  // 手势输入：长按倍速、横滑快进、单/双击分发、进度条拖动
+  const {
+    handleSlideClick,
+    handleProgressPointerDown,
+    handleProgressPointerMove,
+    handleProgressPointerEnd,
+  } = useShortsSlideGestures({
+    getVideoElement,
+    shouldMount,
+    disabled: isMarkedHidden,
+    scrubbingRef,
+    setScrubbing,
+    setFastActive,
+    setCurrentTime: updateCurrentTime,
+    getSeekDuration,
+    onSingleTap: togglePlayInternal,
+    onDoubleTap: handleDoubleClickLike,
+    shouldResumeImmediately: shouldResumeImmediatelyOnClick,
+    onImmediateResume: handleImmediateResume,
+  });
 
   function handleDoubleClickLike(x: number, y: number) {
     // 触发飞心动画（每次都给一个新 key 强制重启动画）
@@ -1235,17 +2326,26 @@ function ShortsSlide({
     // 真要取消请点右下角心形按钮
     if (isLiked) return;
     setIsLiked(true);
-    setLikes((n) => n + 1);
     void onLikeToggle(item.id, true).then((serverLikes) => {
-      if (serverLikes !== null) {
-        setLikes(serverLikes);
-      } else {
+      if (serverLikes === null) {
         // 请求失败：回滚视觉态
         setIsLiked(false);
-        setLikes((n) => Math.max(0, n - 1));
       }
     });
   }
+
+  keyboardLikeHandlerRef.current = () => {
+    if (!isActiveRef.current || isMarkedHidden) return;
+    const slideRect = slideRef.current?.getBoundingClientRect();
+    if (!slideRect) return;
+    handleDoubleClickLike(slideRect.width / 2, slideRect.height / 2);
+  };
+
+  useEffect(() => {
+    const handleKeyboardLike = () => keyboardLikeHandlerRef.current();
+    registerKeyboardLikeHandler(index, handleKeyboardLike);
+    return () => registerKeyboardLikeHandler(index, null);
+  }, [index, registerKeyboardLikeHandler]);
 
   /**
    * 点击右下角心形按钮：在"已点赞 / 未点赞"之间切换。
@@ -1266,27 +2366,47 @@ function ShortsSlide({
         window.setTimeout(() => setHeartBurst(null), 700);
       }
       setIsLiked(true);
-      setLikes((n) => n + 1);
       void onLikeToggle(item.id, true).then((serverLikes) => {
-        if (serverLikes !== null) {
-          setLikes(serverLikes);
-        } else {
+        if (serverLikes === null) {
           setIsLiked(false);
-          setLikes((n) => Math.max(0, n - 1));
         }
       });
     } else {
       // 取消点赞：视觉立即响应，请求失败再回滚
       setIsLiked(false);
-      setLikes((n) => Math.max(0, n - 1));
       void onLikeToggle(item.id, false).then((serverLikes) => {
-        if (serverLikes !== null) {
-          setLikes(serverLikes);
-        } else {
+        if (serverLikes === null) {
           setIsLiked(true);
-          setLikes((n) => n + 1);
         }
       });
+    }
+  }
+
+  /** 创建并复制与详情页相同的一次性分享链接。 */
+  async function handleShareClick(e: React.MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    if (isSharing) return;
+    setIsSharing(true);
+    try {
+      if (pendingShareURLRef.current) {
+        await copyExistingVideoShareURL(pendingShareURLRef.current);
+      } else {
+        const result = await createAndCopyVideoShare(item.id);
+        if (!result.copied) {
+          pendingShareURLRef.current = result.url;
+          showHud("请再次点击分享按钮");
+          return;
+        }
+      }
+      pendingShareURLRef.current = "";
+      showHud("一次性分享链接已复制");
+    } catch {
+      showHud(
+        pendingShareURLRef.current ? "复制失败，请重试" : "分享失败，请重试",
+        <AlertCircle size={16} />
+      );
+    } finally {
+      setIsSharing(false);
     }
   }
 
@@ -1301,7 +2421,7 @@ function ShortsSlide({
     void hideVideo(item.id)
       .then((res) => {
         if (res.ok) {
-          onHideSuccess(index);
+          onHideSuccess(itemKey);
         } else {
           setIsMarkedHidden(false);
           showHud("操作失败，请重试", <AlertCircle size={16} />);
@@ -1313,103 +2433,65 @@ function ShortsSlide({
       });
   }
 
-  // ---- 进度条拖动 ----
-  // 触摸进度条时：暂停 → 跟随手指更新 currentTime → 松手 resume
-  function handleProgressPointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    e.preventDefault();
-    e.stopPropagation();
-    const video = localRef.current;
-    const seekDuration = getSeekDuration(video);
-    if (!video || !seekDuration) return;
-    try {
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    } catch {
-      // ignore
-    }
-    wasPlayingRef.current = !video.paused;
-    if (!video.paused) {
-      try {
-        video.pause();
-      } catch {
-        // ignore
-      }
-    }
-    scrubbingRef.current = true;
-    setScrubbing(true);
-    applyProgressFromEvent(e, seekDuration);
-  }
-  function handleProgressPointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!scrubbingRef.current) return;
-    e.preventDefault();
-    e.stopPropagation();
-    applyProgressFromEvent(e);
-  }
-  function handleProgressPointerEnd(e: React.PointerEvent<HTMLDivElement>) {
-    if (!scrubbingRef.current) return;
-    e.preventDefault();
-    e.stopPropagation();
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {
-      // ignore
-    }
-    const video = localRef.current;
-    scrubbingRef.current = false;
-    setScrubbing(false);
-    if (video && wasPlayingRef.current) {
-      video.play().catch(() => undefined);
-    }
-  }
   function getSeekDuration(video: HTMLVideoElement | null) {
     if (duration > 0) return duration;
     if (video && Number.isFinite(video.duration) && video.duration > 0) {
-      setDuration(video.duration);
+      updateDuration(video.duration);
       return video.duration;
     }
     return 0;
   }
-  function applyProgressFromEvent(
-    e: React.PointerEvent<HTMLDivElement>,
-    knownDuration?: number
-  ) {
-    const video = localRef.current;
-    const seekDuration = knownDuration ?? getSeekDuration(video);
-    if (!video || !seekDuration) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const ratio = clamp((e.clientX - rect.left) / rect.width, 0, 1);
-    const next = ratio * seekDuration;
-    setCurrentTime(next);
-    try {
-      video.currentTime = next;
-    } catch {
-      // ignore（部分 ready state 下设置会抛错）
-    }
-  }
 
-  const progressRatio = duration > 0 ? clamp(currentTime / duration, 0, 1) : 0;
+  // 远离视口的 slide 只保留空壳。属性照旧给全：高度来自 .shorts-slide 的
+  // CSS，滚动高度和吸附点一格不差；data-shorts-slide 让 IntersectionObserver
+  // 依然能观测到它，滑回来时才判定为活跃并重新长出内容。
+  if (!shouldRenderContent) {
+    return (
+      <article
+        ref={slideRef}
+        className="shorts-slide"
+        data-shorts-slide=""
+        data-index={index}
+        data-feed-key={itemKey}
+        data-active={isActive}
+      />
+    );
+  }
 
   return (
     <article
+      ref={slideRef}
       className="shorts-slide"
       data-shorts-slide=""
       data-index={index}
+      data-feed-key={itemKey}
       data-active={isActive}
       onClick={handleSlideClick}
     >
-      {/* 模糊海报背景：避免横屏视频两边出现刺眼黑边 */}
+      {/* 服务端预模糊的小图：避免横屏视频两边出现刺眼黑边，也不创建大面积 GPU blur layer。 */}
       <div
         className="shorts-slide__bg"
-        style={{ backgroundImage: `url(${item.poster})` }}
+        style={{
+          backgroundImage: `url(${item.backgroundPoster || item.poster})`,
+        }}
         aria-hidden="true"
       />
 
-      {shouldMount ? (
+      {sharedVideoSlotRef && (
+        <div
+          ref={sharedVideoSlotRef}
+          className="shorts-slide__ios-video-slot"
+        />
+      )}
+
+      {!usesSharedVideo && shouldMount ? (
         <video
           ref={setRef}
           className="shorts-slide__video"
           src={shouldLoad ? item.videoSrc : undefined}
           poster={item.poster}
           preload={shouldLoad ? (shouldEagerLoad ? "auto" : "metadata") : "none"}
+          autoPlay={isActive}
           playsInline
           loop
           muted={muted}
@@ -1437,7 +2519,9 @@ function ShortsSlide({
 
       {paused && isActive && !scrubbing && (
         <div className="shorts-slide__paused" aria-hidden="true">
-          ▶
+          <span className="shorts-slide__paused-icon">
+            <Play size={22} fill="currentColor" strokeWidth={1.75} />
+          </span>
         </div>
       )}
 
@@ -1451,9 +2535,8 @@ function ShortsSlide({
       {/* 不再展示屏蔽遮罩 */}
       {isMarkedHidden && (
         <div className="shorts-slide__hidden-overlay" onClick={(e) => e.stopPropagation()}>
-          <EyeOff size={38} style={{ color: "#ff4060", marginBottom: "8px" }} />
+          <EyeOff size={38} style={{ color: "#ff4060" }} />
           <div className="shorts-slide__hidden-title">已隐藏该视频</div>
-          <div className="shorts-slide__hidden-desc">系统将不会再次在任何地方向您展示此视频</div>
         </div>
       )}
 
@@ -1494,6 +2577,7 @@ function ShortsSlide({
         {/* 点赞 */}
         <button
           type="button"
+          data-shorts-like=""
           className={`shorts-slide__action ${isLiked ? "is-liked" : ""}`}
           aria-label={isLiked ? "取消点赞" : "点赞"}
           aria-pressed={isLiked}
@@ -1504,21 +2588,31 @@ function ShortsSlide({
             fill={isLiked ? "currentColor" : "none"}
             strokeWidth={2}
           />
-          <span className="shorts-slide__action-count">{formatCount(likes)}</span>
         </button>
 
-
-
-        {/* 不再展示 */}
+        {/* 一次性分享 */}
         <button
           type="button"
           className="shorts-slide__action"
-          aria-label="不再展示"
-          onClick={handleHideClick}
+          aria-label="生成并复制一次性分享链接"
+          aria-busy={isSharing}
+          disabled={isSharing}
+          onClick={handleShareClick}
         >
-          <EyeOff size={22} />
-          <span className="shorts-slide__action-count">隐藏</span>
+          <Share2 size={22} />
         </button>
+
+
+        {canHide && (
+          <button
+            type="button"
+            className="shorts-slide__action"
+            aria-label="不再展示"
+            onClick={handleHideClick}
+          >
+            <EyeOff size={22} />
+          </button>
+        )}
       </aside>
 
       {/* 双击点赞时弹起的心形动画 */}
@@ -1530,6 +2624,18 @@ function ShortsSlide({
           aria-hidden="true"
         >
           <Heart size={88} fill="currentColor" strokeWidth={0} />
+        </div>
+      )}
+
+      {/* 移动端左右滑动 / 拖动进度时的时间提示。独立于底部进度条，
+          这样可以在触屏设备上放到页面顶部且不受底部容器定位限制。 */}
+      {scrubbing && isActive && shouldLoad && !isMarkedHidden && (
+        <div
+          ref={progressTimeRef}
+          className="shorts-slide__progress-time"
+          aria-live="polite"
+        >
+          {formatClock(currentTimeRef.current)} / {formatClock(duration)}
         </div>
       )}
 
@@ -1547,48 +2653,36 @@ function ShortsSlide({
           onClick={(e) => e.stopPropagation()}
         >
           <div
+            ref={progressTrackRef}
             className="shorts-slide__progress-track"
-            style={{
-              "--progress-pct": `${progressRatio * 100}%`,
-            } as React.CSSProperties}
           >
-            <div
-              className="shorts-slide__progress-fill"
-              style={{ width: `${progressRatio * 100}%` }}
-            />
+            <div className="shorts-slide__progress-fill" />
           </div>
-          {scrubbing && (
-            <div className="shorts-slide__progress-time">
-              {formatClock(currentTime)} / {formatClock(duration)}
-            </div>
-          )}
         </div>
       )}
     </article>
   );
 }
 
+/**
+ * 切一屏只会改动紧邻几条 slide 的 props（isActive、各个 shouldXxx、
+ * keyboardSeekPreview），其余全部命中 memo 直接跳过。没有这层时，每次
+ * setActiveIndex 都要把已挂载的每一条 slide 重跑一遍函数体和子树协调——
+ * 即使有几十条保留队列，这份工作也会落在贴着手指的那一帧。
+ *
+ * 这层比较之所以有效：父级传下来的回调要么是 [] 依赖的 useCallback，要么是
+ * 按 index 缓存的 ref setter，要么是稳定的 ref 对象；item 对象在 merge 时
+ * 按引用保留。改这些 props 前先确认它们仍然稳定，否则 memo 会静默失效。
+ *
+ * 另注：父级有个只写不读的 setUserPausedIndexState，作用是强制重渲染。
+ * slide 内所有 isVideoPausedByUser(index) 都在 effect 或事件回调里读 ref，
+ * 没有一处出现在渲染体里，因此那次重渲染被 memo 挡掉不改变任何行为。
+ */
+const ShortsSlide = memo(ShortsSlideImpl);
+
 function ShortsLoadingSpinner({ size }: { size: number }) {
-  const ref = useRef<HTMLSpanElement | null>(null);
-
-  useEffect(() => {
-    let frame = 0;
-    const startedAt = performance.now();
-    const tick = (now: number) => {
-      const spinner = ref.current;
-      if (spinner) {
-        const rotation = ((now - startedAt) / 800) * 360;
-        spinner.style.transform = `rotate(${rotation}deg)`;
-      }
-      frame = window.requestAnimationFrame(tick);
-    };
-    frame = window.requestAnimationFrame(tick);
-    return () => window.cancelAnimationFrame(frame);
-  }, []);
-
   return (
     <span
-      ref={ref}
       className="shorts-slide__loading-spinner"
       style={{
         "--shorts-spinner-size": `${size}px`,
@@ -1598,23 +2692,7 @@ function ShortsLoadingSpinner({ size }: { size: number }) {
   );
 }
 
-function applyVideoAudioState(
-  video: HTMLVideoElement,
-  nextMuted: boolean,
-  nextVolume: number
-) {
-  const safeVolume = clamp(nextVolume, 0, 1);
-  const syncVolume = () => {
-    try {
-      if (Math.abs(video.volume - safeVolume) > 0.001) {
-        video.volume = safeVolume;
-      }
-    } catch {
-      // Some mobile browsers expose volume as effectively read-only.
-    }
-  };
-
-  if (!nextMuted) syncVolume();
+function applyVideoMutedState(video: HTMLVideoElement, nextMuted: boolean) {
   try {
     if (video.muted !== nextMuted) {
       video.muted = nextMuted;
@@ -1622,7 +2700,72 @@ function applyVideoAudioState(
   } catch {
     // ignore
   }
-  if (nextMuted) syncVolume();
+}
+
+/**
+ * 两个持久 media element 的角色。备用元素只负责把下一条的数据先拉下来：
+ * 不能带 autoplay（有数据后会在屏幕外真的播起来），也必须保持静音。
+ */
+function applyIOSVideoRole(
+  video: HTMLVideoElement,
+  role: "active" | "standby"
+) {
+  if (role === "active") {
+    video.autoplay = true;
+    video.setAttribute("autoplay", "");
+    return;
+  }
+  video.autoplay = false;
+  video.removeAttribute("autoplay");
+  applyVideoMutedState(video, true);
+  try {
+    video.defaultMuted = true;
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * 在用户手势里给一个还没播放过的持久 media element 领取有声播放授权。
+ * WebKit 在 play() 内部同步就解除了该元素的自动播放限制，所以紧接着
+ * 暂停不会把授权还回去；保持静音发起则避免和当前视频重叠出声。
+ */
+function unlockVideoAudioPlayback(video: HTMLVideoElement) {
+  applyVideoMutedState(video, true);
+  let request: Promise<void> | undefined;
+  try {
+    request = video.play();
+  } catch {
+    return;
+  }
+  request?.catch(() => undefined);
+  try {
+    video.pause();
+  } catch {
+    // ignore
+  }
+}
+
+function releaseVideoSource(video: HTMLVideoElement) {
+  try {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  } catch {
+    // ignore
+  }
+}
+
+function getMediaErrorName(error: unknown) {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    typeof error.name === "string"
+  ) {
+    return error.name;
+  }
+  return "UnknownError";
 }
 
 function normalizeVideoPlaybackRate(video: HTMLVideoElement) {
@@ -1655,95 +2798,31 @@ function stabilizeVideoAfterAudioToggle(
   }
 }
 
-function shouldUseDocumentScrollForShorts() {
-  return isIPhoneBrowserShell();
-}
+type WebkitFullscreenDocument = Document & {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+};
 
-function isIPhoneBrowserShell() {
-  if (typeof window === "undefined" || typeof navigator === "undefined") {
-    return false;
+function exitDocumentFullscreen(): Promise<void> | null {
+  if (typeof document === "undefined") return null;
+  const fullscreenDocument = document as WebkitFullscreenDocument;
+  const fullscreenElement =
+    fullscreenDocument.fullscreenElement ??
+    fullscreenDocument.webkitFullscreenElement;
+  const exitFullscreen =
+    fullscreenDocument.exitFullscreen?.bind(fullscreenDocument) ??
+    fullscreenDocument.webkitExitFullscreen?.bind(fullscreenDocument);
+  if (!fullscreenElement || !exitFullscreen) return null;
+
+  try {
+    return Promise.resolve(exitFullscreen());
+  } catch (error) {
+    return Promise.reject(error);
   }
-  const ua = navigator.userAgent || "";
-  return /\biPhone\b|\biPod\b/.test(ua) && !isStandaloneDisplayMode();
 }
 
-function isStandaloneDisplayMode() {
-  if (typeof window === "undefined" || typeof navigator === "undefined") {
-    return false;
-  }
-  const nav = navigator as Navigator & { standalone?: boolean };
-  return (
-    nav.standalone === true ||
-    window.matchMedia?.("(display-mode: standalone)").matches === true ||
-    window.matchMedia?.("(display-mode: fullscreen)").matches === true
-  );
-}
-
-function supportsElementFullscreenAPI(target?: Element | null) {
-  if (typeof document === "undefined") return false;
-  const el = (target ?? document.documentElement) as HTMLElement & {
-    webkitRequestFullscreen?: () => Promise<void> | void;
-  };
-  return (
-    typeof el.requestFullscreen === "function" ||
-    typeof el.webkitRequestFullscreen === "function"
-  );
-}
-
-function clamp(n: number, min: number, max: number) {
-  return n < min ? min : n > max ? max : n;
-}
-
-function getVideoWindowBounds(highestViewedIndex: number, itemCount: number) {
-  const size = Math.min(VIDEO_WINDOW_SIZE, itemCount);
-  if (size <= 0 || highestViewedIndex < 0) return { start: 0, end: -1 };
-
-  const end = clamp(highestViewedIndex, 0, itemCount - 1);
-  const start = Math.max(0, end - size + 1);
-  return { start, end };
-}
-
-/** 已经缓冲到片尾（含误差余量），不会再因网络卡顿 */
-function videoBufferedToEnd(video: HTMLVideoElement) {
-  const duration = Number.isFinite(video.duration) ? video.duration : 0;
-  if (duration <= 0) return false;
-  const remaining = Math.max(0, duration - (video.currentTime || 0));
-  return bufferedAheadSeconds(video) >= remaining - 0.25;
-}
-
-function videoHasBufferedData(video: HTMLVideoElement) {
-  for (let i = 0; i < video.buffered.length; i += 1) {
-    if (video.buffered.end(i) > video.buffered.start(i)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** 前向缓冲健康（达到高水位或已缓冲到结尾），可以放心预加载后续视频 */
-function videoHasComfortableBuffer(video: HTMLVideoElement) {
-  if (video.readyState < 3) return false;
-  if (videoBufferedToEnd(video)) return true;
-  return bufferedAheadSeconds(video) >= ACTIVE_PRELOAD_BUFFER_SECONDS;
-}
-
-/** 前向缓冲告急（跌破低水位且没缓冲到结尾），应收回预加载授权 */
-function videoBufferIsCritical(video: HTMLVideoElement) {
-  if (video.readyState < 3) return true;
-  if (videoBufferedToEnd(video)) return false;
-  return bufferedAheadSeconds(video) < ACTIVE_PRELOAD_KEEP_SECONDS;
-}
-
-function bufferedAheadSeconds(video: HTMLVideoElement) {
-  const current = video.currentTime || 0;
-  for (let i = 0; i < video.buffered.length; i += 1) {
-    const start = video.buffered.start(i);
-    const end = video.buffered.end(i);
-    if (start <= current + 0.25 && end > current) {
-      return Math.max(0, end - current);
-    }
-  }
-  return 0;
+function preventMediaContextMenu(event: Event) {
+  event.preventDefault();
 }
 
 function formatClock(seconds: number) {
@@ -1752,14 +2831,6 @@ function formatClock(seconds: number) {
   const m = Math.floor(total / 60);
   const s = total % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-/** 简易的点赞数缩写：1.2k / 3.4w，避免 5 位数挤爆右侧操作栏 */
-function formatCount(n: number) {
-  if (!Number.isFinite(n) || n <= 0) return "0";
-  if (n < 1000) return String(n);
-  if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
-  return (n / 10000).toFixed(1).replace(/\.0$/, "") + "w";
 }
 
 /** 识别云盘缩写名称 */
@@ -1772,6 +2843,7 @@ function getDriveShortName(source: string): string {
   if (s.includes("onedrive")) return "OneDrive";
   if (s.includes("wopan") || s.includes("沃盘")) return "沃盘";
   if (s.includes("guangyapan") || s.includes("guangya") || s.includes("光鸭")) return "光鸭";
+  if (s.includes("webdav") || s.includes("web dav")) return "WebDAV";
   if (s.includes("localstorage") || s.includes("本地")) return "本地";
   if (s.includes("spider") || s.includes("爬虫")) return "爬虫";
   return source.substring(0, 4);

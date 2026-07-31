@@ -26,6 +26,7 @@ test("accepts public same-origin pages as video delete return paths", () => {
 test("rejects unsafe video delete return paths", () => {
   assert.equal(normalizeVideoReturnPath("/video/abc", ORIGIN), null);
   assert.equal(normalizeVideoReturnPath("/login", ORIGIN), null);
+  assert.equal(normalizeVideoReturnPath("/share#secret-token", ORIGIN), null);
   assert.equal(
     normalizeVideoReturnPath("https://example.com/list", ORIGIN),
     null

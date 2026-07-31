@@ -16,6 +16,7 @@ const HIDE_AFTER_SCROLL_Y = 56;
 
 export function AppShell({ children, mobileAutoHideNav = false }: Props) {
   const [mobileNavHidden, setMobileNavHidden] = useState(false);
+  const [backToTopVisible, setBackToTopVisible] = useState(false);
 
   useEffect(() => {
     if (!mobileAutoHideNav) {
@@ -76,6 +77,7 @@ export function AppShell({ children, mobileAutoHideNav = false }: Props) {
     "app-shell",
     mobileAutoHideNav ? "app-shell--mobile-auto-hide-nav" : "",
     mobileNavHidden ? "is-mobile-nav-hidden" : "",
+    backToTopVisible ? "is-back-to-top-visible" : "",
   ].filter(Boolean).join(" ");
 
   return (
@@ -87,7 +89,7 @@ export function AppShell({ children, mobileAutoHideNav = false }: Props) {
       </div>
       <main className="app-shell__main">{children}</main>
       <Footer />
-      <BackToTop />
+      <BackToTop onVisibilityChange={setBackToTopVisible} />
     </div>
   );
 }

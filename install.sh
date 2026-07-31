@@ -125,7 +125,7 @@ asset_name() {
 
 verify_runtime_deps() {
   local cmd
-  for cmd in curl tar ffmpeg ffprobe openssl python3; do
+  for cmd in curl tar ffmpeg ffprobe python3; do
     command -v "$cmd" >/dev/null 2>&1 || die "missing command: $cmd"
   done
 
@@ -152,7 +152,7 @@ install_deps() {
     export DEBIAN_FRONTEND=noninteractive
     log "installing runtime dependencies"
     apt-get update
-    apt-get install -y ca-certificates curl tar ffmpeg openssl iproute2 python3 python3-requests python3-bs4 python3-lxml python3-socks
+    apt-get install -y ca-certificates curl tar ffmpeg iproute2 python3 python3-requests python3-bs4 python3-lxml python3-socks
     verify_runtime_deps
     return
   fi
@@ -233,12 +233,6 @@ prepare_config() {
     fi
   fi
 
-  if grep -q 'session_secret: "change-me-to-a-random-string"' "$cfg"; then
-    local secret
-    secret="$(openssl rand -hex 32)"
-    sed -i -E "s#session_secret: \".*\"#session_secret: \"$secret\"#" "$cfg"
-    log "generated random session_secret"
-  fi
 }
 
 write_service() {
@@ -253,12 +247,14 @@ Type=simple
 WorkingDirectory=${INSTALL_PATH}
 ExecStart=${INSTALL_PATH}/server
 Restart=on-failure
+RestartForceExitStatus=75
 RestartSec=5
 TimeoutStopSec=20
 Environment=VIDEO_CONFIG=${INSTALL_PATH}/config.yaml
 Environment=VIDEO_FRONTEND_DIR=${INSTALL_PATH}/dist
 Environment=VIDEO_VERSION_FILE=${VERSION_FILE}
 Environment=VIDEO_GITHUB_REPO=${GITHUB_REPO}
+Environment=VIDEO_RESTART_MANAGED=true
 Environment=HOME=/root
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 LimitNOFILE=65536
@@ -535,18 +531,56 @@ service_health_url() {
   printf 'http://127.0.0.1:%s/admin/api/setup' "$(listen_port_from_config)"
 }
 
+local_service_curl() {
+  # 健康检查只访问本机。显式忽略 ~/.curlrc 和所有代理设置，避免服务器为
+  # GitHub 下载配置 HTTP_PROXY/ALL_PROXY 后，127.0.0.1 也被错误发往代理。
+  curl --disable --noproxy '*' "$@"
+}
+
+report_service_readiness_failure() {
+  local port listeners=""
+  port="$(listen_port_from_config)"
+
+  if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    warn "service process is active, but its local health endpoint is unreachable"
+  else
+    warn "service process is not active"
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    listeners="$(
+      ss -ltnp 2>/dev/null \
+        | awk -v port="$port" '$4 ~ ":" port "$" {print}' \
+        || true
+    )"
+    if [[ -n "$listeners" ]]; then
+      warn "listener(s) found on port $port:"
+      printf '%s\n' "$listeners" >&2
+    else
+      warn "nothing is listening on port $port"
+    fi
+  fi
+}
+
 wait_for_service_ready() {
   local url deadline
   url="$(service_health_url)"
   deadline=$((SECONDS + SERVICE_READY_TIMEOUT))
   log "waiting for service at $url"
   while (( SECONDS < deadline )); do
-    if curl -fsS --connect-timeout 2 --max-time 5 "$url" >/dev/null 2>&1; then
+    if local_service_curl -fsS --connect-timeout 2 --max-time 5 "$url" >/dev/null 2>&1; then
       log "service is ready"
       return 0
     fi
     sleep 2
   done
+
+  warn "service readiness check timed out after ${SERVICE_READY_TIMEOUT}s: $url"
+  # 最后一次探测保留 curl 错误，避免 90 秒内完全没有可操作的诊断信息。
+  if local_service_curl -fsS --connect-timeout 2 --max-time 5 "$url" >/dev/null; then
+    log "service is ready"
+    return 0
+  fi
   return 1
 }
 
@@ -561,6 +595,7 @@ restart_service_ready() {
   fi
 
   warn "service failed to become ready"
+  report_service_readiness_failure
   systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
   journalctl -u "${SERVICE_NAME}.service" -n 80 --no-pager || true
   return 1
@@ -691,7 +726,7 @@ install_app() {
   write_service
   install_cli
   open_firewall_port
-  restart_service_ready || die "service failed to start"
+  restart_service_ready || die "service readiness check failed; see diagnostics above"
   record_version
   show_success
 }
@@ -728,7 +763,7 @@ update_app() {
   fi
 
   if ! restart_service_ready; then
-    warn "new version failed to start; restoring previous files"
+    warn "new version failed its readiness check; restoring previous files"
     restore_install_files "$backup"
     restart_service_ready 2>/dev/null || true
     rm -rf "$backup"
@@ -771,14 +806,23 @@ reset_password() {
   if [[ ! -f "$db_path" ]]; then
     die "数据库文件不存在: $db_path"
   fi
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    die "需要 sqlite3 命令，请先安装: apt install sqlite3"
+  if [[ ! -x "$INSTALL_PATH/server" ]]; then
+    die "服务端程序不存在或不可执行: $INSTALL_PATH/server"
   fi
 
   echo "当前用户列表："
   echo "---"
-  sqlite3 -separator ' | ' "$db_path" \
-    "SELECT id, username, role, CASE WHEN banned THEN '已封禁' ELSE '正常' END AS status FROM users ORDER BY id;"
+  DB_PATH="$db_path" python3 - <<'PY' || die "读取用户列表失败"
+import os
+import sqlite3
+
+conn = sqlite3.connect(os.environ["DB_PATH"])
+for row in conn.execute(
+    "SELECT id, username, role, CASE WHEN banned THEN '已封禁' ELSE '正常' END AS status FROM users ORDER BY id"
+):
+    print(" | ".join(str(part) for part in row))
+conn.close()
+PY
   echo "---"
   echo
 
@@ -788,7 +832,20 @@ reset_password() {
   fi
 
   local existing
-  existing=$(sqlite3 "$db_path" "SELECT username FROM users WHERE id = $user_id;" 2>/dev/null)
+  existing=$(DB_PATH="$db_path" USER_ID="$user_id" python3 - <<'PY' 2>/dev/null
+import os
+import sqlite3
+
+conn = sqlite3.connect(os.environ["DB_PATH"])
+row = conn.execute(
+    "SELECT username FROM users WHERE id = ?",
+    (int(os.environ["USER_ID"]),),
+).fetchone()
+conn.close()
+if row:
+    print(row[0])
+PY
+)
   if [[ -z "$existing" ]]; then
     die "用户 ID $user_id 不存在"
   fi
@@ -807,18 +864,11 @@ reset_password() {
   fi
 
   local hashed
-  hashed=$(NEW_PASS="$new_pass" python3 -c "
-import bcrypt, os
-print(bcrypt.hashpw(os.environ['NEW_PASS'].encode(), bcrypt.gensalt()).decode())
-" 2>/dev/null) \
-    || hashed=$(NEW_PASS="$new_pass" python3 -c "
-import hashlib, base64, os
-h = hashlib.sha256(os.environ['NEW_PASS'].encode()).digest()
-print(base64.b64encode(h).decode())
-" 2>/dev/null)
+  hashed=$(printf '%s' "$new_pass" | "$INSTALL_PATH/server" hash-password 2>/dev/null) \
+    || die "密码哈希生成失败，请确认 $INSTALL_PATH/server 为当前版本"
 
   if [[ -z "$hashed" ]]; then
-    die "密码哈希生成失败，请确认 python3 已安装"
+    die "密码哈希生成失败"
   fi
 
   NEW_HASH="$hashed" USER_ID="$user_id" DB_PATH="$db_path" python3 -c "
@@ -896,7 +946,7 @@ main() {
       ;;
     restart)
       need_root "$@"
-      restart_service_ready || die "service failed to start"
+      restart_service_ready || die "service readiness check failed; see diagnostics above"
       ;;
     stop)
       need_root "$@"

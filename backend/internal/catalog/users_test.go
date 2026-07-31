@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"testing"
 )
@@ -58,6 +60,14 @@ func TestListUsers(t *testing.T) {
 	if len(users) != 2 {
 		t.Fatalf("expected 2 users, got %d", len(users))
 	}
+	admins, err := c.ListAdmins(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(admins) != 1 || admins[0].Username != "user2" ||
+		admins[0].Password != "pass2" || admins[0].Role != "admin" {
+		t.Fatalf("administrators = %#v", admins)
+	}
 }
 
 func TestSetUserBanned(t *testing.T) {
@@ -97,5 +107,20 @@ func TestUnbanIP(t *testing.T) {
 	banned, _ := c.IsLoginIPBanned(ctx, "5.6.7.8")
 	if banned {
 		t.Fatal("expected IP to be unbanned")
+	}
+}
+
+func TestUserMutationsReturnNoRowsForMissingUser(t *testing.T) {
+	c := setupTestCatalogForUsers(t)
+	ctx := context.Background()
+
+	if err := c.SetUserBanned(ctx, 404, true); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("SetUserBanned error = %v, want sql.ErrNoRows", err)
+	}
+	if err := c.UpdateUserPassword(ctx, 404, "hash"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("UpdateUserPassword error = %v, want sql.ErrNoRows", err)
+	}
+	if err := c.DeleteUser(ctx, 404); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("DeleteUser error = %v, want sql.ErrNoRows", err)
 	}
 }

@@ -32,6 +32,9 @@ func TestFrontendHandlerServesStaticAsset(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), "console.log") {
 		t.Fatalf("body = %q, want asset content", rr.Body.String())
 	}
+	if got := rr.Header().Get("Cache-Control"); got != frontendHashedAssetCacheControl {
+		t.Fatalf("Cache-Control = %q, want %q", got, frontendHashedAssetCacheControl)
+	}
 }
 
 func TestFrontendHandlerFallsBackToIndexForSPARoute(t *testing.T) {

@@ -1,21 +1,20 @@
 import { useEffect, useState } from "react";
 import {
   Ban,
-  CheckCircle,
+  ChevronDown,
   Key,
-  Plus,
-  RefreshCw,
   ShieldOff,
   Trash2,
-  Users,
-  Globe,
 } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
 import { ConfirmModal } from "./ConfirmModal";
+import { PasswordInput } from "./PasswordInput";
+import { AdminLoading } from "./AdminLoading";
 
 type Tab = "users" | "ips";
+const MIN_PASSWORD_LENGTH = 6;
 
 export function UsersPage() {
   const [tab, setTab] = useState<Tab>("users");
@@ -34,6 +33,14 @@ export function UsersPage() {
   const [deleting, setDeleting] = useState(false);
   const [unbanIPConfirm, setUnbanIPConfirm] = useState<string | null>(null);
   const { show } = useToast();
+  const createPasswordError =
+    createPassword.length > 0 && createPassword.length < MIN_PASSWORD_LENGTH
+      ? `密码至少 ${MIN_PASSWORD_LENGTH} 位`
+      : "";
+  const resetPasswordError =
+    resetPasswordValue.length > 0 && resetPasswordValue.length < MIN_PASSWORD_LENGTH
+      ? `密码至少 ${MIN_PASSWORD_LENGTH} 位`
+      : "";
 
   async function refreshUsers() {
     try {
@@ -62,7 +69,7 @@ export function UsersPage() {
   }, []);
 
   async function handleCreate() {
-    if (!createUsername.trim() || !createPassword) return;
+    if (!createUsername.trim() || !createPassword || createPasswordError) return;
     setCreating(true);
     try {
       await api.createUser({
@@ -114,7 +121,7 @@ export function UsersPage() {
   }
 
   async function handleResetPassword() {
-    if (!resetPasswordId || !resetPasswordValue) return;
+    if (!resetPasswordId || !resetPasswordValue || resetPasswordError) return;
     setResetting(true);
     try {
       await api.resetPassword(resetPasswordId, resetPasswordValue);
@@ -126,6 +133,11 @@ export function UsersPage() {
     } finally {
       setResetting(false);
     }
+  }
+
+  function closeResetPassword() {
+    setResetPasswordId(null);
+    setResetPasswordValue("");
   }
 
   async function handleUnbanIP() {
@@ -146,45 +158,43 @@ export function UsersPage() {
 
   return (
     <div className="admin-page">
-      <div className="admin-page__header">
-        <h1 className="admin-page__title">
-          <Users size={20} /> 用户管理
-        </h1>
-        <div className="admin-page__actions">
-          <button className="admin-btn" onClick={refresh} disabled={loading}>
-            <RefreshCw size={14} /> 刷新
+      <div className="admin-users-toolbar">
+        <div className="admin-users-tabs admin-tags-filter-tabs" role="tablist" aria-label="用户分组">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "users"}
+            className={`admin-tags-filter-tab ${tab === "users" ? "is-active" : ""}`}
+            onClick={() => setTab("users")}
+          >
+            <span className="admin-tags-filter-tab__text">用户列表</span>
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "ips"}
+            className={`admin-tags-filter-tab ${tab === "ips" ? "is-active" : ""}`}
+            onClick={() => setTab("ips")}
+          >
+            <span className="admin-tags-filter-tab__text">封禁IP</span>
+          </button>
+        </div>
+        <div className="admin-users-toolbar-actions">
           {tab === "users" && (
-            <button className="admin-btn is-primary" onClick={() => setShowCreate(true)}>
-              <Plus size={14} /> 创建用户
+            <button className="admin-btn admin-users-create-fab" onClick={() => setShowCreate(true)}>
+              新建用户
             </button>
           )}
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
-        <button
-          className={`admin-btn${tab === "users" ? " is-primary" : ""}`}
-          onClick={() => setTab("users")}
-        >
-          <Users size={14} /> 用户列表
-        </button>
-        <button
-          className={`admin-btn${tab === "ips" ? " is-primary" : ""}`}
-          onClick={() => setTab("ips")}
-        >
-          <Globe size={14} /> 封禁IP ({ips.length})
-        </button>
-      </div>
-
       {loading ? (
-        <div className="admin-loading">加载中...</div>
+        <AdminLoading />
       ) : tab === "users" ? (
-        <div className="admin-table-wrap">
-          <table className="admin-table">
+        <div className="admin-table-wrap admin-users-table-wrap">
+          <table className="admin-table admin-users-table">
             <thead>
               <tr>
-                <th>ID</th>
                 <th>用户名</th>
                 <th>角色</th>
                 <th>状态</th>
@@ -194,29 +204,32 @@ export function UsersPage() {
             </thead>
             <tbody>
               {users.length === 0 ? (
-                <tr>
-                  <td colSpan={6} style={{ textAlign: "center", padding: 24, opacity: 0.5 }}>暂无用户</td>
+                <tr className="admin-empty-row">
+                  <td className="admin-empty-cell" colSpan={5}>暂无用户</td>
                 </tr>
               ) : (
                 users.map((u) => (
                   <tr key={u.id}>
-                    <td>{u.id}</td>
-                    <td>{u.username}</td>
-                    <td>
+                    <td className="admin-users-table__username" data-label="用户名">
+                      <span className="admin-users-table__username-value">{u.username}</span>
+                    </td>
+                    <td className="admin-users-table__role" data-label="角色">
                       <span className={`admin-status ${u.role === "admin" ? "is-generating" : "is-pending"}`}>
                         {u.role === "admin" ? "管理员" : "普通用户"}
                       </span>
                     </td>
-                    <td>
+                    <td className="admin-users-table__state" data-label="状态">
                       {u.banned ? (
                         <span className="admin-status is-error">已封禁</span>
                       ) : (
                         <span className="admin-status is-ok">正常</span>
                       )}
                     </td>
-                    <td>{formatTime(u.createdAt)}</td>
-                    <td>
-                      <div style={{ display: "flex", gap: 4 }}>
+                    <td className="admin-users-table__time" data-label="创建时间">
+                      {formatTime(u.createdAt)}
+                    </td>
+                    <td className="admin-users-table__actions is-actions" data-label="操作">
+                      <div className="admin-users-table__action-row">
                         <button
                           className="admin-btn admin-btn--small"
                           onClick={() => handleBan(u)}
@@ -235,7 +248,7 @@ export function UsersPage() {
                           <Key size={14} />
                         </button>
                         <button
-                          className="admin-btn admin-btn--small admin-btn--danger"
+                          className="admin-btn admin-btn--small is-danger"
                           onClick={() => setDeleteConfirm(u)}
                           title="删除"
                         >
@@ -250,8 +263,8 @@ export function UsersPage() {
           </table>
         </div>
       ) : (
-        <div className="admin-table-wrap">
-          <table className="admin-table">
+        <div className="admin-table-wrap admin-users-table-wrap">
+          <table className="admin-table admin-banned-ips-table">
             <thead>
               <tr>
                 <th>IP 地址</th>
@@ -262,22 +275,28 @@ export function UsersPage() {
             </thead>
             <tbody>
               {ips.length === 0 ? (
-                <tr>
-                  <td colSpan={4} style={{ textAlign: "center", padding: 24, opacity: 0.5 }}>暂无封禁IP</td>
+                <tr className="admin-empty-row">
+                  <td className="admin-empty-cell" colSpan={4}>暂无封禁IP</td>
                 </tr>
               ) : (
                 ips.map((ip) => (
                   <tr key={ip.ip}>
-                    <td><code>{ip.ip}</code></td>
-                    <td>{ip.reason || "-"}</td>
-                    <td>{formatTime(ip.createdAt)}</td>
-                    <td>
+                    <td className="admin-banned-ips-table__ip" data-label="IP 地址">
+                      <code>{ip.ip}</code>
+                    </td>
+                    <td className="admin-banned-ips-table__reason" data-label="原因">
+                      {ip.reason || "-"}
+                    </td>
+                    <td className="admin-banned-ips-table__time" data-label="封禁时间">
+                      {formatTime(ip.createdAt)}
+                    </td>
+                    <td className="admin-banned-ips-table__actions is-actions" data-label="操作">
                       <button
-                        className="admin-btn admin-btn--small is-primary"
+                        className="admin-btn admin-btn--small"
                         onClick={() => setUnbanIPConfirm(ip.ip)}
                         title="解除封禁"
                       >
-                        <CheckCircle size={14} /> 解除封禁
+                        解除封禁
                       </button>
                     </td>
                   </tr>
@@ -292,6 +311,7 @@ export function UsersPage() {
       <Modal
         open={showCreate}
         title="创建用户"
+        className="admin-modal--user-create"
         onClose={() => setShowCreate(false)}
         footer={
           <>
@@ -299,7 +319,7 @@ export function UsersPage() {
             <button
               className="admin-btn is-primary"
               onClick={handleCreate}
-              disabled={creating || !createUsername.trim() || !createPassword}
+              disabled={creating || !createUsername.trim() || !createPassword || Boolean(createPasswordError)}
             >
               {creating ? "创建中..." : "创建"}
             </button>
@@ -317,18 +337,32 @@ export function UsersPage() {
           </div>
           <div className="admin-form__row">
             <label>密码</label>
-            <input
-              type="password"
+            <PasswordInput
               value={createPassword}
               onChange={(e) => setCreatePassword(e.target.value)}
+              className={createPasswordError ? "is-invalid" : undefined}
+              aria-invalid={createPasswordError ? "true" : undefined}
+              aria-describedby={createPasswordError ? "admin-create-password-error" : undefined}
             />
+            {createPasswordError && (
+              <div className="admin-form__error" id="admin-create-password-error">
+                {createPasswordError}
+              </div>
+            )}
           </div>
           <div className="admin-form__row">
             <label>角色</label>
-            <select value={createRole} onChange={(e) => setCreateRole(e.target.value)}>
-              <option value="user">普通用户</option>
-              <option value="admin">管理员</option>
-            </select>
+            <div className="admin-form-select-wrap">
+              <select
+                className="admin-form-select"
+                value={createRole}
+                onChange={(e) => setCreateRole(e.target.value)}
+              >
+                <option value="user">普通用户</option>
+                <option value="admin">管理员</option>
+              </select>
+              <ChevronDown size={15} className="admin-form-select__icon" aria-hidden="true" />
+            </div>
           </div>
         </div>
       </Modal>
@@ -337,14 +371,15 @@ export function UsersPage() {
       <Modal
         open={resetPasswordId !== null}
         title="重置密码"
-        onClose={() => setResetPasswordId(null)}
+        className="admin-modal--password-reset"
+        onClose={closeResetPassword}
         footer={
           <>
-            <button className="admin-btn" onClick={() => setResetPasswordId(null)}>取消</button>
+            <button className="admin-btn" onClick={closeResetPassword}>取消</button>
             <button
               className="admin-btn is-primary"
               onClick={handleResetPassword}
-              disabled={resetting || !resetPasswordValue}
+              disabled={resetting || !resetPasswordValue || Boolean(resetPasswordError)}
             >
               {resetting ? "重置中..." : "重置"}
             </button>
@@ -354,12 +389,19 @@ export function UsersPage() {
         <div className="admin-form">
           <div className="admin-form__row">
             <label>新密码</label>
-            <input
-              type="password"
+            <PasswordInput
               value={resetPasswordValue}
               onChange={(e) => setResetPasswordValue(e.target.value)}
               autoFocus
+              className={resetPasswordError ? "is-invalid" : undefined}
+              aria-invalid={resetPasswordError ? "true" : undefined}
+              aria-describedby={resetPasswordError ? "admin-reset-password-error" : undefined}
             />
+            {resetPasswordError && (
+              <div className="admin-form__error" id="admin-reset-password-error">
+                {resetPasswordError}
+              </div>
+            )}
           </div>
         </div>
       </Modal>
@@ -368,9 +410,10 @@ export function UsersPage() {
       <ConfirmModal
         open={deleteConfirm !== null}
         title="删除用户"
-        message={`确定要删除用户「${deleteConfirm?.username ?? ""}」吗？此操作不可撤销。`}
-        confirmText={deleting ? "删除中..." : "删除"}
+        message={`确定要删除用户「${deleteConfirm?.username ?? ""}」吗？`}
+        hideIcon
         danger
+        modalClassName="admin-modal--user-delete"
         onConfirm={handleDelete}
         onCancel={() => setDeleteConfirm(null)}
         loading={deleting}
@@ -381,7 +424,8 @@ export function UsersPage() {
         open={unbanIPConfirm !== null}
         title="解除IP封禁"
         message={`确定要解除 IP「${unbanIPConfirm ?? ""}」的封禁吗？`}
-        confirmText="解除封禁"
+        hideIcon
+        modalClassName="admin-modal--ip-unban"
         onConfirm={handleUnbanIP}
         onCancel={() => setUnbanIPConfirm(null)}
       />

@@ -1,18 +1,48 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Search } from "lucide-react";
 
-export function SearchPanel() {
+const SEARCH_DEBOUNCE_MS = 500;
+
+type SearchPanelProps = {
+  value?: string;
+  onSearch?: (keyword: string) => void;
+};
+
+export function SearchPanel({ value, onSearch }: SearchPanelProps = {}) {
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const [keyword, setKeyword] = useState(params.get("q") ?? "");
+  const urlKeyword = params.get("q") ?? "";
+  const committedKeyword = value ?? urlKeyword;
+  const [keyword, setKeyword] = useState(committedKeyword);
+
+  const commitSearch = useCallback((value: string) => {
+    const q = value.trim();
+    if (onSearch) {
+      onSearch(q);
+      return;
+    }
+    const sp = new URLSearchParams();
+    if (q) sp.set("q", q);
+    const query = sp.toString();
+    navigate(query ? `/list?${query}` : "/list");
+  }, [navigate, onSearch]);
+
+  useEffect(() => {
+    setKeyword(committedKeyword);
+  }, [committedKeyword]);
+
+  useEffect(() => {
+    if (keyword.trim() === committedKeyword.trim()) return;
+    const timer = window.setTimeout(() => {
+      commitSearch(keyword);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [commitSearch, committedKeyword, keyword]);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    const q = keyword.trim();
-    const sp = new URLSearchParams();
-    if (q) sp.set("q", q);
-    navigate(`/list?${sp.toString()}`);
+    commitSearch(keyword);
   }
 
   return (
@@ -25,7 +55,7 @@ export function SearchPanel() {
             type="text"
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}
-            placeholder="搜索视频标题或作者..."
+            placeholder="搜索视频标题或作者"
             aria-label="搜索关键词"
           />
         </div>

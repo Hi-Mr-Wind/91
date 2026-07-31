@@ -1,23 +1,39 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { fetchTags, type TagItem } from "@/data/videos";
+import { fetchTags, readCachedTags, type TagItem } from "@/data/videos";
 
-export function TagCloud() {
+const TAG_PLACEHOLDER_COUNT = 16;
+
+type TagCloudProps = {
+  linkBasePath?: string;
+  onTagSelect?: () => void;
+};
+
+export function TagCloud({ linkBasePath = "/list", onTagSelect }: TagCloudProps) {
   const [params] = useSearchParams();
   const activeTag = params.get("tag");
-  const [tags, setTags] = useState<TagItem[]>([]);
+  const initialTagsRef = useRef<TagItem[] | null>(readCachedTags());
+  const [tags, setTags] = useState<TagItem[]>(initialTagsRef.current ?? []);
+  const [loaded, setLoaded] = useState(initialTagsRef.current !== null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const visibleTags = useMemo(
+    () => tags.filter((tag) => typeof tag.count !== "number" || tag.count > 0),
+    [tags]
+  );
 
   useEffect(() => {
+    if (initialTagsRef.current !== null) return;
+
     let active = true;
-    const timer = window.setTimeout(() => {
-      fetchTags().then((list) => {
+    fetchTags()
+      .then((list) => {
         if (active) setTags(list);
+      })
+      .finally(() => {
+        if (active) setLoaded(true);
       });
-    }, 500);
     return () => {
       active = false;
-      window.clearTimeout(timer);
     };
   }, []);
 
@@ -89,38 +105,40 @@ export function TagCloud() {
       slider.removeEventListener("wheel", handleWheel);
       slider.removeEventListener("click", handleClick, { capture: true });
     };
-  }, [tags]);
+  }, [visibleTags]);
 
-  if (tags.length === 0) return null;
+  if (loaded && visibleTags.length === 0) return null;
 
-  // 将标签分为奇偶两行，使其横向自由流式排布，不发生强制的列对齐
-  const row1 = tags.filter((_, idx) => idx % 2 === 0);
-  const row2 = tags.filter((_, idx) => idx % 2 !== 0);
+  const loading = !loaded && visibleTags.length === 0;
 
   const renderTag = (tag: TagItem) => (
     <Link
       key={tag.id}
-      to={`/list?tag=${encodeURIComponent(tag.label)}`}
+      to={`${linkBasePath}?tag=${encodeURIComponent(tag.label)}`}
       className={`tag-chip ${activeTag === tag.label ? "is-active" : ""}`}
-      title={
-        typeof tag.count === "number" ? `${tag.count} 个视频` : undefined
-      }
+      onClick={onTagSelect}
     >
       {tag.label}
-      {typeof tag.count === "number" && tag.count > 0 && (
-        <span style={{ marginLeft: 4, opacity: 0.7 }}>({tag.count})</span>
-      )}
     </Link>
   );
 
   return (
-    <div className="tag-cloud-container" aria-label="热门标签">
+    <div
+      className={`tag-cloud-container ${loading ? "is-loading" : ""}`}
+      aria-label="热门标签"
+      aria-busy={loading ? "true" : undefined}
+    >
       <div className="tag-cloud__grid" ref={containerRef}>
         <div className="tag-cloud__row">
-          {row1.map(renderTag)}
-        </div>
-        <div className="tag-cloud__row">
-          {row2.map(renderTag)}
+          {loading
+            ? Array.from({ length: TAG_PLACEHOLDER_COUNT }, (_, item) => (
+                <span
+                  key={item}
+                  className="tag-chip tag-chip--placeholder"
+                  aria-hidden="true"
+                />
+              ))
+            : visibleTags.map(renderTag)}
         </div>
       </div>
     </div>

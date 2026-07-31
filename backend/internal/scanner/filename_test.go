@@ -2,20 +2,28 @@ package scanner
 
 import "testing"
 
-func TestParseMatchesOnlyFixedTagsFromFilename(t *testing.T) {
-	got := Parse("[乱七八糟] 女大人妻后入口交奶子臀.mp4")
-	want := []string{"后入", "奶子", "口交", "臀", "人妻", "女大"}
-
-	if !sameStrings(got.Tags, want) {
-		t.Fatalf("tags = %#v, want %#v", got.Tags, want)
+func TestParseStripsBracketPrefixAndAuthor(t *testing.T) {
+	got := Parse("[乱七八糟] 女大人妻后入 - 某作者.mp4")
+	if got.Title != "女大人妻后入" {
+		t.Fatalf("title = %q, want 女大人妻后入", got.Title)
+	}
+	if got.Author != "某作者" {
+		t.Fatalf("author = %q, want 某作者", got.Author)
 	}
 }
 
-func TestParseDoesNotKeepBracketTags(t *testing.T) {
+func TestParseDegradesGracefully(t *testing.T) {
 	got := Parse("[sunny,kenny] 普通标题.mp4")
+	if got.Title != "普通标题" {
+		t.Fatalf("title = %q, want 普通标题", got.Title)
+	}
+	if got.Author != "" {
+		t.Fatalf("author = %q, want empty", got.Author)
+	}
 
-	if len(got.Tags) != 0 {
-		t.Fatalf("tags = %#v, want none", got.Tags)
+	plain := Parse("纯标题.mp4")
+	if plain.Title != "纯标题" || plain.Author != "" {
+		t.Fatalf("plain = %#v", plain)
 	}
 }
 

@@ -47,21 +47,23 @@ func TestShouldRunChecksDate(t *testing.T) {
 
 func TestNewAppliesDefaults(t *testing.T) {
 	r := New(Config{Settings: newStubSettings()})
-	// CronHour=0 is a legitimate hour (midnight); New() only clamps out-of-range
-	// values. The "default to 01:00" responsibility lives in the config layer.
-	if r.cfg.CronHour != 0 {
-		t.Errorf("CronHour zero-value should be preserved, got %d", r.cfg.CronHour)
+	if r.cfg.CronHour != 1 {
+		t.Errorf("CronHour zero-value should fall back to 1, got %d", r.cfg.CronHour)
 	}
 }
 
 func TestNewRejectsInvalidCronHour(t *testing.T) {
-	r := New(Config{CronHour: -1, Settings: newStubSettings()})
+	r := New(Config{CronHour: 0, Settings: newStubSettings()})
 	if r.cfg.CronHour != 1 {
 		t.Fatalf("invalid cron_hour fall back to 1, got %d", r.cfg.CronHour)
 	}
-	r2 := New(Config{CronHour: 25, Settings: newStubSettings()})
+	r2 := New(Config{CronHour: -1, Settings: newStubSettings()})
 	if r2.cfg.CronHour != 1 {
 		t.Fatalf("out-of-range cron_hour fall back to 1, got %d", r2.cfg.CronHour)
+	}
+	r3 := New(Config{CronHour: 25, Settings: newStubSettings()})
+	if r3.cfg.CronHour != 1 {
+		t.Fatalf("out-of-range cron_hour fall back to 1, got %d", r3.cfg.CronHour)
 	}
 }
 
@@ -114,8 +116,16 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 			rec.push("migrate")
 			return nil
 		},
+		RestoreCrawlerVideos: func(_ context.Context, id string) error {
+			rec.push("restore:" + id)
+			return nil
+		},
 		RunDedupeAssetCleanup: func(context.Context) error {
 			rec.push("dedupe-cleanup")
+			return nil
+		},
+		RunTagMaintenance: func(context.Context) error {
+			rec.push("tag-maintenance")
 			return nil
 		},
 	})
@@ -132,7 +142,9 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 		"crawl:sp-1",
 		"wait-idle", // after phase 2
 		"migrate",
+		"restore:sp-1",
 		"dedupe-cleanup",
+		"tag-maintenance",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("call sequence len = %d, want %d; got=%v", len(got), len(want), got)
@@ -165,6 +177,10 @@ func TestRunPipelineSkipsMigrationWhenNoCrawler(t *testing.T) {
 			rec.push("dedupe-cleanup")
 			return nil
 		},
+		RunTagMaintenance: func(context.Context) error {
+			rec.push("tag-maintenance")
+			return nil
+		},
 	})
 
 	r.runPipeline(context.Background())
@@ -175,13 +191,20 @@ func TestRunPipelineSkipsMigrationWhenNoCrawler(t *testing.T) {
 		}
 	}
 	foundCleanup := false
+	foundTagMaintenance := false
 	for _, c := range rec.snapshot() {
 		if c == "dedupe-cleanup" {
 			foundCleanup = true
 		}
+		if c == "tag-maintenance" {
+			foundTagMaintenance = true
+		}
 	}
 	if !foundCleanup {
 		t.Fatalf("dedupe cleanup should still run when crawler is absent; calls=%v", rec.snapshot())
+	}
+	if !foundTagMaintenance {
+		t.Fatalf("tag maintenance should still run when crawler is absent; calls=%v", rec.snapshot())
 	}
 }
 
@@ -205,6 +228,7 @@ func TestRunPipelineExitsWhenContextCancelledMidPhase(t *testing.T) {
 		WaitPreviewQueuesIdle: func(context.Context) error { rec.push("wait-idle"); return nil },
 		RunMigration:          func(context.Context) error { rec.push("migrate"); return nil },
 		RunDedupeAssetCleanup: func(context.Context) error { rec.push("dedupe-cleanup"); return nil },
+		RunTagMaintenance:     func(context.Context) error { rec.push("tag-maintenance"); return nil },
 	})
 
 	r.runPipeline(ctx)
@@ -221,6 +245,9 @@ func TestRunPipelineExitsWhenContextCancelledMidPhase(t *testing.T) {
 		}
 		if c == "dedupe-cleanup" {
 			t.Fatalf("dedupe cleanup should not run after cancel, got call %q", c)
+		}
+		if c == "tag-maintenance" {
+			t.Fatalf("tag maintenance should not run after cancel, got call %q", c)
 		}
 	}
 }
@@ -272,13 +299,8 @@ func TestRunPipelineLockedDropsOverlappingTriggers(t *testing.T) {
 	close(releaseFirst)
 }
 
-func TestSoftDeadlinePreventsLaterPhases_REMOVED(t *testing.T) {
-	t.Skip("legacy soft-deadline removed in 2026-05; see TestCtxCancelPreventsLaterPhases")
-}
-
 // TestCtxCancelPreventsLaterPhases 校验：ctx 在 phase 边界已取消（进程退出）时，
-// 后续 phase 不会启动。这是 checkDeadline 的核心语义，原"软超时"行为已废除，但
-// "ctx 已 done 就 bail" 仍保留。
+// 后续 phase 不会启动。"ctx 已 done 就 bail" 仍保留。
 func TestCtxCancelPreventsLaterPhases(t *testing.T) {
 	rec := &recorder{}
 	settings := newStubSettings()

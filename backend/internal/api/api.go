@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,8 +26,12 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
-	"github.com/video-site/backend/internal/mediaasset"
+	"github.com/video-site/backend/internal/localpath"
+	"github.com/video-site/backend/internal/persistence"
 	"github.com/video-site/backend/internal/proxy"
+	"github.com/video-site/backend/internal/subtitles"
+	"github.com/video-site/backend/internal/tagging"
+	"github.com/video-site/backend/internal/videoname"
 )
 
 const localUploadDriveID = localupload.DriveID
@@ -41,19 +46,24 @@ var allowedUploadExtensions = map[string]struct{}{
 
 var allowedUploadTags = map[string]struct{}{
 	"奶子": {},
-	"臀":  {},
-	"口交": {},
 	"女大": {},
 	"人妻": {},
-	"AV": {},
+	"后入": {},
+	"制服": {},
+	"美臀": {},
+	"口交": {},
 }
+
+const maxSubtitleBytes = 20 << 20
 
 type Server struct {
 	Catalog         *catalog.Catalog
 	Proxy           *proxy.Proxy
+	SubtitleClient  subtitles.Client
 	LocalDir        string
 	UploadDir       string
 	OnVideoUploaded func(*catalog.Video)
+	RemoteUploads   RemoteUploadService
 	// OnHideVideo 处理前台「不再展示」。隐藏机制已废弃，改走拉黑逻辑：
 	// 删除库中记录 + 本地封面/预览，保留网盘源文件，并写黑名单墓碑
 	// （扫盘不再入库）。未注入时回退为旧的 hidden 标记。
@@ -63,14 +73,39 @@ type Server struct {
 	tagCacheUntil time.Time
 	tagCache      []TagDTO
 
+	shortsFeedMu  sync.Mutex
+	shortsFeeds   map[string]*shortsFeedSession
+	shortsFeedNow func() time.Time
+
+	homeRecommendationMu       sync.Mutex
+	homeRecommendationSessions map[string]*homeRecommendationSession
+	homeRecommendationNow      func() time.Time
+
+	// shareNow is injectable so one-time share expiry behavior can be tested
+	// without sleeping. Production leaves it nil and uses time.Now.
+	shareNow func() time.Time
+
 	// GetTheme 返回当前生效的主题（"dark" | "pink" | "sky"）。前台 /api/settings/theme 用，
 	// 不需要登录。无注入时返回 "dark"。
 	GetTheme func() string
+
+	subtitleCacheMu  sync.Mutex
+	subtitleCache    map[string]subtitleCacheEntry
+	subtitleCacheNow func() time.Time
+}
+
+type subtitleCacheEntry struct {
+	videoID string
+	subs    []subtitles.Subtitle
+	expires time.Time
+	created time.Time
 }
 
 const (
 	homePageSize = 12
 )
+
+var subtitleHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // VideoDTO 是返回给前端的视频对象，字段名跟前端 VideoItem 对齐
 type VideoDTO struct {
@@ -104,6 +139,7 @@ type TagDTO struct {
 type VideoDetailDTO struct {
 	VideoDTO
 	VideoSrc      string        `json:"videoSrc"`
+	MediaType     string        `json:"mediaType,omitempty"`
 	Poster        string        `json:"poster"`
 	Description   string        `json:"description"`
 	EmbedURL      string        `json:"embedUrl"`
@@ -111,6 +147,16 @@ type VideoDetailDTO struct {
 	AuthorProfile AuthorProfile `json:"authorProfile"`
 	RelatedVideos []VideoDTO    `json:"relatedVideos"`
 	CommentsList  []Comment     `json:"commentsList"`
+}
+
+type SubtitleDTO struct {
+	Name     string `json:"name"`
+	Label    string `json:"label"`
+	Language string `json:"language,omitempty"`
+	Ext      string `json:"ext"`
+	Type     string `json:"type"`
+	URL      string `json:"url"`
+	Source   string `json:"source"`
 }
 
 type AuthorProfile struct {
@@ -134,25 +180,46 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 	// 鉴权组之外。只暴露 theme 一个字段，避免泄露其他设置。
 	r.Get("/api/settings/theme", s.handleGetTheme)
 
+	// 一次性分享的领取和媒体路由必须公开，但每个媒体请求都会再次校验
+	// HttpOnly 分享会话，并且只能访问该分享绑定的单个视频。
+	r.Post("/api/share/consume", s.handleConsumeVideoShare)
+	r.Get("/api/share/{shareID}/subtitles", s.handleSharedVideoSubtitles)
+	r.Post("/api/share/{shareID}/view", s.handleSharedVideoView)
+	r.Get("/p/share/{shareID}/stream", s.handleSharedVideoStream)
+	r.Get("/p/share/{shareID}/preview", s.handleSharedVideoPreview)
+	r.Get("/p/share/{shareID}/thumb", s.handleSharedVideoThumb)
+	r.Get("/p/share/{shareID}/subtitle/{index}", s.handleSharedSubtitleFile)
+
 	r.Group(func(r chi.Router) {
 		r.Use(a.Required)
 		r.Get("/api/home", s.handleHome)
 		r.Get("/api/list", s.handleList)
 		r.Get("/api/video/{id}", s.handleVideoDetail)
-		r.Put("/api/video/{id}/tags", s.handleUpdateVideoTags)
+		r.Get("/api/video/{id}/subtitles", s.handleVideoSubtitles)
+		r.Post("/api/video/{id}/share", s.handleCreateVideoShare)
+		r.Put("/api/video/{id}/reaction", s.handleSetVideoReaction)
 		r.Post("/api/video/{id}/like", s.handleLike)
 		r.Delete("/api/video/{id}/like", s.handleUnlike)
 		r.Post("/api/video/{id}/view", s.handleView)
-		r.Post("/api/video/{id}/hide", s.handleHideVideo)
-		r.Post("/api/upload", s.handleUploadVideo)
 		r.Get("/api/tags", s.handleTags)
-		r.Post("/api/shorts/next", s.handleShortsNext)
+		r.Get("/api/shorts/next", s.handleShortsNext)
 
 		// 代理路由同样需要鉴权，防止绕过
 		r.Get("/p/stream/{driveID}/*", s.handleStream)
+		r.Get("/p/subtitle/{id}/{index}", s.handleSubtitleFile)
 		r.Get("/p/upload/{videoID}", s.handleUploadedVideo)
 		r.Get("/p/preview/{videoID}", s.handlePreview)
 		r.Get("/p/thumb/{videoID}", s.handleThumb)
+	})
+
+	r.Group(func(r chi.Router) {
+		r.Use(a.AdminRequired)
+		r.Put("/api/video/{id}/tags", s.handleUpdateVideoTags)
+		r.Post("/api/video/{id}/hide", s.handleHideVideo)
+		r.Post("/api/upload", s.handleUploadVideo)
+		r.Post("/api/upload/remote", s.handleCreateRemoteUpload)
+		r.Get("/api/upload/remote", s.handleListRemoteUploads)
+		r.Post("/api/upload/remote/{jobId}/cancel", s.handleCancelRemoteUpload)
 	})
 }
 
@@ -170,115 +237,49 @@ func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	// 首页优先从全量已有封面的视频里随机抽取，避免只在最近一小段候选中反复出现。
-	excludeIDs := parseVideoIDQuery(r, "exclude", 120)
-	items, err := s.Catalog.RandomVideosWithReadyThumbnailsExcluding(r.Context(), excludeIDs, homePageSize)
+	count, err := homeRecommendationCount(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	recommendationSession := &homeRecommendationSession{}
+	persistentSession := false
+	if identity, ok := auth.SessionIdentityFromContext(r.Context()); ok {
+		recommendationSession = s.homeRecommendationSession(identity)
+		persistentSession = true
+	}
+	recommendationSession.requestMu.Lock()
+	defer recommendationSession.requestMu.Unlock()
+
+	items, roundVideoIDs, roundCursor, err := s.nextHomeRecommendationBatch(
+		r.Context(),
+		recommendationSession,
+		count,
+	)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if len(items) < homePageSize {
-		fallbackExclude := append([]string{}, excludeIDs...)
-		for _, item := range items {
-			if item != nil {
-				fallbackExclude = append(fallbackExclude, item.ID)
-			}
-		}
-		fallback, err := s.Catalog.RandomVideosExcluding(r.Context(), fallbackExclude, homePageSize-len(items))
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-		items = appendUniqueVideos(items, fallback, homePageSize)
-	}
-	if len(items) < homePageSize && len(excludeIDs) > 0 {
-		// The browser keeps a recent-video exclude list so normal refreshes do not
-		// repeat too quickly. On small libraries that list can cover every visible
-		// video; when that happens, start a new random round instead of returning
-		// an empty home section.
-		roundExclude := videoIDs(items)
-		fallback, err := s.Catalog.RandomVideosWithReadyThumbnailsExcluding(r.Context(), roundExclude, homePageSize-len(items))
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-		items = appendUniqueVideos(items, fallback, homePageSize)
-	}
-	if len(items) < homePageSize && len(excludeIDs) > 0 {
-		fallback, err := s.Catalog.RandomVideosExcluding(r.Context(), videoIDs(items), homePageSize-len(items))
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-		items = appendUniqueVideos(items, fallback, homePageSize)
+	recommendationSession.roundVideoIDs = roundVideoIDs
+	recommendationSession.roundCursor = roundCursor
+	if persistentSession {
+		s.touchHomeRecommendationSession(recommendationSession)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, mapVideos(items))
 }
 
-func parseVideoIDQuery(r *http.Request, key string, limit int) []string {
-	if r == nil {
-		return nil
+func homeRecommendationCount(r *http.Request) (int, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("count"))
+	if raw == "" {
+		return homePageSize, nil
 	}
-	values := r.URL.Query()[key]
-	if len(values) == 0 {
-		return nil
+	count, err := strconv.Atoi(raw)
+	if err != nil || count < 1 || count > homePageSize {
+		return 0, errors.New("invalid home recommendation count")
 	}
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		for _, id := range strings.Split(value, ",") {
-			id = strings.TrimSpace(id)
-			if id == "" {
-				continue
-			}
-			if _, ok := seen[id]; ok {
-				continue
-			}
-			seen[id] = struct{}{}
-			out = append(out, id)
-			if limit > 0 && len(out) >= limit {
-				return out
-			}
-		}
-	}
-	return out
-}
-
-func appendUniqueVideos(dst []*catalog.Video, candidates []*catalog.Video, limit int) []*catalog.Video {
-	if len(dst) >= limit {
-		return dst[:limit]
-	}
-	seen := make(map[string]struct{}, len(dst))
-	for _, v := range dst {
-		if v != nil {
-			seen[v.ID] = struct{}{}
-		}
-	}
-	for _, v := range candidates {
-		if v == nil {
-			continue
-		}
-		if _, ok := seen[v.ID]; ok {
-			continue
-		}
-		dst = append(dst, v)
-		seen[v.ID] = struct{}{}
-		if len(dst) >= limit {
-			return dst
-		}
-	}
-	return dst
-}
-
-func videoIDs(items []*catalog.Video) []string {
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		if item != nil && item.ID != "" {
-			out = append(out, item.ID)
-		}
-	}
-	return out
+	return count, nil
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +306,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": mapVideos(items),
 		"total": total,
@@ -315,23 +317,10 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 	id := routeParam(r, "id")
-	v, err := s.Catalog.GetVideo(r.Context(), id)
+	v, err := s.availableVideo(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
-	}
-	if v.Hidden {
-		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
-		return
-	}
-	if v.DriveID != localUploadDriveID {
-		if _, err := s.Catalog.GetDrive(r.Context(), v.DriveID); err != nil {
-			drives, listErr := s.Catalog.ListDrives(r.Context())
-			if listErr != nil || len(drives) > 0 {
-				writeErr(w, http.StatusNotFound, sql.ErrNoRows)
-				return
-			}
-		}
 	}
 	related := s.pickRelatedVideos(r.Context(), v, 6)
 	dto := mapVideo(v)
@@ -342,6 +331,7 @@ func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 	detail := VideoDetailDTO{
 		VideoDTO:    dto,
 		VideoSrc:    s.videoSource(v),
+		MediaType:   playbackMediaType(v),
 		Poster:      thumbnailURL(v),
 		Description: v.Description,
 		EmbedURL:    fmt.Sprintf(`<iframe src="/embed/%s" width="640" height="360" frameborder="0" allowfullscreen></iframe>`, pathSegment(v.ID)),
@@ -525,93 +515,6 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// shortsNextReq 客户端把当前轮已看过的 video id 列表传上来。
-type shortsNextReq struct {
-	SeenIDs []string `json:"seenIds"`
-	Count   int      `json:"count"`
-}
-
-// ShortsItemDTO 是短视频流单条的精简结构。比 VideoDTO 多 videoSrc / poster，
-// 方便前端直接喂给 <video>，不必再为每条请求 /api/video/:id。
-type ShortsItemDTO struct {
-	VideoDTO
-	VideoSrc string `json:"videoSrc"`
-	Poster   string `json:"poster"`
-}
-
-// handleShortsNext 为短视频模式提供"不重复随机视频"接口。
-//
-// 行为：
-//   - 入参 seenIds 为客户端当前轮已看过的视频 id（来自 localStorage）
-//   - 服务器从未在 seenIds 中的可见视频里随机抽至多 count 条返回
-//   - 当返回数量 < count 且小于全库可见总数时，说明本轮即将结束，
-//     返回 roundComplete=true，前端应在用户看完返回的这些后清空本地已看记录开新一轮
-//   - 当 seenIds 真实覆盖当前全部可见视频时，本接口直接返回新一轮的随机一批
-//     （不能仅看 seenIds 长度，里面可能有隐藏、删除或历史脏 ID）
-func (s *Server) handleShortsNext(w http.ResponseWriter, r *http.Request) {
-	var body shortsNextReq
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	count := body.Count
-	if count <= 0 {
-		count = 5
-	}
-	if count > 20 {
-		count = 20
-	}
-
-	total, err := s.Catalog.CountVisibleVideos(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	items, err := s.Catalog.RandomVideosExcluding(r.Context(), body.SeenIDs, count)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	if total > 0 && len(items) == 0 && len(body.SeenIDs) > 0 {
-		items, err = s.Catalog.RandomVideosExcluding(r.Context(), nil, count)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-	}
-
-	// 注入 sourceLabel 以便前端展示来源网盘
-	driveLabels := make(map[string]string)
-	out := make([]ShortsItemDTO, 0, len(items))
-	for _, v := range items {
-		dto := mapVideo(v)
-		if label, ok := driveLabels[v.DriveID]; ok {
-			dto.SourceLabel = label
-		} else if d, err := s.Catalog.GetDrive(r.Context(), v.DriveID); err == nil {
-			label := driveKindLabel(d.Kind)
-			driveLabels[v.DriveID] = label
-			dto.SourceLabel = label
-		}
-		out = append(out, ShortsItemDTO{
-			VideoDTO: dto,
-			VideoSrc: s.videoSource(v),
-			Poster:   thumbnailURL(v),
-		})
-	}
-
-	// roundComplete: 服务端能给出的视频数小于 count，说明剩余可选已耗尽，
-	// 前端把这批播完后应该清空本地 seenIds 开新一轮。
-	roundComplete := len(out) < count
-
-	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{
-		"items":         out,
-		"total":         total,
-		"roundComplete": roundComplete,
-	})
-}
-
 type updateVideoTagsReq struct {
 	Tags []string `json:"tags"`
 }
@@ -647,6 +550,45 @@ func (s *Server) handleLike(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"likes": likes})
+}
+
+type setVideoReactionReq struct {
+	VisitID  string                `json:"visitId"`
+	Reaction catalog.VideoReaction `json:"reaction"`
+}
+
+func (s *Server) handleSetVideoReaction(w http.ResponseWriter, r *http.Request) {
+	var body setVideoReactionReq
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 2048))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, errors.New("request body must contain one JSON object"))
+		return
+	}
+
+	result, err := s.Catalog.SetVisitReaction(
+		r.Context(),
+		routeParam(r, "id"),
+		body.VisitID,
+		body.Reaction,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, catalog.ErrInvalidVideoReaction),
+			errors.Is(err, catalog.ErrInvalidVideoReactionVisitID):
+			writeErr(w, http.StatusBadRequest, err)
+		case errors.Is(err, sql.ErrNoRows):
+			writeErr(w, http.StatusNotFound, err)
+		default:
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleUnlike 取消点赞：likes - 1（保底 0）。
@@ -726,9 +668,13 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tags, err := parseUploadTags(uploadTagValues(r))
+	tags, err := s.canonicalUploadTags(r.Context(), uploadTagValues(r))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		status := http.StatusInternalServerError
+		if isUploadTagValidationError(err) {
+			status = http.StatusBadRequest
+		}
+		writeErr(w, status, err)
 		return
 	}
 
@@ -737,13 +683,17 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 	if title == "" {
 		title = uploadTitleFromFileName(originalName)
 	}
+	if err := videoname.ValidateUploadTitle(title, ext); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
 
 	uploadID, err := newUploadID(now)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	storedName := uploadID + ext
+	storedName := videoname.UploadFileName(title, ext, uploadID, false)
 	dst, err := s.localUploadFilePath(storedName)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -754,26 +704,77 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if _, statErr := os.Lstat(dst); statErr == nil {
+		storedName = videoname.UploadFileName(title, ext, uploadID, true)
+		dst, err = s.localUploadFilePath(storedName)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else if !os.IsNotExist(statErr) {
+		writeErr(w, http.StatusInternalServerError, statErr)
+		return
+	}
+	partPath := dst + ".part"
+	out, err := os.OpenFile(partPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		storedName = videoname.UploadFileName(title, ext, uploadID, true)
+		dst, err = s.localUploadFilePath(storedName)
+		if err == nil {
+			partPath = dst + ".part"
+			out, err = os.OpenFile(partPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		}
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	title = videoname.TitleFromFileName(storedName)
 	size, copyErr := io.Copy(out, file)
 	closeErr := out.Close()
 	if copyErr != nil {
-		_ = os.Remove(dst)
+		_ = os.Remove(partPath)
 		writeErr(w, http.StatusInternalServerError, copyErr)
 		return
 	}
 	if closeErr != nil {
-		_ = os.Remove(dst)
+		_ = os.Remove(partPath)
 		writeErr(w, http.StatusInternalServerError, closeErr)
 		return
 	}
 	if size <= 0 {
-		_ = os.Remove(dst)
+		_ = os.Remove(partPath)
 		writeErr(w, http.StatusBadRequest, errors.New("uploaded video is empty"))
+		return
+	}
+	if err := os.Chmod(partPath, 0o644); err != nil {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// The potentially long request-body copy above writes an excluded .part
+	// file. Only publication of the final file and its catalog rows needs to be
+	// atomic with respect to a backup snapshot.
+	persistence.RLock()
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			persistence.RUnlock()
+		}
+	}()
+	if _, err := os.Lstat(dst); err == nil {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusConflict, errors.New("目标视频文件已存在，请重试"))
+		return
+	} else if !os.IsNotExist(err) {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := os.Rename(partPath, dst); err != nil {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -781,10 +782,9 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		ID:            localUploadDriveID + "-" + uploadID,
 		DriveID:       localUploadDriveID,
 		FileID:        storedName,
-		FileName:      originalName,
+		FileName:      storedName,
 		Title:         title,
 		Author:        "用户上传",
-		Tags:          tags,
 		Size:          size,
 		Ext:           strings.TrimPrefix(ext, "."),
 		PreviewStatus: "pending",
@@ -797,6 +797,18 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	if len(tags) > 0 {
+		if err := s.Catalog.SetManualVideoTags(r.Context(), video.ID, tags); err != nil {
+			_ = os.Remove(dst)
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if saved, err := s.Catalog.GetVideo(r.Context(), video.ID); err == nil {
+			video = saved
+		}
+	}
+	persistence.RUnlock()
+	mutationLocked = false
 	if s.OnVideoUploaded != nil {
 		s.OnVideoUploaded(video)
 	}
@@ -808,6 +820,42 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	fileID := routeWildcardParam(r, "*")
 	s.Proxy.ServeStream(w, r, driveID, fileID)
 }
+
+func (s *Server) handleVideoSubtitles(w http.ResponseWriter, r *http.Request) {
+	v, ok := s.visibleVideo(w, r, routeParam(r, "id"))
+	if !ok {
+		return
+	}
+	subs, err := s.loadVideoSubtitles(r.Context(), v)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, mapSubtitles(v.ID, subs))
+}
+
+func (s *Server) handleSubtitleFile(w http.ResponseWriter, r *http.Request) {
+	v, ok := s.visibleVideo(w, r, routeParam(r, "id"))
+	if !ok {
+		return
+	}
+	index, err := strconv.Atoi(routeParam(r, "index"))
+	if err != nil || index < 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid subtitle index"))
+		return
+	}
+	s.serveSubtitleSelection(w, r, v, index)
+}
+
+func (s *Server) visibleVideo(w http.ResponseWriter, r *http.Request, id string) (*catalog.Video, bool) {
+	v, err := s.Catalog.GetVideo(r.Context(), id)
+	if err != nil || v.Hidden {
+		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
+		return nil, false
+	}
+	return v, true
+}
+
 func (s *Server) handleUploadedVideo(w http.ResponseWriter, r *http.Request) {
 	videoID := routeParam(r, "videoID")
 	v, err := s.Catalog.GetVideo(r.Context(), videoID)
@@ -815,18 +863,7 @@ func (s *Server) handleUploadedVideo(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	path, err := s.localUploadFilePath(v.FileID)
-	if err != nil {
-		http.Error(w, "invalid upload file", http.StatusForbidden)
-		return
-	}
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Size() == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Cache-Control", "private, max-age=300")
-	http.ServeFile(w, r, path)
+	s.serveUploadedVideo(w, r, v)
 }
 
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
@@ -836,45 +873,11 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if v.PreviewStatus != "ready" {
-		http.Error(w, "preview not ready", http.StatusNotFound)
-		return
-	}
-	if v.PreviewLocal != "" {
-		if !strings.HasPrefix(filepath.Clean(v.PreviewLocal), filepath.Clean(s.LocalDir)) {
-			http.Error(w, "invalid local path", http.StatusForbidden)
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
-		s.Proxy.ServeLocal(w, r, v.PreviewLocal)
-		return
-	}
-	http.NotFound(w, r)
+	s.servePreviewVideo(w, r, v)
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	videoID := routeParam(r, "videoID")
-	var clean string
-	for _, path := range mediaasset.ThumbnailPathCandidates(s.LocalDir, videoID) {
-		candidate := filepath.Clean(path)
-		if !strings.HasPrefix(candidate, filepath.Clean(s.LocalDir)) {
-			http.Error(w, "invalid path", http.StatusForbidden)
-			return
-		}
-		if _, err := os.Stat(candidate); err == nil {
-			clean = candidate
-			break
-		}
-	}
-	if clean == "" {
-		w.Header().Set("Cache-Control", "no-store")
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Cache-Control", "private, max-age=86400")
-	s.Proxy.ServeLocal(w, r, clean)
+	s.serveVideoThumb(w, r, routeParam(r, "videoID"))
 }
 
 // ---------- helpers ----------
@@ -910,6 +913,281 @@ func mapVideo(v *catalog.Video) VideoDTO {
 	}
 }
 
+func (s *Server) loadVideoSubtitles(ctx context.Context, v *catalog.Video) ([]subtitles.Subtitle, error) {
+	if v == nil || s.SubtitleClient == nil {
+		return []subtitles.Subtitle{}, nil
+	}
+	request := subtitles.Request{
+		FileID:          v.FileID,
+		FileName:        v.FileName,
+		LookupNames:     subtitleLookupAliases(v),
+		ContentHash:     v.ContentHash,
+		SampledSHA256:   v.SampledSHA256,
+		DurationSeconds: v.DurationSeconds,
+	}
+	cacheKey := subtitleCacheKey(v, request)
+	if subs, ok := s.cachedSubtitles(cacheKey); ok {
+		return subs, nil
+	}
+	subs, err := s.SubtitleClient.Subtitles(ctx, request)
+	if err != nil {
+		// Subtitle lookup is best effort. Authentication changes, timeouts, rate
+		// limits, and malformed upstream responses must never interrupt playback.
+		subs = []subtitles.Subtitle{}
+	}
+	subs = filterSupportedSubtitles(subs, v.DurationSeconds)
+	s.cacheSubtitles(cacheKey, v.ID, subs)
+	return cloneSubtitles(subs), nil
+}
+
+func subtitleLookupAliases(v *catalog.Video) []string {
+	if v == nil {
+		return nil
+	}
+	for _, candidate := range []string{v.FileName, v.ID, v.Title} {
+		if code := tagging.FindSubtitleAVCode(candidate); code != "" {
+			return []string{code}
+		}
+	}
+	return nil
+}
+
+func subtitleCacheKey(v *catalog.Video, req subtitles.Request) string {
+	return strings.Join([]string{
+		v.ID, v.DriveID, req.FileID, req.FileName,
+		strings.Join(req.LookupNames, "\x1f"), req.ContentHash, req.SampledSHA256,
+		strconv.Itoa(req.DurationSeconds),
+	}, "\x00")
+}
+
+func (s *Server) subtitleNow() time.Time {
+	if s.subtitleCacheNow != nil {
+		return s.subtitleCacheNow()
+	}
+	return time.Now()
+}
+
+func (s *Server) cachedSubtitles(key string) ([]subtitles.Subtitle, bool) {
+	now := s.subtitleNow()
+	s.subtitleCacheMu.Lock()
+	defer s.subtitleCacheMu.Unlock()
+	entry, ok := s.subtitleCache[key]
+	if !ok || !now.Before(entry.expires) {
+		if ok {
+			delete(s.subtitleCache, key)
+		}
+		return nil, false
+	}
+	return cloneSubtitles(entry.subs), true
+}
+
+func (s *Server) cacheSubtitles(key, videoID string, subs []subtitles.Subtitle) {
+	now := s.subtitleNow()
+	ttl := 5 * time.Minute
+	if len(subs) == 0 {
+		ttl = time.Minute
+	}
+	s.subtitleCacheMu.Lock()
+	defer s.subtitleCacheMu.Unlock()
+	if s.subtitleCache == nil {
+		s.subtitleCache = make(map[string]subtitleCacheEntry)
+	}
+	for existingKey, entry := range s.subtitleCache {
+		if !now.Before(entry.expires) {
+			delete(s.subtitleCache, existingKey)
+		}
+	}
+	if len(s.subtitleCache) >= 2048 {
+		var oldestKey string
+		var oldest time.Time
+		for existingKey, entry := range s.subtitleCache {
+			if oldestKey == "" || entry.created.Before(oldest) {
+				oldestKey, oldest = existingKey, entry.created
+			}
+		}
+		delete(s.subtitleCache, oldestKey)
+	}
+	s.subtitleCache[key] = subtitleCacheEntry{videoID: videoID, subs: cloneSubtitles(subs), expires: now.Add(ttl), created: now}
+}
+
+func (s *Server) invalidateSubtitleCache(videoID string) {
+	s.subtitleCacheMu.Lock()
+	defer s.subtitleCacheMu.Unlock()
+	for key, entry := range s.subtitleCache {
+		if entry.videoID == videoID {
+			delete(s.subtitleCache, key)
+		}
+	}
+}
+
+func cloneSubtitles(subs []subtitles.Subtitle) []subtitles.Subtitle {
+	out := make([]subtitles.Subtitle, len(subs))
+	copy(out, subs)
+	return out
+}
+
+func filterSupportedSubtitles(subs []subtitles.Subtitle, videoDuration int) []subtitles.Subtitle {
+	out := make([]subtitles.Subtitle, 0, len(subs))
+	for _, sub := range subs {
+		if subtitlePlayerType(sub.Ext) == "" {
+			continue
+		}
+		if strings.TrimSpace(sub.URL) == "" {
+			continue
+		}
+		if !subtitles.DurationCompatible(videoDuration, sub.DurationSeconds) {
+			continue
+		}
+		out = append(out, sub)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		iGroup, iDelta := subtitleDurationOrder(out[i].DurationSeconds, videoDuration)
+		jGroup, jDelta := subtitleDurationOrder(out[j].DurationSeconds, videoDuration)
+		if iGroup != jGroup {
+			return iGroup < jGroup
+		}
+		if iDelta != jDelta {
+			return iDelta < jDelta
+		}
+		iLanguage := subtitleLanguageOrder(out[i])
+		jLanguage := subtitleLanguageOrder(out[j])
+		if iLanguage != jLanguage {
+			return iLanguage < jLanguage
+		}
+		return subtitleOrderKey(out[i]) < subtitleOrderKey(out[j])
+	})
+	return out
+}
+
+func subtitleDurationOrder(subtitleDuration, videoDuration int) (group, delta int) {
+	if videoDuration <= 0 {
+		return 0, 0
+	}
+	if subtitleDuration <= 0 {
+		return 1, 0
+	}
+	delta = subtitleDuration - videoDuration
+	if delta < 0 {
+		delta = -delta
+	}
+	if subtitles.DurationCompatible(videoDuration, subtitleDuration) {
+		return 0, delta
+	}
+	return 2, delta
+}
+
+func subtitleLanguageOrder(sub subtitles.Subtitle) int {
+	language := strings.ToLower(strings.TrimSpace(sub.Language))
+	language = strings.ReplaceAll(language, "_", "-")
+	if language == "zh" || strings.HasPrefix(language, "zh-") || language == "zho" || language == "chi" || language == "cmn" {
+		return 0
+	}
+	if language != "" {
+		return 3
+	}
+	name := strings.ToLower(strings.TrimSpace(sub.Name))
+	if strings.Contains(name, "中文") || strings.Contains(name, "中字") || strings.Contains(name, "简体") || strings.Contains(name, "繁体") ||
+		strings.Contains(name, "zh-cn") || strings.Contains(name, "zh_cn") || strings.Contains(name, "zh-tw") || strings.Contains(name, "zh_tw") ||
+		subtitleNameHasMarker(name, "chs") || subtitleNameHasMarker(name, "cht") {
+		return 1
+	}
+	return 2
+}
+
+func subtitleNameHasMarker(name, marker string) bool {
+	for _, field := range strings.FieldsFunc(name, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	}) {
+		if field == marker {
+			return true
+		}
+	}
+	return false
+}
+
+func subtitleOrderKey(sub subtitles.Subtitle) string {
+	rawURL := strings.TrimSpace(sub.URL)
+	if parsed, err := url.Parse(rawURL); err == nil {
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		rawURL = parsed.String()
+	}
+	return strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(sub.Language)),
+		strings.ToLower(strings.TrimSpace(sub.Name)),
+		normalizeSubtitleExt(sub.Ext),
+		strconv.Itoa(sub.Source),
+		strings.TrimSpace(sub.SourceLabel),
+		strings.TrimSpace(sub.ID),
+		rawURL,
+	}, "\x00")
+}
+
+func mapSubtitles(videoID string, subs []subtitles.Subtitle) []SubtitleDTO {
+	out := make([]SubtitleDTO, 0, len(subs))
+	for index, sub := range subs {
+		ext := normalizeSubtitleExt(sub.Ext)
+		typ := subtitlePlayerType(ext)
+		if typ == "" {
+			continue
+		}
+		label := subtitleLabel(sub, index)
+		out = append(out, SubtitleDTO{
+			Name:     strings.TrimSpace(sub.Name),
+			Label:    label,
+			Language: strings.TrimSpace(sub.Language),
+			Ext:      ext,
+			Type:     typ,
+			URL:      fmt.Sprintf("/p/subtitle/%s/%d", pathSegment(videoID), index),
+			Source:   strings.TrimSpace(sub.SourceLabel),
+		})
+	}
+	return out
+}
+
+func subtitleLabel(sub subtitles.Subtitle, index int) string {
+	parts := make([]string, 0, 3)
+	if lang := strings.TrimSpace(sub.Language); lang != "" {
+		parts = append(parts, lang)
+	}
+	if name := strings.TrimSpace(sub.Name); name != "" {
+		parts = append(parts, name)
+	}
+	if ext := normalizeSubtitleExt(sub.Ext); ext != "" {
+		parts = append(parts, strings.ToUpper(ext))
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("字幕 %d", index+1)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func subtitlePlayerType(ext string) string {
+	switch normalizeSubtitleExt(ext) {
+	case "vtt":
+		return "vtt"
+	case "srt":
+		return "srt"
+	case "ass", "ssa":
+		return "ass"
+	default:
+		return ""
+	}
+}
+
+func subtitleContentType(ext string) string {
+	switch subtitlePlayerType(ext) {
+	case "vtt":
+		return "text/vtt; charset=utf-8"
+	default:
+		return "text/plain; charset=utf-8"
+	}
+}
+
+func normalizeSubtitleExt(ext string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))
+}
+
 func previewURL(v *catalog.Video) string {
 	base := "/p/preview/" + pathSegment(v.ID)
 	if v.UpdatedAt.IsZero() {
@@ -942,13 +1220,58 @@ func transcodedSource(v *catalog.Video) (string, bool) {
 }
 
 func (s *Server) videoSource(v *catalog.Video) string {
+	src, _ := s.videoSourceAndSize(v)
+	return src
+}
+
+// playbackMediaType describes the resource selected by videoSource. A ready
+// transcode is always an MP4 even when the original catalog entry was MKV/AVI.
+func playbackMediaType(v *catalog.Video) string {
+	if v == nil {
+		return ""
+	}
+	if v.TranscodeStatus == "ready" && v.TranscodedFileID != "" {
+		return "video/mp4"
+	}
+	switch strings.ToLower(strings.TrimPrefix(strings.TrimSpace(v.Ext), ".")) {
+	case "mp4", "m4v":
+		return "video/mp4"
+	default:
+		return ""
+	}
+}
+
+// videoSourceAndSize 返回实际播放资源的地址和同一资源的字节数。转码就绪时
+// 播放的是转码产物，因此不能继续沿用原文件大小来估算码率。
+func (s *Server) videoSourceAndSize(v *catalog.Video) (string, int64) {
 	if v.DriveID == localUploadDriveID {
-		return "/p/upload/" + pathSegment(v.ID)
+		return "/p/upload/" + pathSegment(v.ID), v.Size
 	}
-	if src, ok := transcodedSource(v); ok {
-		return src
+	if driveID, fileID, ok := videoStreamTarget(v); ok {
+		size := v.Size
+		if v.TranscodeStatus == "ready" && fileID == v.TranscodedFileID && v.TranscodedFileID != "" {
+			size = v.TranscodedSize
+		}
+		return fmt.Sprintf("/p/stream/%s/%s", pathSegment(driveID), pathSegment(fileID)), size
 	}
-	return fmt.Sprintf("/p/stream/%s/%s", pathSegment(v.DriveID), pathSegment(v.FileID))
+	return fmt.Sprintf("/p/stream/%s/%s", pathSegment(v.DriveID), pathSegment(v.FileID)), v.Size
+}
+
+// videoStreamTarget returns the exact drive/file pair used by the browser-facing
+// /p/stream URL. Shorts link prewarming must use the transcoded file when present,
+// otherwise it would warm a different cache entry from the one playback requests.
+func videoStreamTarget(v *catalog.Video) (driveID, fileID string, ok bool) {
+	if v == nil || v.DriveID == localUploadDriveID || v.DriveID == "" {
+		return "", "", false
+	}
+	fileID = v.FileID
+	if v.TranscodeStatus == "ready" && v.TranscodedFileID != "" {
+		fileID = v.TranscodedFileID
+	}
+	if fileID == "" {
+		return "", "", false
+	}
+	return v.DriveID, fileID, true
 }
 
 // videoSource 兼容旧调用点，没有 server context 时按之前逻辑回退到 /p/stream。
@@ -1023,6 +1346,8 @@ func driveKindLabel(kind string) string {
 		return "OneDrive"
 	case "googledrive":
 		return "Google Drive"
+	case "webdav":
+		return "WebDAV"
 	case localstorage.Kind:
 		return "本地存储"
 	default:
@@ -1039,15 +1364,8 @@ func (s *Server) localUploadFilePath(fileID string) (string, error) {
 		return "", errors.New("local upload storage is not configured")
 	}
 	path := filepath.Join(root, fileID)
-	cleanRoot, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	cleanPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	if cleanPath != cleanRoot && !strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator)) {
+	cleanPath, ok := localpath.Within(root, path)
+	if !ok {
 		return "", errors.New("invalid upload file id")
 	}
 	return cleanPath, nil
@@ -1102,6 +1420,42 @@ func parseUploadTags(values []string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+func (s *Server) canonicalUploadTags(ctx context.Context, values []string) ([]string, error) {
+	tags, err := parseUploadTags(values)
+	if err != nil {
+		return nil, uploadTagValidationError{err}
+	}
+	if len(tags) == 0 {
+		return tags, nil
+	}
+	if s.Catalog == nil {
+		return nil, errors.New("catalog is not configured")
+	}
+	canonicalTags := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		label, ok, err := s.Catalog.LookupTagLabel(ctx, tag)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, uploadTagValidationError{
+				fmt.Errorf("unknown upload tag: %s", tag),
+			}
+		}
+		canonicalTags = append(canonicalTags, label)
+	}
+	return canonicalTags, nil
+}
+
+type uploadTagValidationError struct {
+	error
+}
+
+func isUploadTagValidationError(err error) bool {
+	var target uploadTagValidationError
+	return errors.As(err, &target)
 }
 
 func splitUploadTags(value string) []string {

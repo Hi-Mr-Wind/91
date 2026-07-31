@@ -3,17 +3,6 @@ import { QrCode } from "lucide-react";
 import * as api from "../api";
 import { useToast } from "../ToastContext";
 
-function guangYaPanQRStatusClass(
-  status: api.GuangYaPanQRStatus | null,
-  completed: boolean,
-  error: string
-): string {
-  if (completed || status?.state === "success") return "is-ok";
-  if (error || status?.state === "expired" || status?.state === "denied" || status?.state === "error")
-    return "is-error";
-  return "is-pending";
-}
-
 export function GuangYaPanQRCodeLogin({
   onCredentials,
 }: {
@@ -94,11 +83,6 @@ export function GuangYaPanQRCodeLogin({
     };
   }, [session, completed, onCredentials, show]);
 
-  const statusText = completed
-    ? "已获取凭证"
-    : pollingError || status?.statusText || (session ? "等待扫码" : "未生成二维码");
-  const statusClass = guangYaPanQRStatusClass(status, completed, pollingError);
-
   return (
     <div className="admin-form__row">
       <label>扫码登录</label>
@@ -113,7 +97,6 @@ export function GuangYaPanQRCodeLogin({
             <QrCode size={14} />
             {starting ? "生成中..." : session ? "重新生成二维码" : "生成二维码"}
           </button>
-          <span className={`admin-status ${statusClass}`}>{statusText}</span>
         </div>
 
         {session && (
@@ -124,9 +107,11 @@ export function GuangYaPanQRCodeLogin({
               alt="光鸭网盘扫码登录二维码"
             />
             <div className="admin-p123-qr__meta">
-              <div className="admin-form__help">
-                使用光鸭 App 扫码并确认登录；确认后系统会自动填入 access_token 和 refresh_token。
-              </div>
+              {pollingError && (
+                <div className="admin-form__help">
+                  {pollingError}
+                </div>
+              )}
               {session.expiresAt && (
                 <div className="admin-form__help">
                   过期时间：{new Date(session.expiresAt).toLocaleTimeString("zh-CN", {

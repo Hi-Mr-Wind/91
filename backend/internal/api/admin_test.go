@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,38 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 )
+
+func TestHandleUpdateVideoRejectsReadOnlyTitleAndAuthor(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "video-read-only", DriveID: "drive", FileID: "file", FileName: "file.mp4",
+		Title: "file", Author: "author", PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/admin/api/videos/video-read-only", strings.NewReader(`{"title":"changed"}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "video-read-only")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleUpdateVideo(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetVideo(ctx, "video-read-only")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.Title != "file" || got.Author != "author" {
+		t.Fatalf("metadata changed: title=%q author=%q", got.Title, got.Author)
+	}
+}
 
 func TestHandleLoginReturnsForbiddenForBannedIP(t *testing.T) {
 	ctx := context.Background()
@@ -116,9 +149,85 @@ func TestHandleSetupStoresCredentialsAndCreatesSession(t *testing.T) {
 	if len(cookies) == 0 {
 		t.Fatal("setup did not set a session cookie")
 	}
-	ok, err := cat.ValidateSession(context.Background(), cookies[0].Value)
+	ok, _, err := cat.ValidateSession(context.Background(), cookies[0].Value)
 	if err != nil || !ok {
 		t.Fatalf("setup session valid=%v err=%v", ok, err)
+	}
+}
+
+func TestHandleBanUserDeletesSessions(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	hash, err := auth.HashPassword("secret123")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	userID, err := cat.CreateUser(ctx, "viewer", hash, "user")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := cat.CreateSession(ctx, "viewer-token", time.Hour, userID); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/users/1/ban", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", strconv.FormatInt(userID, 10))
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleBanUser(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	ok, _, err := cat.ValidateSession(ctx, "viewer-token")
+	if err != nil {
+		t.Fatalf("validate session: %v", err)
+	}
+	if ok {
+		t.Fatal("banned user session is still valid")
+	}
+}
+
+func TestHandleBanUserRejectsLastActiveAdmin(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	hash, err := auth.HashPassword("secret123")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	adminID, err := cat.CreateUser(ctx, "owner", hash, "admin")
+	if err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/users/1/ban", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", strconv.FormatInt(adminID, 10))
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleBanUser(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -179,6 +288,127 @@ func TestHandleDeleteVideoPassesDeleteSourceOption(t *testing.T) {
 	}
 }
 
+func TestHandleRemoveBlacklistRejectsNonRestorableVideo(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "local-upload-video", DriveID: "local-upload", FileID: "upload.mp4",
+		Title: "Upload", PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, "local-upload-video"); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/api/blacklist/local-upload-video", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "local-upload-video")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleRemoveBlacklist(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", rr.Code, rr.Body.String())
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, "local-upload-video"); err != nil || !deleted {
+		t.Fatalf("non-restorable tombstone was removed: deleted=%v err=%v", deleted, err)
+	}
+}
+
+func TestHandleStartBlacklistSourceDeleteReturnsBackgroundStatus(t *testing.T) {
+	started := false
+	server := &AdminServer{
+		OnStartBlacklistSourceDelete: func(req BlacklistSourceDeleteRequest) bool {
+			if !req.DeleteAllSources || len(req.IDs) != 0 {
+				t.Fatalf("request = %#v, want all sources", req)
+			}
+			started = true
+			return true
+		},
+		GetBlacklistSourceDeleteStatus: func() BlacklistSourceDeleteStatus {
+			return BlacklistSourceDeleteStatus{
+				State: "running", Running: true, Total: 12, Processed: 3, Deleted: 2, Failed: 1,
+			}
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/blacklist/source-delete", strings.NewReader(`{"deleteAllSources":true}`))
+	rr := httptest.NewRecorder()
+
+	server.handleStartBlacklistSourceDelete(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body = %s", rr.Code, rr.Body.String())
+	}
+	if !started {
+		t.Fatal("source delete hook was not called")
+	}
+	var got struct {
+		Accepted bool                        `json:"accepted"`
+		Status   BlacklistSourceDeleteStatus `json:"status"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !got.Accepted ||
+		!got.Status.Running ||
+		got.Status.Total != 12 ||
+		got.Status.Processed != 3 ||
+		got.Status.Deleted != 2 ||
+		got.Status.Failed != 1 {
+		t.Fatalf("response = %#v", got)
+	}
+}
+
+func TestHandleStartBlacklistSourceDeleteRequiresExplicitConfirmation(t *testing.T) {
+	called := false
+	server := &AdminServer{
+		OnStartBlacklistSourceDelete: func(_ BlacklistSourceDeleteRequest) bool {
+			called = true
+			return true
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/blacklist/source-delete", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+
+	server.handleStartBlacklistSourceDelete(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+	}
+	if called {
+		t.Fatal("source delete hook ran without explicit confirmation")
+	}
+}
+
+func TestHandleStartBlacklistSourceDeleteAcceptsExplicitIDs(t *testing.T) {
+	var got BlacklistSourceDeleteRequest
+	server := &AdminServer{
+		OnStartBlacklistSourceDelete: func(req BlacklistSourceDeleteRequest) bool {
+			got = req
+			return true
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/blacklist/source-delete", strings.NewReader(`{"ids":[" a ","","b","a"]}`))
+	rr := httptest.NewRecorder()
+
+	server.handleStartBlacklistSourceDelete(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body = %s", rr.Code, rr.Body.String())
+	}
+	if got.DeleteAllSources || len(got.IDs) != 2 || got.IDs[0] != "a" || got.IDs[1] != "b" {
+		t.Fatalf("request = %#v", got)
+	}
+}
+
 func TestHandleCheckUpdateReportsNewRelease(t *testing.T) {
 	dir := t.TempDir()
 	versionFile := filepath.Join(dir, ".version")
@@ -193,6 +423,7 @@ func TestHandleCheckUpdateReportsNewRelease(t *testing.T) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"tag_name": "v0.2.0",
 			"html_url": "https://github.com/nianzhibai/91/releases/tag/v0.2.0",
+			"body":     "## Changes\n\n- Added update notes dialog",
 		})
 	}))
 	t.Cleanup(releaseServer.Close)
@@ -222,6 +453,9 @@ func TestHandleCheckUpdateReportsNewRelease(t *testing.T) {
 	}
 	if got.ReleaseURL == "" {
 		t.Fatalf("releaseUrl is empty")
+	}
+	if got.ReleaseNotes != "## Changes\n\n- Added update notes dialog" {
+		t.Fatalf("releaseNotes = %q", got.ReleaseNotes)
 	}
 }
 
@@ -726,36 +960,133 @@ func TestHandleUpsertGoogleDriveMergesOAuthCredentials(t *testing.T) {
 	if got.Credentials["refresh_token"] != "existing-refresh" || got.Credentials["access_token"] != "existing-access" {
 		t.Fatalf("tokens were not preserved: %#v", got.Credentials)
 	}
-	if got.Credentials["use_online_api"] != "false" {
-		t.Fatalf("use_online_api = %q, want false", got.Credentials["use_online_api"])
-	}
 	if got.Credentials["client_id"] != "google-client-id" || got.Credentials["client_secret"] != "google-client-secret" {
 		t.Fatalf("oauth client credentials = %#v, want saved", got.Credentials)
 	}
-	if got.Credentials["api_url_address"] != "https://api.oplist.org/googleui/renewapi" {
-		t.Fatalf("api_url_address = %q, want preserved", got.Credentials["api_url_address"])
+	if _, ok := got.Credentials["use_online_api"]; ok {
+		t.Fatalf("deprecated use_online_api was not removed: %#v", got.Credentials)
+	}
+	if _, ok := got.Credentials["api_url_address"]; ok {
+		t.Fatalf("deprecated api_url_address was not removed: %#v", got.Credentials)
+	}
+}
+
+func TestHandleUpsertWebDAVMergesCredentials(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "webdav-main",
+		Kind:   "webdav",
+		Name:   "WebDAV",
+		RootID: "/media",
+		Credentials: map[string]string{
+			"base_url": "https://openlist.example.com/dav",
+			"username": "existing-user",
+			"password": "existing-password",
+		},
+		Status: "ok",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
 	}
 
-	clearReq := httptest.NewRequest(http.MethodPost, "/admin/api/drives", bytes.NewBufferString(`{
-		"id": "google-main",
-		"kind": "googledrive",
-		"name": "Google Drive",
-		"rootId": "root",
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives", bytes.NewBufferString(`{
+		"id": "webdav-main",
+		"kind": "webdav",
+		"name": "WebDAV",
+		"rootId": "/media",
 		"credentials": {
-			"api_url_address": ""
+			"base_url": "",
+			"username": "updated-user",
+			"password": ""
 		}
 	}`))
-	clearRR := httptest.NewRecorder()
-	(&AdminServer{Catalog: cat}).handleUpsertDrive(clearRR, clearReq)
-	if clearRR.Code != http.StatusOK {
-		t.Fatalf("clear status = %d, body = %s", clearRR.Code, clearRR.Body.String())
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	cleared, err := cat.GetDrive(ctx, "google-main")
+	got, err := cat.GetDrive(ctx, "webdav-main")
 	if err != nil {
-		t.Fatalf("get cleared drive: %v", err)
+		t.Fatalf("get drive: %v", err)
 	}
-	if _, ok := cleared.Credentials["api_url_address"]; ok {
-		t.Fatalf("api_url_address was not cleared: %#v", cleared.Credentials)
+	if got.Credentials["base_url"] != "https://openlist.example.com/dav" {
+		t.Fatalf("base_url = %q, want preserved", got.Credentials["base_url"])
+	}
+	if got.Credentials["username"] != "updated-user" {
+		t.Fatalf("username = %q, want updated-user", got.Credentials["username"])
+	}
+	if got.Credentials["password"] != "existing-password" {
+		t.Fatalf("password = %q, want preserved", got.Credentials["password"])
+	}
+	if !isCrawlerUploadTargetKind(got.Kind) {
+		t.Fatalf("kind %q should be a crawler upload target", got.Kind)
+	}
+}
+
+func TestHandleGetDriveCredentialsReturnsStoredValues(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	want := map[string]string{
+		"base_url": "https://openlist.example.com/dav",
+		"username": "stored-user",
+		"password": "stored-password",
+	}
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:          "webdav-main",
+		Kind:        "webdav",
+		Name:        "WebDAV",
+		RootID:      "/media",
+		Credentials: want,
+		Status:      "ok",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives/webdav-main/credentials", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "webdav-main")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleGetDriveCredentials(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	var got struct {
+		Credentials map[string]string `json:"credentials"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode credentials: %v", err)
+	}
+	if len(got.Credentials) != len(want) {
+		t.Fatalf("credentials = %#v, want %#v", got.Credentials, want)
+	}
+	for key, value := range want {
+		if got.Credentials[key] != value {
+			t.Fatalf("credential %q = %q, want %q", key, got.Credentials[key], value)
+		}
 	}
 }
 
@@ -932,7 +1263,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		}
 	})
 	scriptPath := filepath.Join(tmp, "demo_crawler.py")
-	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Demo Crawler\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Demo Crawler\"\nCRAWLER_PROTOCOL = \"crawler.v2\"\n"), 0o644); err != nil {
 		t.Fatalf("write crawler script: %v", err)
 	}
 
@@ -947,6 +1278,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 				"proxy":           " http://127.0.0.1:7890 ",
 				"script_path":     scriptPath,
 				"upload_drive_id": "p115-target",
+				"paused":          "true",
 			},
 			Status:        "ok",
 			TeaserEnabled: false,
@@ -1029,9 +1361,11 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	var got []struct {
 		ID               string `json:"id"`
 		Name             string `json:"name"`
+		Protocol         string `json:"protocol"`
 		Kind             string `json:"kind"`
 		Proxy            string `json:"proxy"`
 		UploadDriveID    string `json:"uploadDriveId"`
+		Paused           bool   `json:"paused"`
 		TeaserEnabled    bool   `json:"teaserEnabled"`
 		LastCrawlAt      int64  `json:"lastCrawlAt"`
 		TotalCrawled     int    `json:"totalCrawledCount"`
@@ -1046,9 +1380,11 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	}
 	type crawlerListRow struct {
 		Name             string
+		Protocol         string
 		Kind             string
 		Proxy            string
 		UploadDriveID    string
+		Paused           bool
 		TeaserEnabled    bool
 		LastCrawlAt      int64
 		TotalCrawled     int
@@ -1062,9 +1398,11 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	for _, d := range got {
 		byID[d.ID] = crawlerListRow{
 			Name:             d.Name,
+			Protocol:         d.Protocol,
 			Kind:             d.Kind,
 			Proxy:            d.Proxy,
 			UploadDriveID:    d.UploadDriveID,
+			Paused:           d.Paused,
 			TeaserEnabled:    d.TeaserEnabled,
 			LastCrawlAt:      d.LastCrawlAt,
 			TotalCrawled:     d.TotalCrawled,
@@ -1084,11 +1422,17 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	if byID["crawler-main"].Name != "Demo Crawler" {
 		t.Fatalf("crawler name = %q, want script metadata name", byID["crawler-main"].Name)
 	}
+	if byID["crawler-main"].Protocol != scriptcrawler.ProtocolV2 {
+		t.Fatalf("crawler protocol = %q, want %q", byID["crawler-main"].Protocol, scriptcrawler.ProtocolV2)
+	}
 	if byID["crawler-main"].Proxy != "http://127.0.0.1:7890" {
 		t.Fatalf("crawler proxy = %q, want trimmed proxy", byID["crawler-main"].Proxy)
 	}
 	if byID["crawler-main"].UploadDriveID != "p115-target" {
 		t.Fatalf("uploadDriveId = %q, want p115-target", byID["crawler-main"].UploadDriveID)
+	}
+	if !byID["crawler-main"].Paused {
+		t.Fatal("paused = false, want true from crawler drive")
 	}
 	if byID["crawler-main"].TeaserEnabled {
 		t.Fatal("teaserEnabled = true, want false from crawler drive")
@@ -1389,7 +1733,7 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 
 func TestHandleImportCrawlerScriptFile(t *testing.T) {
 	tmp := t.TempDir()
-	script := "CRAWLER_NAME = \"Demo Crawler\"\nprint('crawler')\n"
+	script := "CRAWLER_NAME = \"Demo Crawler\"\nCRAWLER_PROTOCOL = \"crawler.v2\"\nprint('crawler')\n"
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 	part, err := mw.CreateFormFile("file", "../demo crawler.py")
@@ -1413,6 +1757,7 @@ func TestHandleImportCrawlerScriptFile(t *testing.T) {
 	var got struct {
 		ScriptPath string `json:"scriptPath"`
 		Name       string `json:"name"`
+		Protocol   string `json:"protocol"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -1434,8 +1779,67 @@ func TestHandleImportCrawlerScriptFile(t *testing.T) {
 	if got.Name != "Demo Crawler" {
 		t.Fatalf("name = %q, want script metadata name", got.Name)
 	}
+	if got.Protocol != scriptcrawler.ProtocolV2 {
+		t.Fatalf("protocol = %q, want %q", got.Protocol, scriptcrawler.ProtocolV2)
+	}
 	if string(data) != script {
 		t.Fatalf("script content = %q", string(data))
+	}
+}
+
+func TestHandleImportCrawlerScriptFileDoesNotCreateCrawlerTagWithoutVideos(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.SetAutoGenerateTagsEnabled(ctx, false); err != nil {
+		t.Fatalf("disable auto-generate tags: %v", err)
+	}
+
+	script := "CRAWLER_NAME = \"Imported Crawler\"\nprint('crawler')\n"
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", "imported.py")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write([]byte(script)); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/crawlers/import-file", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	(&AdminServer{
+		Catalog:         cat,
+		LocalPreviewDir: filepath.Join(tmp, "previews"),
+	}).handleImportCrawlerScriptFile(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	label, ok, err := cat.LookupTagLabel(ctx, "Imported Crawler")
+	if err != nil {
+		t.Fatalf("lookup crawler tag: %v", err)
+	}
+	if ok {
+		t.Fatalf("lookup tag = %q/%v, want no crawler tag before any video exists", label, ok)
+	}
+	enabled, err := cat.AutoGenerateTagsEnabled(ctx)
+	if err != nil {
+		t.Fatalf("read auto-generate setting: %v", err)
+	}
+	if enabled {
+		t.Fatal("import changed auto-generate setting to enabled")
 	}
 }
 
@@ -1515,6 +1919,7 @@ func TestHandleImportCrawlerScriptURL(t *testing.T) {
 	var got struct {
 		ScriptPath string `json:"scriptPath"`
 		Name       string `json:"name"`
+		Protocol   string `json:"protocol"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -1529,6 +1934,9 @@ func TestHandleImportCrawlerScriptURL(t *testing.T) {
 	}
 	if got.Name != "URL Crawler" {
 		t.Fatalf("name = %q, want script metadata name", got.Name)
+	}
+	if got.Protocol != scriptcrawler.ProtocolV1 {
+		t.Fatalf("protocol = %q, want %q", got.Protocol, scriptcrawler.ProtocolV1)
 	}
 	if filepath.Base(got.ScriptPath) != "crawler.py" {
 		t.Fatalf("script filename = %q, want original filename", filepath.Base(got.ScriptPath))
@@ -1591,6 +1999,7 @@ func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
 			"script_path": scriptPath,
 			"proxy":       "http://127.0.0.1:7890",
 			"target_new":  "10",
+			"paused":      "true",
 		},
 	}); err != nil {
 		t.Fatalf("seed crawler: %v", err)
@@ -1641,7 +2050,7 @@ func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("crawler drive should remain for existing videos: %v", err)
 	}
-	if drive.Credentials["script_path"] != "" || drive.Credentials["proxy"] != "" || drive.Credentials["target_new"] != "" {
+	if drive.Credentials["script_path"] != "" || drive.Credentials["proxy"] != "" || drive.Credentials["target_new"] != "" || drive.Credentials["paused"] != "" {
 		t.Fatalf("crawler credentials were not cleared: %+v", drive.Credentials)
 	}
 	if _, err := cat.GetVideo(ctx, "video-from-crawler"); err != nil {
@@ -1657,6 +2066,56 @@ func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
 	}
 	if !got.OK || got.DeletedVideos != 0 || !got.DeletedScript {
 		t.Fatalf("response = %#v", got)
+	}
+}
+
+func TestHandleSetCrawlerPausedPersistsCredential(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:          "crawler-main",
+		Kind:        scriptcrawler.Kind,
+		Name:        "Crawler",
+		RootID:      "/",
+		Credentials: map[string]string{"script_path": "/tmp/crawler.py"},
+	}); err != nil {
+		t.Fatalf("seed crawler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/crawlers/crawler-main/paused", strings.NewReader(`{"paused":true}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "crawler-main")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleSetCrawlerPaused(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		OK     bool `json:"ok"`
+		Paused bool `json:"paused"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.OK || !resp.Paused {
+		t.Fatalf("response = %#v, want paused true", resp)
+	}
+	drive, err := cat.GetDrive(ctx, "crawler-main")
+	if err != nil {
+		t.Fatalf("get crawler: %v", err)
+	}
+	if drive.Credentials["paused"] != "true" {
+		t.Fatalf("paused credential = %q, want true", drive.Credentials["paused"])
 	}
 }
 
@@ -1681,6 +2140,255 @@ func TestHandleImportCrawlerScriptURLRejectsNonPython(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), ".py") {
 		t.Fatalf("body = %s, want .py error", rr.Body.String())
+	}
+}
+
+func TestHandleQuarkQRStartAndStatusReturnCookie(t *testing.T) {
+	var pollCalls int
+	var accountCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/cas/ajax/getTokenForQrcodeLogin":
+			http.SetCookie(w, &http.Cookie{Name: "_UP_LOGIN", Value: "temporary", Path: "/", HttpOnly: true})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": 2000000,
+				"data":   map[string]any{"members": map[string]string{"token": "quark-token"}},
+			})
+		case "/cas/ajax/getServiceTicketByQrcodeToken":
+			pollCalls++
+			if r.URL.Query().Get("token") != "quark-token" {
+				t.Errorf("poll token = %q", r.URL.Query().Get("token"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": 2000000,
+				"data":   map[string]any{"members": map[string]string{"service_ticket": "service-ticket"}},
+			})
+		case "/account/info":
+			accountCalls++
+			if r.URL.Query().Get("st") != "service-ticket" {
+				t.Errorf("service ticket = %q", r.URL.Query().Get("st"))
+			}
+			http.SetCookie(w, &http.Cookie{Name: "__pus", Value: "pus-value", Path: "/", HttpOnly: true})
+			http.SetCookie(w, &http.Cookie{Name: "__puus", Value: "puus-value", Path: "/", HttpOnly: true})
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "code": 0})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	server := &AdminServer{
+		QuarkQRUOPBaseURL: upstream.URL,
+		QuarkQRPanBaseURL: upstream.URL,
+	}
+	startReq := httptest.NewRequest(http.MethodPost, "/admin/api/drives/quark/qr", nil)
+	startRR := httptest.NewRecorder()
+	server.handleQuarkQRStart(startRR, startReq)
+	if startRR.Code != http.StatusOK {
+		t.Fatalf("start status = %d, body = %s", startRR.Code, startRR.Body.String())
+	}
+	if startRR.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("start Cache-Control = %q", startRR.Header().Get("Cache-Control"))
+	}
+	var session struct {
+		Token          string `json:"token"`
+		QRCodeURL      string `json:"qrCodeUrl"`
+		QRImageDataURL string `json:"qrImageDataUrl"`
+	}
+	if err := json.NewDecoder(startRR.Body).Decode(&session); err != nil {
+		t.Fatalf("decode start: %v", err)
+	}
+	if session.Token != "quark-token" || !strings.HasPrefix(session.QRCodeURL, "https://su.quark.cn/4_eMHBJ?") {
+		t.Fatalf("session = %#v", session)
+	}
+	if !strings.HasPrefix(session.QRImageDataURL, "data:image/png;base64,") {
+		t.Fatalf("qr image = %q", session.QRImageDataURL)
+	}
+
+	statusReq := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/api/drives/quark/qr/status",
+		strings.NewReader(`{"token":"quark-token"}`),
+	)
+	if statusReq.URL.RawQuery != "" {
+		t.Fatalf("admin status request unexpectedly contains query: %s", statusReq.URL.RawQuery)
+	}
+	statusRR := httptest.NewRecorder()
+	server.handleQuarkQRStatus(statusRR, statusReq)
+	if statusRR.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", statusRR.Code, statusRR.Body.String())
+	}
+	if statusRR.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status Cache-Control = %q", statusRR.Header().Get("Cache-Control"))
+	}
+	var status struct {
+		State  string `json:"state"`
+		Status int    `json:"status"`
+		Cookie string `json:"cookie"`
+	}
+	if err := json.NewDecoder(statusRR.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status.State != "success" || status.Status != 2000000 || status.Cookie != "__pus=pus-value; __puus=puus-value" {
+		t.Fatalf("status response = %#v", status)
+	}
+	if pollCalls != 1 || accountCalls != 1 {
+		t.Fatalf("upstream calls: poll=%d account=%d", pollCalls, accountCalls)
+	}
+}
+
+func TestHandleQuarkQRStatusRejectsMissingToken(t *testing.T) {
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/api/drives/quark/qr/status",
+		strings.NewReader(`{"token":""}`),
+	)
+	rr := httptest.NewRecorder()
+	(&AdminServer{}).handleQuarkQRStatus(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", rr.Header().Get("Cache-Control"))
+	}
+}
+
+type p115QRRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f p115QRRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func p115QRJSONResponse(req *http.Request, body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+}
+
+func TestHandleP115QRStart(t *testing.T) {
+	client := &http.Client{Transport: p115QRRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "qrcodeapi.115.com" || req.URL.Path != "/api/1.0/web/1.0/token" {
+			t.Fatalf("unexpected upstream request: %s", req.URL.String())
+		}
+		return p115QRJSONResponse(req, `{
+			"state":1,
+			"code":0,
+			"data":{
+				"uid":"qr-uid",
+				"time":1784127027,
+				"sign":"qr-sign",
+				"qrcode":"https://115.com/scan/dg-qr-uid"
+			}
+		}`), nil
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/p115/qr", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{P115QRHTTPClient: client}).handleP115QRStart(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", rr.Header().Get("Cache-Control"))
+	}
+	var got struct {
+		UID            string `json:"uid"`
+		Time           int64  `json:"time"`
+		Sign           string `json:"sign"`
+		QRCodeURL      string `json:"qrCodeUrl"`
+		QRImageDataURL string `json:"qrImageDataUrl"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.UID != "qr-uid" || got.Time != 1784127027 || got.Sign != "qr-sign" || got.QRCodeURL != "https://115.com/scan/dg-qr-uid" {
+		t.Fatalf("response = %#v", got)
+	}
+	if !strings.HasPrefix(got.QRImageDataURL, "data:image/png;base64,") {
+		t.Fatalf("qr image = %q", got.QRImageDataURL)
+	}
+}
+
+func TestHandleP115QRStatusUsesPOSTBodyAndReturnsCookie(t *testing.T) {
+	upstreamCalls := 0
+	client := &http.Client{Transport: p115QRRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		switch req.URL.Host + req.URL.Path {
+		case "qrcodeapi.115.com/get/status/":
+			if req.URL.Query().Get("uid") != "qr-uid" || req.URL.Query().Get("sign") != "qr-sign" {
+				t.Fatalf("status query = %s", req.URL.RawQuery)
+			}
+			return p115QRJSONResponse(req, `{"state":1,"code":0,"data":{"status":2}}`), nil
+		case "passportapi.115.com/app/1.0/web/1.0/login/qrcode":
+			return p115QRJSONResponse(req, `{
+				"state":1,
+				"code":0,
+				"data":{"cookie":{"UID":"user-uid","CID":"cid","SEID":"seid","KID":"kid"}}
+			}`), nil
+		default:
+			t.Fatalf("unexpected upstream request: %s", req.URL.String())
+			return nil, nil
+		}
+	})}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/api/drives/p115/qr/status",
+		strings.NewReader(`{"uid":"qr-uid","time":1784127027,"sign":"qr-sign"}`),
+	)
+	if req.URL.RawQuery != "" {
+		t.Fatalf("admin status request unexpectedly contains query: %s", req.URL.RawQuery)
+	}
+	rr := httptest.NewRecorder()
+	(&AdminServer{P115QRHTTPClient: client}).handleP115QRStatus(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", rr.Header().Get("Cache-Control"))
+	}
+	var got struct {
+		State  string `json:"state"`
+		Status int    `json:"status"`
+		Cookie string `json:"cookie"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.State != "success" || got.Status != 2 || got.Cookie != "UID=user-uid;CID=cid;SEID=seid;KID=kid" {
+		t.Fatalf("response = %#v", got)
+	}
+	if upstreamCalls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", upstreamCalls)
+	}
+}
+
+func TestHandleP115QRStatusRejectsIncompleteSession(t *testing.T) {
+	upstreamCalls := 0
+	client := &http.Client{Transport: p115QRRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		return p115QRJSONResponse(req, `{}`), nil
+	})}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/api/drives/p115/qr/status",
+		strings.NewReader(`{"uid":"qr-uid","time":1784127027}`),
+	)
+	rr := httptest.NewRecorder()
+	(&AdminServer{P115QRHTTPClient: client}).handleP115QRStatus(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
 	}
 }
 
@@ -1873,7 +2581,8 @@ func TestHandleTestCrawlerScriptRunsImportedScript(t *testing.T) {
 	defer media.Close()
 
 	script := filepath.Join(t.TempDir(), "crawler.py")
-	body := `import json
+	body := `CRAWLER_NAME = "Dry Run Test"
+import json
 print(json.dumps({"title": "Dry Run Video", "source_id": "dry-1", "media_url": "` + media.URL + `/video.mp4", "thumbnail_url": "` + media.URL + `/thumb.jpg", "detail_url": "` + media.URL + `/detail"}))
 `
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
@@ -1924,81 +2633,6 @@ print(json.dumps({"title": "Dry Run Video", "source_id": "dry-1", "media_url": "
 	}
 	if got.MediaCheck.ContentLength != 2048 {
 		t.Fatalf("contentLength = %d, want 2048", got.MediaCheck.ContentLength)
-	}
-}
-
-func TestHandleListDrivesIncludesGoogleDriveOnlineAPIMode(t *testing.T) {
-	ctx := context.Background()
-	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
-	if err != nil {
-		t.Fatalf("open catalog: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := cat.Close(); err != nil {
-			t.Fatalf("close catalog: %v", err)
-		}
-	})
-
-	for _, d := range []*catalog.Drive{
-		{
-			ID:     "google-legacy",
-			Kind:   "googledrive",
-			Name:   "Google Legacy",
-			RootID: "root",
-			Credentials: map[string]string{
-				"refresh_token":   "legacy-refresh",
-				"api_url_address": "https://openlist-api.example/googleui/renewapi",
-			},
-			Status: "ok",
-		},
-		{
-			ID:     "google-oauth",
-			Kind:   "googledrive",
-			Name:   "Google OAuth",
-			RootID: "root",
-			Credentials: map[string]string{
-				"refresh_token":  "oauth-refresh",
-				"use_online_api": "false",
-				"client_id":      "client-id",
-				"client_secret":  "client-secret",
-			},
-			Status: "ok",
-		},
-	} {
-		if err := cat.UpsertDrive(ctx, d); err != nil {
-			t.Fatalf("seed drive %s: %v", d.ID, err)
-		}
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives", nil)
-	rr := httptest.NewRecorder()
-	(&AdminServer{Catalog: cat}).handleListDrives(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
-	}
-
-	var got []struct {
-		ID                        string `json:"id"`
-		GoogleDriveUseOnlineAPI   bool   `json:"googleDriveUseOnlineAPI"`
-		GoogleDriveOpenListAPIURL string `json:"googleDriveOpenListApiUrl"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	byID := map[string]bool{}
-	byAPIURL := map[string]string{}
-	for _, d := range got {
-		byID[d.ID] = d.GoogleDriveUseOnlineAPI
-		byAPIURL[d.ID] = d.GoogleDriveOpenListAPIURL
-	}
-	if !byID["google-legacy"] {
-		t.Fatalf("legacy google drive use_online_api = false, want true")
-	}
-	if byID["google-oauth"] {
-		t.Fatalf("oauth google drive use_online_api = true, want false")
-	}
-	if byAPIURL["google-legacy"] != "https://openlist-api.example/googleui/renewapi" {
-		t.Fatalf("legacy google drive openlist api url = %q, want custom URL", byAPIURL["google-legacy"])
 	}
 }
 
@@ -2357,6 +2991,100 @@ func TestHandleCreateTagClassifiesExistingVideos(t *testing.T) {
 	}
 }
 
+func TestHandleUpdateTagSavesMatchRulesAndClassifies(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "rule-video", DriveID: "drive", FileID: "file", Title: "custom matching phrase",
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "展示标签", nil, "user"); err != nil {
+		t.Fatalf("create tag: %v", err)
+	}
+	tags, err := cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags: %v", err)
+	}
+	var tagID int64
+	for _, tag := range tags {
+		if tag.Label == "展示标签" {
+			tagID = tag.ID
+		}
+	}
+	req := requestWithRouteParam(
+		http.MethodPut,
+		"/admin/api/tags/1",
+		"id",
+		strconv.FormatInt(tagID, 10),
+		strings.NewReader(`{"matchRules":{"keywords":["custom matching phrase"]}}`),
+	)
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleUpdateTag(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Tag catalog.Tag `json:"tag"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Tag.MatchRules.Keywords) != 1 || len(got.Tag.Aliases) != 0 {
+		t.Fatalf("response = %#v", got)
+	}
+	video, err := cat.GetVideo(ctx, "rule-video")
+	if err != nil || len(video.Tags) != 1 || video.Tags[0] != "展示标签" {
+		t.Fatalf("classified video = %#v, %v", video, err)
+	}
+
+	req = requestWithRouteParam(
+		http.MethodPut,
+		"/admin/api/tags/1",
+		"id",
+		strconv.FormatInt(tagID, 10),
+		strings.NewReader(`{"matchRules":{"keywords":["other phrase"]}}`),
+	)
+	rr = httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleUpdateTag(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("second update status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	video, err = cat.GetVideo(ctx, "rule-video")
+	if err != nil {
+		t.Fatalf("get video after second update: %v", err)
+	}
+	if len(video.Tags) != 0 {
+		t.Fatalf("tag rule deletion did not refresh video tags: %#v", video.Tags)
+	}
+}
+
+func TestTagJobHandlersExposeStatus(t *testing.T) {
+	server := &AdminServer{
+		OnStartTagRetag: func() bool { return true },
+		GetTagJobStatus: func() TagJobStatus {
+			return TagJobStatus{State: "running", Running: true, Kind: "retag", Total: 10, Processed: 4}
+		},
+	}
+	rr := httptest.NewRecorder()
+	server.handleStartTagRetag(rr, httptest.NewRequest(http.MethodPost, "/admin/api/tags/retag", nil))
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("retag status = %d", rr.Code)
+	}
+
+	rr = httptest.NewRecorder()
+	server.handleTagJobStatus(rr, httptest.NewRequest(http.MethodGet, "/admin/api/tags/jobs/status", nil))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"processed":4`) {
+		t.Fatalf("job status = %d, %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestHandleDeleteTagRemovesTagFromVideos(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -2412,6 +3140,41 @@ func TestHandleDeleteTagRemovesTagFromVideos(t *testing.T) {
 	}
 	if len(video.Tags) != 0 {
 		t.Fatalf("video tags = %#v, want none", video.Tags)
+	}
+}
+
+func TestHandleDeleteTagAllowsBuiltinTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	tags, err := cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags: %v", err)
+	}
+	var builtinID int64
+	for _, tag := range tags {
+		if tag.Label == "奶子" {
+			builtinID = tag.ID
+			break
+		}
+	}
+	if builtinID == 0 {
+		t.Fatal("奶子 builtin tag missing")
+	}
+	req := requestWithRouteParam(
+		http.MethodDelete,
+		"/admin/api/tags/1",
+		"id",
+		strconv.FormatInt(builtinID, 10),
+		strings.NewReader(""),
+	)
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleDeleteTag(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -2476,6 +3239,185 @@ func TestHandleAdminListVideosFiltersByDriveID(t *testing.T) {
 	}
 }
 
+func TestHandleAdminListVideosTreatsUploadsAsOneSource(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, video := range []*catalog.Video{
+		{
+			ID:          "uploaded-from-file",
+			DriveID:     "local-upload",
+			FileID:      "from-file.mp4",
+			Title:       "uploaded from file",
+			PublishedAt: now,
+			CreatedAt:   now,
+		},
+		{
+			ID:          "uploaded-from-link",
+			DriveID:     "local-upload",
+			FileID:      "from-link.mp4",
+			Title:       "uploaded from link",
+			PublishedAt: now.Add(-time.Second),
+			CreatedAt:   now.Add(-time.Second),
+		},
+		{
+			ID:          "cloud-video",
+			DriveID:     "cloud",
+			FileID:      "cloud-file",
+			Title:       "cloud video",
+			PublishedAt: now.Add(-2 * time.Second),
+			CreatedAt:   now.Add(-2 * time.Second),
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed %s: %v", video.ID, err)
+		}
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/admin/api/videos?driveId=local-upload",
+		nil,
+	)
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleAdminListVideos(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items []catalog.Video `json:"items"`
+		Total int             `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("response total/items = %d/%d, want both uploads: %#v", got.Total, len(got.Items), got.Items)
+	}
+	for _, item := range got.Items {
+		if item.DriveID != "local-upload" {
+			t.Fatalf("unexpected non-upload item: %#v", item)
+		}
+	}
+}
+
+func TestHandleAdminListVideosAppliesAdvancedFilters(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	seed := func(id, driveID string, createdAt, publishedAt time.Time, durationSeconds int) {
+		t.Helper()
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:              id,
+			DriveID:         driveID,
+			FileID:          "file-" + id,
+			Title:           id,
+			DurationSeconds: durationSeconds,
+			PublishedAt:     publishedAt,
+			CreatedAt:       createdAt,
+			UpdatedAt:       createdAt,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed(
+		"scriptcrawler-crawler-a-source-1",
+		"cloud-a",
+		time.Date(2026, time.July, 10, 23, 30, 0, 0, time.Local),
+		time.Date(2026, time.June, 1, 23, 30, 0, 0, time.Local),
+		5*60,
+	)
+	seed(
+		"scriptcrawler-crawler-a-source-2",
+		"cloud-a",
+		time.Date(2026, time.July, 11, 0, 30, 0, 0, time.Local),
+		time.Date(2026, time.June, 2, 0, 30, 0, 0, time.Local),
+		15*60,
+	)
+	seed(
+		"scriptcrawler-crawler-b-source-3",
+		"cloud-b",
+		time.Date(2026, time.July, 10, 12, 0, 0, 0, time.Local),
+		time.Date(2026, time.June, 1, 12, 0, 0, 0, time.Local),
+		5*60,
+	)
+	for _, source := range []struct {
+		crawlerID string
+		sourceID  string
+		videoID   string
+	}{
+		{"crawler-a", "source-1", "scriptcrawler-crawler-a-source-1"},
+		{"crawler-a", "source-2", "scriptcrawler-crawler-a-source-2"},
+		{"crawler-b", "source-3", "scriptcrawler-crawler-b-source-3"},
+	} {
+		if err := cat.MarkCrawlerSourceSeen(ctx, "scriptcrawler", source.crawlerID, source.sourceID, "imported", source.videoID, "", 0); err != nil {
+			t.Fatalf("mark crawler source %s: %v", source.sourceID, err)
+		}
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/admin/api/videos?driveId=cloud-a&crawlerId=crawler-a&createdFrom=2026-07-10&createdTo=2026-07-10&durationMinMinutes=4&durationMaxMinutes=6",
+		nil,
+	)
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleAdminListVideos(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items []catalog.Video `json:"items"`
+		Total int             `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Total != 1 || len(got.Items) != 1 || got.Items[0].ID != "scriptcrawler-crawler-a-source-1" {
+		t.Fatalf("filtered response = total %d items %#v, want source-1", got.Total, got.Items)
+	}
+}
+
+func TestHandleAdminListVideosRejectsInvalidAdvancedRanges(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	tomorrow := time.Now().In(time.Local).AddDate(0, 0, 1).Format(adminVideoDateLayout)
+	for _, target := range []string{
+		"/admin/api/videos?createdFrom=2026/07/10",
+		"/admin/api/videos?createdFrom=" + tomorrow,
+		"/admin/api/videos?createdTo=" + tomorrow,
+		"/admin/api/videos?durationMinMinutes=10&durationMaxMinutes=5",
+		"/admin/api/videos?durationMinMinutes=1.5",
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		rr := httptest.NewRecorder()
+		(&AdminServer{Catalog: cat}).handleAdminListVideos(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, body = %s", target, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 func TestHandleAdminListVideosDoesNotExposeCategory(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -2500,6 +3442,14 @@ func TestHandleAdminListVideosDoesNotExposeCategory(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
 	}
+	if _, err := cat.EnsureTag(ctx, "source-tag", "user"); err != nil {
+		t.Fatalf("ensure source tag: %v", err)
+	}
+	if _, err := cat.AddVideoTagAssignments(ctx, "video-1", []catalog.TagAssignment{{
+		Label: "source-tag", Source: "crawler", Evidence: "脚本标签",
+	}}); err != nil {
+		t.Fatalf("assign source tag: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/videos", nil)
 	rr := httptest.NewRecorder()
@@ -2519,6 +3469,14 @@ func TestHandleAdminListVideosDoesNotExposeCategory(t *testing.T) {
 	}
 	if _, ok := got.Items[0]["category"]; ok {
 		t.Fatalf("admin video response exposed category: %#v", got.Items[0])
+	}
+	sources, ok := got.Items[0]["tagSources"].(map[string]any)
+	if !ok || sources["source-tag"] != "crawler" {
+		t.Fatalf("tag sources = %#v", got.Items[0]["tagSources"])
+	}
+	evidence, ok := got.Items[0]["tagEvidence"].(map[string]any)
+	if !ok || evidence["source-tag"] != "脚本标签" {
+		t.Fatalf("tag evidence = %#v", got.Items[0]["tagEvidence"])
 	}
 }
 

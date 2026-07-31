@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Loader2, Moon, Sparkles, Star } from "lucide-react";
+import { Check, Loader2 } from "lucide-react";
 import * as api from "./api";
 import type { Theme } from "./api";
 import { useToast } from "./ToastContext";
@@ -12,32 +12,20 @@ function isTheme(value: unknown): value is Theme {
 type Option = {
   id: Theme;
   title: string;
-  subtitle: string;
-  description: string;
-  icon: typeof Moon;
 };
 
 const OPTIONS: Option[] = [
   {
     id: "dark",
     title: "暗黑 + 暖橙",
-    subtitle: "Cinema Dark",
-    description: "深邃灰阶 + 暖橙主色，适合夜间观影、长时间浏览。",
-    icon: Moon,
   },
   {
     id: "pink",
     title: "奶油白 + 樱花粉",
-    subtitle: "Sakura Cream",
-    description: "柔和奶白底 + 樱花粉主色，清爽温柔，日间使用更舒适。",
-    icon: Sparkles,
   },
   {
     id: "sky",
     title: "星空蓝 + 暖星黄",
-    subtitle: "Starry Sky",
-    description: "浅天空蓝底 + 暖星黄主色，配上淡淡的网格与点点星光，顶级美感。",
-    icon: Star,
   },
 ];
 
@@ -108,13 +96,8 @@ export function ThemePage() {
 
   return (
     <div className="theme-page">
-      <header className="theme-page__head">
-        <h1 className="theme-page__title">主题外观</h1>
-      </header>
-
       <div className="theme-grid">
         {OPTIONS.map((opt) => {
-          const Icon = opt.icon;
           const isActive = active === opt.id;
           const isSaving = saving === opt.id;
           return (
@@ -145,12 +128,8 @@ export function ThemePage() {
 
               <div className="theme-card__body">
                 <div className="theme-card__head">
-                  <span className="theme-card__icon">
-                    <Icon size={16} />
-                  </span>
                   <div className="theme-card__title-wrap">
                     <span className="theme-card__title">{opt.title}</span>
-                    <span className="theme-card__subtitle">{opt.subtitle}</span>
                   </div>
                   <span className="theme-card__state" aria-hidden="true">
                     {isSaving ? (
@@ -160,7 +139,6 @@ export function ThemePage() {
                     ) : null}
                   </span>
                 </div>
-                <p className="theme-card__desc">{opt.description}</p>
               </div>
             </button>
           );

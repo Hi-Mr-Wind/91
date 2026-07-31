@@ -321,6 +321,14 @@
   --drive-shadow: rgba(76, 171, 234, 0.15);
   --drive-shadow-strong: rgba(76, 171, 234, 0.4);
 }
+.source-badge[data-kind="webdav"] {
+  --drive-color: var(--drive-webdav);
+  --drive-bg: rgba(42, 167, 200, 0.12);
+  --drive-text: #9de9f8;
+  --drive-border: rgba(42, 167, 200, 0.35);
+  --drive-shadow: rgba(42, 167, 200, 0.15);
+  --drive-shadow-strong: rgba(42, 167, 200, 0.4);
+}
 .source-badge[data-kind="localstorage"] {
   --drive-color: var(--drive-localstorage);
   --drive-bg: rgba(53, 184, 143, 0.12);
@@ -478,6 +486,7 @@
 .video-card__source[data-kind="wopan"] { --source-color: var(--drive-wopan); }
 .video-card__source[data-kind="guangyapan"] { --source-color: var(--drive-guangyapan); }
 .video-card__source[data-kind="onedrive"] { --source-color: var(--drive-onedrive); }
+.video-card__source[data-kind="webdav"] { --source-color: var(--drive-webdav); }
 .video-card__source[data-kind="localstorage"] { --source-color: var(--drive-localstorage); }
 
 /* =========================================================

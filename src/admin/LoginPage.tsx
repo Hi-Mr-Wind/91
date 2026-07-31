@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
-import { Play } from "lucide-react";
 import { useAuth } from "./AuthContext";
 import { useToast } from "./ToastContext";
 import * as api from "./api";
+import { PasswordInput } from "./PasswordInput";
 
 export function LoginPage() {
   const { status, login, refresh } = useAuth();
@@ -86,11 +86,6 @@ export function LoginPage() {
   return (
     <div className="admin-login">
       <form className="admin-login__card" onSubmit={handleSubmit}>
-        {setupRequired && (
-          <h1 className="admin-login__title">
-            <Play size={18} fill="currentColor" /> 首次设置管理员
-          </h1>
-        )}
         <div className="admin-form">
           <div className="admin-form__row">
             <label htmlFor="admin-login-username">用户名</label>
@@ -104,9 +99,8 @@ export function LoginPage() {
           </div>
           <div className="admin-form__row">
             <label htmlFor="admin-login-password">密码</label>
-            <input
+            <PasswordInput
               id="admin-login-password"
-              type="password"
               value={p}
               onChange={(e) => setP(e.target.value)}
               autoComplete={setupRequired ? "new-password" : "current-password"}
@@ -115,9 +109,8 @@ export function LoginPage() {
           {setupRequired && (
             <div className="admin-form__row">
               <label htmlFor="admin-login-password-confirm">确认密码</label>
-              <input
+              <PasswordInput
                 id="admin-login-password-confirm"
-                type="password"
                 value={p2}
                 onChange={(e) => setP2(e.target.value)}
                 autoComplete="new-password"

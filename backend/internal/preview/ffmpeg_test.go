@@ -3,8 +3,12 @@ package preview
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +16,31 @@ import (
 
 	"github.com/video-site/backend/internal/drives"
 )
+
+func TestReplaceFilePreservesHardLinkedBackupSnapshot(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "thumbnail.jpg")
+	snapshot := filepath.Join(root, "snapshot-thumbnail.jpg")
+	replacement := filepath.Join(root, "replacement.jpg")
+	if err := os.WriteFile(target, []byte("old-thumbnail"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, snapshot); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if err := os.WriteFile(replacement, []byte("new-thumbnail"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceFile(replacement, target); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(target); err != nil || string(body) != "new-thumbnail" {
+		t.Fatalf("replacement body = %q err=%v", body, err)
+	}
+	if body, err := os.ReadFile(snapshot); err != nil || string(body) != "old-thumbnail" {
+		t.Fatalf("hard-linked snapshot body = %q err=%v", body, err)
+	}
+}
 
 func TestNewDefaultsToThreeSecondTeaserSegments(t *testing.T) {
 	gen := New(Config{})
@@ -151,20 +180,26 @@ func TestTeaserSegmentFallbackRequiresPlannedSegmentCount(t *testing.T) {
 }
 
 func TestShortVideoRequiresOnlyOneUsableTeaserSegment(t *testing.T) {
-	if got := requiredTeaserSegments(12, 3); got != 1 {
+	if got := requiredTeaserSegments(12, 3, false); got != 1 {
 		t.Fatalf("required segments = %d, want 1 for short video", got)
 	}
-	if got := requiredTeaserSegments(29.999, 3); got != 1 {
+	if got := requiredTeaserSegments(29.999, 3, true); got != 1 {
 		t.Fatalf("required segments = %d, want 1 below 30 seconds", got)
 	}
 }
 
-func TestMediumAndLongVideosStillRequirePlannedTeaserSegments(t *testing.T) {
-	if got := requiredTeaserSegments(30, 4); got != 4 {
-		t.Fatalf("required segments = %d, want planned count at 30 seconds", got)
+func TestMediumAndLongVideosRequireFullPlanBeforeExplicitDegradation(t *testing.T) {
+	if got := requiredTeaserSegments(30, 4, false); got != 4 {
+		t.Fatalf("required segments = %d, want full four-segment plan", got)
 	}
-	if got := requiredTeaserSegments(204, 4); got != 4 {
-		t.Fatalf("required segments = %d, want planned count for longer video", got)
+	if got := requiredTeaserSegments(30, 4, true); got != 2 {
+		t.Fatalf("required segments = %d, want two at 30 seconds", got)
+	}
+	if got := requiredTeaserSegments(204, 4, true); got != 2 {
+		t.Fatalf("required segments = %d, want two for longer video", got)
+	}
+	if got := requiredTeaserSegments(204, 2, true); got != 2 {
+		t.Fatalf("required segments = %d, want full two-segment plan", got)
 	}
 }
 
@@ -267,7 +302,206 @@ func TestShouldProxy115FFmpegLinks(t *testing.T) {
 	if !shouldProxyFFmpegLink(&drives.StreamLink{URL: "https://cdnfhnfile.115cdn.net/file.mp4"}) {
 		t.Fatal("115 CDN link should use local ffmpeg proxy")
 	}
+	if !shouldProxyFFmpegLink(&drives.StreamLink{
+		URL:                  "https://webdav.example/dav/file.mp4",
+		PassThroughRedirects: true,
+	}) {
+		t.Fatal("redirect-passthrough link should use local ffmpeg proxy")
+	}
 	if shouldProxyFFmpegLink(&drives.StreamLink{URL: "https://download.example/file.mp4"}) {
 		t.Fatal("generic link should not use local ffmpeg proxy")
+	}
+}
+
+func TestPrepareFFmpegLinkDoesNotLeakWebDAVCredentialsToRedirectTarget(t *testing.T) {
+	originRequests := make(chan http.Header, 1)
+	targetRequests := make(chan http.Header, 1)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests <- r.Header.Clone()
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Range", "bytes 2-5/10")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "2345")
+	}))
+	t.Cleanup(target.Close)
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originRequests <- r.Header.Clone()
+		w.Header().Set("Location", target.URL+"/video.mp4")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	link := &drives.StreamLink{
+		URL: origin.URL + "/dav/video.mp4",
+		Headers: http.Header{
+			"Authorization":       {"Basic webdav-secret"},
+			"Cookie":              {"session=webdav-secret"},
+			"Proxy-Authorization": {"Basic proxy-secret"},
+			"User-Agent":          {"video-site-webdav"},
+		},
+		PassThroughRedirects: true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	proxied, cleanup, err := prepareFFmpegLink(ctx, link)
+	if err != nil {
+		t.Fatalf("prepare ffmpeg link: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if proxied.URL == link.URL {
+		t.Fatal("ffmpeg link was not replaced with a loopback proxy URL")
+	}
+	if proxied.Headers != nil {
+		t.Fatalf("proxied headers = %#v, want nil", proxied.Headers)
+	}
+	if proxied.PassThroughRedirects {
+		t.Fatal("loopback ffmpeg link should not expose upstream redirect semantics")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, proxied.URL, nil)
+	if err != nil {
+		t.Fatalf("new loopback request: %v", err)
+	}
+	req.Header.Set("Range", "bytes=2-5")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request loopback proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read loopback response: %v", err)
+	}
+	if resp.StatusCode != http.StatusPartialContent || string(body) != "2345" {
+		t.Fatalf("response = status %d body %q", resp.StatusCode, body)
+	}
+
+	originHeaders := <-originRequests
+	targetHeaders := <-targetRequests
+	if got := originHeaders.Get("Authorization"); got != "Basic webdav-secret" {
+		t.Fatalf("origin Authorization = %q, want WebDAV credentials", got)
+	}
+	if got := originHeaders.Get("Cookie"); got != "session=webdav-secret" {
+		t.Fatalf("origin Cookie = %q, want WebDAV cookie", got)
+	}
+	if got := originHeaders.Get("Range"); got != "bytes=2-5" {
+		t.Fatalf("origin Range = %q, want bytes=2-5", got)
+	}
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "Referer"} {
+		if got := targetHeaders.Get(name); got != "" {
+			t.Fatalf("%s leaked to redirect target: %q", name, got)
+		}
+	}
+	if got := targetHeaders.Get("Range"); got != "bytes=2-5" {
+		t.Fatalf("target Range = %q, want bytes=2-5", got)
+	}
+	if got := targetHeaders.Get("User-Agent"); got != "video-site-webdav" {
+		t.Fatalf("target User-Agent = %q, want video-site-webdav", got)
+	}
+}
+
+// newTeaserStubGenerator builds a Generator whose ffmpeg produces usable output
+// for the first okSegments segment invocations and leaves the output file empty
+// afterwards, which is the "damaged source" shape the degraded teaser path is
+// meant to handle.
+func newTeaserStubGenerator(t *testing.T, okSegments int) *Generator {
+	t.Helper()
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "segment-count")
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	script := fmt.Sprintf(`#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+case " $* " in
+  *" -f concat "*)
+    printf 'concat-output' > "$out"
+    exit 0
+    ;;
+esac
+count=$(cat %[1]q 2>/dev/null || echo 0)
+count=$((count + 1))
+printf '%%s' "$count" > %[1]q
+if [ "$count" -le %[2]d ]; then
+  printf 'segment-output' > "$out"
+fi
+exit 0
+`, counter, okSegments)
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffmpeg stub: %v", err)
+	}
+
+	ffprobe := filepath.Join(dir, "ffprobe")
+	probeScript := "#!/bin/sh\n" +
+		`printf '%s' '{"streams":[{"codec_type":"video","duration":"3.0"}],"format":{"duration":"3.0"}}'` + "\n"
+	if err := os.WriteFile(ffprobe, []byte(probeScript), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+
+	return New(Config{
+		FFmpegPath:  ffmpeg,
+		FFprobePath: ffprobe,
+		Width:       480,
+		LocalDir:    filepath.Join(dir, "preview"),
+	})
+}
+
+func TestGenerateSequentialAcceptsDegradedTeaserAndLogsIt(t *testing.T) {
+	gen := newTeaserStubGenerator(t, 2)
+	link := &drives.StreamLink{URL: filepath.Join(t.TempDir(), "video.mp4")}
+
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	path, err := gen.generateSequential(context.Background(), 204, func(int) (*drives.StreamLink, error) {
+		return link, nil
+	})
+	if err != nil {
+		t.Fatalf("generate sequential: %v", err)
+	}
+	if path == "" {
+		t.Fatal("expected a teaser path for the degraded result")
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if !strings.Contains(logs.String(), "degraded teaser accepted segments=2/4") {
+		t.Fatalf("logs = %q, want an explicit degraded-teaser record", logs.String())
+	}
+}
+
+func TestGenerateSequentialRejectsTeaserBelowDegradedFloor(t *testing.T) {
+	gen := newTeaserStubGenerator(t, 1)
+	link := &drives.StreamLink{URL: filepath.Join(t.TempDir(), "video.mp4")}
+
+	_, err := gen.generateSequential(context.Background(), 204, func(int) (*drives.StreamLink, error) {
+		return link, nil
+	})
+	if err == nil {
+		t.Fatal("expected an error: one usable segment is below the degraded floor")
+	}
+	if !strings.Contains(err.Error(), "only generated 1/4 teaser segments") {
+		t.Fatalf("error = %v, want the generated/planned segment count", err)
+	}
+}
+
+func TestGenerateSequentialKeepsFullPlanWhenEverySegmentWorks(t *testing.T) {
+	gen := newTeaserStubGenerator(t, 4)
+	link := &drives.StreamLink{URL: filepath.Join(t.TempDir(), "video.mp4")}
+
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	path, err := gen.generateSequential(context.Background(), 204, func(int) (*drives.StreamLink, error) {
+		return link, nil
+	})
+	if err != nil {
+		t.Fatalf("generate sequential: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if strings.Contains(logs.String(), "degraded teaser") {
+		t.Fatalf("logs = %q, want no degradation for a healthy source", logs.String())
 	}
 }

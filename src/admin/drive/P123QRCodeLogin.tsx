@@ -3,18 +3,6 @@ import { QrCode } from "lucide-react";
 import * as api from "../api";
 import { useToast } from "../ToastContext";
 
-function p123QRStatusClass(
-  status: api.P123QRStatus | null,
-  completed: boolean,
-  error: string
-): string {
-  if (completed || status?.loginStatus === 3) return "is-ok";
-  if (error || status?.loginStatus === 2 || status?.loginStatus === 4) {
-    return "is-error";
-  }
-  return "is-pending";
-}
-
 export function P123QRCodeLogin({ onToken }: { onToken: (token: string) => void }) {
   const { show } = useToast();
   const [session, setSession] = useState<api.P123QRSession | null>(null);
@@ -59,7 +47,7 @@ export function P123QRCodeLogin({ onToken }: { onToken: (token: string) => void 
           if (timer) window.clearInterval(timer);
           setCompleted(true);
           onToken(next.accessToken);
-          show("扫码成功，已填入 access_token，保存后生效", "success");
+          show("扫码成功，保存后生效", "success");
           return;
         }
         if (next.loginStatus === 2 || next.loginStatus === 4) {
@@ -82,15 +70,9 @@ export function P123QRCodeLogin({ onToken }: { onToken: (token: string) => void 
     };
   }, [session, completed, onToken, show]);
 
-  const statusText = completed
-    ? "已获取 token"
-    : pollingError || status?.statusText || (session ? "等待扫码" : "未生成二维码");
-  const statusClass = p123QRStatusClass(status, completed, pollingError);
-  const platform = status?.platformText ? ` · ${status.platformText}` : "";
-
   return (
     <div className="admin-form__row">
-      <label>扫码登录</label>
+      <label>方式一</label>
       <div className="admin-p123-qr">
         <div className="admin-p123-qr__actions">
           <button
@@ -102,10 +84,6 @@ export function P123QRCodeLogin({ onToken }: { onToken: (token: string) => void 
             <QrCode size={14} />
             {starting ? "生成中..." : session ? "重新生成二维码" : "生成二维码"}
           </button>
-          <span className={`admin-status ${statusClass}`}>
-            {statusText}
-            {platform}
-          </span>
         </div>
 
         {session && (
@@ -116,9 +94,11 @@ export function P123QRCodeLogin({ onToken }: { onToken: (token: string) => void 
               alt="123网盘扫码登录二维码"
             />
             <div className="admin-p123-qr__meta">
-              <div className="admin-form__help">
-                使用微信或 123网盘 App 扫码并确认登录；确认后系统会自动填入 access_token。
-              </div>
+              {pollingError && (
+                <div className="admin-form__help">
+                  {pollingError}
+                </div>
+              )}
               {session.expiresAt && (
                 <div className="admin-form__help">
                   过期时间：{new Date(session.expiresAt).toLocaleTimeString("zh-CN", {

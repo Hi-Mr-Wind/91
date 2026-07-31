@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS videos (
     fingerprint_status TEXT DEFAULT 'pending',  -- pending / ready / failed
     fingerprint_error  TEXT DEFAULT '',
     parent_id        TEXT,
+    dir_name         TEXT DEFAULT '',           -- 所在目录名（扫盘时落库，供标签重算使用）
     title            TEXT NOT NULL,
     author           TEXT,
     tags             TEXT,                      -- JSON array
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS videos (
     favorites        INTEGER DEFAULT 0,
     comments         INTEGER DEFAULT 0,
     likes            INTEGER DEFAULT 0,
+    last_liked_at    INTEGER DEFAULT 0,
     dislikes         INTEGER DEFAULT 0,
     hidden           INTEGER DEFAULT 0,          -- 1 = hidden from public display
     tags_manual      INTEGER DEFAULT 0,          -- 1 = user explicitly curated tags
@@ -43,22 +45,82 @@ CREATE TABLE IF NOT EXISTS videos (
 
 CREATE INDEX IF NOT EXISTS idx_videos_drive ON videos(drive_id, file_id);
 CREATE INDEX IF NOT EXISTS idx_videos_pub   ON videos(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos(duration_seconds);
 CREATE INDEX IF NOT EXISTS idx_videos_views ON videos(views DESC);
+
+-- 管理员提交的视频直链后台任务。source_url 只在任务排队或执行期间保留；
+-- 进入 completed / failed / canceled 后由状态更新语句立即清空。
+CREATE TABLE IF NOT EXISTS remote_upload_jobs (
+    sequence           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                 TEXT NOT NULL UNIQUE,
+    source_url         TEXT NOT NULL DEFAULT '',
+    source_label       TEXT NOT NULL DEFAULT '',
+    requested_title    TEXT NOT NULL DEFAULT '',
+    resolved_title     TEXT NOT NULL DEFAULT '',
+    tags               TEXT NOT NULL DEFAULT '[]',
+    state              TEXT NOT NULL
+                           CHECK (state IN (
+                               'queued', 'downloading', 'validating', 'saving',
+                               'completed', 'failed', 'canceled'
+                           )),
+    bytes_downloaded   INTEGER NOT NULL DEFAULT 0,
+    total_bytes        INTEGER NOT NULL DEFAULT 0,
+    cancel_requested   INTEGER NOT NULL DEFAULT 0,
+    error_message      TEXT NOT NULL DEFAULT '',
+    temp_file          TEXT NOT NULL DEFAULT '',
+    final_file         TEXT NOT NULL DEFAULT '',
+    completed_video_id TEXT NOT NULL DEFAULT '',
+    created_at         INTEGER NOT NULL,
+    started_at         INTEGER NOT NULL DEFAULT 0,
+    updated_at         INTEGER NOT NULL,
+    finished_at        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_remote_upload_jobs_queue
+    ON remote_upload_jobs(state, sequence);
+CREATE INDEX IF NOT EXISTS idx_remote_upload_jobs_recent
+    ON remote_upload_jobs(sequence DESC);
+CREATE INDEX IF NOT EXISTS idx_remote_upload_jobs_finished
+    ON remote_upload_jobs(finished_at);
+
+-- 视频详情页按“本次访问”记录的一张匿名临时选票。visit_id 由每次页面实例
+-- 随机生成，不关联账号、Cookie 或设备；刷新/重新进入会生成新的 visit_id。
+-- 保留 none 行可以让取消操作和重复请求保持幂等。
+CREATE TABLE IF NOT EXISTS video_reaction_visits (
+    video_id   TEXT NOT NULL,
+    visit_id   TEXT NOT NULL,
+    reaction   TEXT NOT NULL DEFAULT 'none'
+                   CHECK (reaction IN ('none', 'like', 'dislike')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (video_id, visit_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_reaction_visits_video
+    ON video_reaction_visits(video_id);
 
 -- 统一标签池
 CREATE TABLE IF NOT EXISTS tags (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    label      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    aliases    TEXT NOT NULL DEFAULT '[]',       -- JSON array
-    source     TEXT NOT NULL DEFAULT 'user',     -- system / user / collection / legacy
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    label       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    aliases     TEXT NOT NULL DEFAULT '[]',       -- JSON array，旧版别名数据，保留用于迁移兼容
+    -- 匹配规则 JSON：{"keywords":[],"matchAvCode":bool}
+    -- 为空时匹配器按 label+旧版 aliases 兜底。
+    match_rules TEXT NOT NULL DEFAULT '{}',
+    source      TEXT NOT NULL DEFAULT 'user',     -- builtin / user / generated
+    origin      TEXT NOT NULL DEFAULT '',         -- crawler 等来源型标签标记；不参与匹配来源归一
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS video_tags (
     video_id   TEXT NOT NULL,
     tag_id     INTEGER NOT NULL,
-    source     TEXT NOT NULL DEFAULT 'auto',     -- auto / manual / legacy
+    -- auto=规则引擎 / manual=人工 / legacy=旧数据回填 / crawler=爬虫脚本或爬虫名 /
+    -- series=番号系列 / propagated=同类传播
+    source     TEXT NOT NULL DEFAULT 'auto',
+    evidence   TEXT NOT NULL DEFAULT '',          -- 命中证据，如 "文件名:翘臀"
     created_at INTEGER NOT NULL,
     PRIMARY KEY (video_id, tag_id)
 );
@@ -66,25 +128,22 @@ CREATE TABLE IF NOT EXISTS video_tags (
 CREATE INDEX IF NOT EXISTS idx_video_tags_tag ON video_tags(tag_id);
 CREATE INDEX IF NOT EXISTS idx_video_tags_video ON video_tags(video_id);
 
--- 用户手动删除过的非系统标签。自动扫描/迁移不再重新创建同名标签；
--- 管理员手动新建同名标签时会移除这里的记录。
-CREATE TABLE IF NOT EXISTS deleted_tags (
-    label      TEXT PRIMARY KEY COLLATE NOCASE,
-    source     TEXT NOT NULL DEFAULT '',
-    deleted_at INTEGER NOT NULL
-);
-
--- 管理员显式删除过的视频。用于防止后续扫描 / 爬虫把同一个源文件
--- 再次入库；不代表原始云盘文件已被删除。
+-- 被拉黑、删除或自动去重的视频。用于防止后续扫描 / 爬虫把同一个源文件
+-- 再次入库；source_deleted 是旧版本兼容字段，源文件删除成功后会清除墓碑。
 CREATE TABLE IF NOT EXISTS deleted_videos (
-    id           TEXT PRIMARY KEY,
-    drive_id     TEXT NOT NULL DEFAULT '',
-    file_id      TEXT NOT NULL DEFAULT '',
-    content_hash TEXT NOT NULL DEFAULT '',
-    file_name    TEXT NOT NULL DEFAULT '',
-    size_bytes   INTEGER NOT NULL DEFAULT 0,
-    reason       TEXT NOT NULL DEFAULT '',
-    deleted_at   INTEGER NOT NULL
+    id                 TEXT PRIMARY KEY,
+    drive_id           TEXT NOT NULL DEFAULT '',
+    file_id            TEXT NOT NULL DEFAULT '',
+    parent_id          TEXT NOT NULL DEFAULT '',
+    content_hash       TEXT NOT NULL DEFAULT '',
+    file_name          TEXT NOT NULL DEFAULT '',
+    size_bytes         INTEGER NOT NULL DEFAULT 0,
+    reason             TEXT NOT NULL DEFAULT '',
+    source_deleted     INTEGER NOT NULL DEFAULT 0,
+    canonical_video_id TEXT NOT NULL DEFAULT '',
+    restore_requested  INTEGER NOT NULL DEFAULT 0,
+    restore_payload    TEXT NOT NULL DEFAULT '',
+    deleted_at         INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_file
@@ -111,6 +170,8 @@ CREATE TABLE IF NOT EXISTS crawler_seen_sources (
 
 CREATE INDEX IF NOT EXISTS idx_crawler_seen_sources_drive
     ON crawler_seen_sources(kind, drive_id, status);
+CREATE INDEX IF NOT EXISTS idx_crawler_seen_sources_video
+    ON crawler_seen_sources(kind, drive_id, status, canonical_video_id);
 
 -- 网盘账户
 CREATE TABLE IF NOT EXISTS drives (
@@ -151,6 +212,23 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
     expires_at INTEGER NOT NULL
 );
 
+-- 一次性视频分享。token_hash 只保存分享令牌摘要；首次领取时原子写入
+-- session_hash，此后只有持有对应 HttpOnly cookie 的浏览器可以继续播放。
+CREATE TABLE IF NOT EXISTS video_shares (
+    id                 TEXT PRIMARY KEY,
+    token_hash         TEXT NOT NULL UNIQUE,
+    video_id           TEXT NOT NULL,
+    created_at         INTEGER NOT NULL,
+    consumed_at        INTEGER NOT NULL DEFAULT 0,
+    session_hash       TEXT NOT NULL DEFAULT '',
+    session_expires_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_shares_video
+    ON video_shares(video_id);
+CREATE INDEX IF NOT EXISTS idx_video_shares_session
+    ON video_shares(id, session_hash, session_expires_at);
+
 -- 管理后台登录永久封禁 IP
 CREATE TABLE IF NOT EXISTS banned_login_ips (
     ip         TEXT PRIMARY KEY,
@@ -174,3 +252,32 @@ CREATE TABLE IF NOT EXISTS users (
     banned     INTEGER NOT NULL DEFAULT 0,       -- 1 = 被封禁
     created_at INTEGER NOT NULL
 );
+
+-- 内容级查重疑似区（near-miss）复核队列：夜间维护写入，管理后台裁决。
+-- (left_video_id, right_video_id) 按字典序归一化，同一对只存一行；
+-- status=dismissed 的对不会被夜间维护重新写回。
+CREATE TABLE IF NOT EXISTS duplicate_review_pairs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    left_video_id  TEXT NOT NULL,
+    right_video_id TEXT NOT NULL,
+    median_ssim    REAL NOT NULL DEFAULT 0,
+    min_ssim       REAL NOT NULL DEFAULT 0,
+    comparisons    INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'pending', -- pending / merged / dismissed
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    UNIQUE(left_video_id, right_video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_duplicate_review_pairs_status
+    ON duplicate_review_pairs(status, updated_at DESC);
+
+-- 短视频随机 feed 会话快照：token → 洗牌后的可见视频 id 列表（JSON 数组）。
+-- 持久化让后端重启/更新不再使旧 token 失效，前端可从上次游标续播同一轮。
+-- 过期与数量上限由 API 层在写入时清理。
+CREATE TABLE IF NOT EXISTS shorts_feed_sessions (
+    token       TEXT PRIMARY KEY,
+    video_ids   TEXT NOT NULL,
+    last_access INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shorts_feed_sessions_last_access
+    ON shorts_feed_sessions(last_access);

@@ -11,8 +11,8 @@ type Props = {
 };
 
 const sortOptions: { key: SortKey; label: string }[] = [
-  { key: "latest", label: "最新" },
   { key: "hot", label: "最热" },
+  { key: "latest", label: "最新" },
   { key: "recent", label: "最近观看" },
 ];
 

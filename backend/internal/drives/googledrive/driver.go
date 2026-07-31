@@ -30,7 +30,6 @@ const (
 	defaultAPIBaseURL   = "https://www.googleapis.com/drive/v3"
 	defaultUploadAPIURL = "https://www.googleapis.com/upload/drive/v3"
 	defaultOAuthURL     = "https://www.googleapis.com/oauth2/v4/token"
-	defaultRenewAPIURL  = "https://api.oplist.org/googleui/renewapi"
 	defaultListInterval = 1 * time.Second
 	defaultListCooldown = 5 * time.Minute
 	defaultLinkCooldown = 5 * time.Minute
@@ -47,8 +46,6 @@ type Driver struct {
 	accessToken   string
 	clientID      string
 	clientSecret  string
-	useOnlineAPI  bool
-	renewAPIURL   string
 	oauthURL      string
 	apiBaseURL    string
 	uploadBaseURL string
@@ -73,8 +70,6 @@ type Config struct {
 	AccessToken  string
 	ClientID     string
 	ClientSecret string
-	UseOnlineAPI bool
-	RenewAPIURL  string
 	OAuthURL     string
 	APIBaseURL   string
 	UploadAPIURL string
@@ -86,10 +81,6 @@ func New(c Config) *Driver {
 	rootID := strings.TrimSpace(c.RootID)
 	if rootID == "" {
 		rootID = "root"
-	}
-	renewAPIURL := strings.TrimSpace(c.RenewAPIURL)
-	if renewAPIURL == "" {
-		renewAPIURL = defaultRenewAPIURL
 	}
 	oauthURL := strings.TrimSpace(c.OAuthURL)
 	if oauthURL == "" {
@@ -110,8 +101,6 @@ func New(c Config) *Driver {
 		accessToken:   strings.TrimSpace(c.AccessToken),
 		clientID:      strings.TrimSpace(c.ClientID),
 		clientSecret:  strings.TrimSpace(c.ClientSecret),
-		useOnlineAPI:  c.UseOnlineAPI,
-		renewAPIURL:   renewAPIURL,
 		oauthURL:      oauthURL,
 		apiBaseURL:    apiBaseURL,
 		uploadBaseURL: uploadBaseURL,
@@ -666,29 +655,8 @@ func googleUploadRateLimitError(status int, header http.Header, body []byte, mes
 }
 
 func (d *Driver) refresh(ctx context.Context) error {
-	if d.useOnlineAPI && d.renewAPIURL != "" {
-		var out tokenResp
-		res, err := d.client.R().
-			SetContext(ctx).
-			SetQueryParams(map[string]string{
-				"refresh_ui": d.refreshToken,
-				"server_use": "true",
-				"driver_txt": "googleui_go",
-			}).
-			SetResult(&out).
-			SetError(&out).
-			Get(d.renewAPIURL)
-		if err != nil {
-			return fmt.Errorf("googledrive refresh token: %w", err)
-		}
-		if err := tokenResponseError("googledrive refresh token", res, out, true); err != nil {
-			return err
-		}
-		d.applyToken(out)
-		return nil
-	}
 	if d.clientID == "" || d.clientSecret == "" {
-		return errors.New("googledrive refresh token: client_id and client_secret are required when online API is disabled")
+		return errors.New("googledrive refresh token: client_id and client_secret are required")
 	}
 	var out tokenResp
 	res, err := d.client.R().
@@ -705,7 +673,7 @@ func (d *Driver) refresh(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("googledrive refresh token: %w", err)
 	}
-	if err := tokenResponseError("googledrive refresh token", res, out, false); err != nil {
+	if err := tokenResponseError("googledrive refresh token", res, out); err != nil {
 		return err
 	}
 	d.applyToken(out)
@@ -722,7 +690,7 @@ func (d *Driver) applyToken(out tokenResp) {
 	}
 }
 
-func tokenResponseError(prefix string, res *resty.Response, out tokenResp, requireRefresh bool) error {
+func tokenResponseError(prefix string, res *resty.Response, out tokenResp) error {
 	if isGoogleTokenRateLimit(res, out) {
 		message := strings.TrimSpace(out.Text)
 		if message == "" {
@@ -755,7 +723,7 @@ func tokenResponseError(prefix string, res *resty.Response, out tokenResp, requi
 	if res != nil && res.IsError() {
 		return fmt.Errorf("%s: status=%d body=%s", prefix, res.StatusCode(), strings.TrimSpace(res.String()))
 	}
-	if out.AccessToken == "" || (requireRefresh && out.RefreshToken == "") {
+	if out.AccessToken == "" {
 		return fmt.Errorf("%s: empty token", prefix)
 	}
 	return nil

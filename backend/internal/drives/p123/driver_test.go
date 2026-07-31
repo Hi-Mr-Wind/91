@@ -155,10 +155,20 @@ func TestInitUsesAccessTokenWithoutLogin(t *testing.T) {
 	}
 }
 
-func TestLoginRiskErrorSuggestsAccessToken(t *testing.T) {
+func TestDefaultAPIBaseMatchesCurrentWebAPIHost(t *testing.T) {
+	d := New(Config{ID: "123-main"})
+	if d.mainAPIBase != "https://api.123278.com/b/api" {
+		t.Fatalf("main api base = %q", d.mainAPIBase)
+	}
+	if d.loginAPIBase != "https://api.123278.com/b/api" {
+		t.Fatalf("login api base = %q", d.loginAPIBase)
+	}
+}
+
+func TestLoginRiskErrorSuggestsQRCodeLogin(t *testing.T) {
 	err := loginError("当前账号存在境外登录风险，请使用短信验证码或者微信进行登录。")
-	if err == nil || !strings.Contains(err.Error(), "access_token") {
-		t.Fatalf("loginError() = %v, want access_token guidance", err)
+	if err == nil || !strings.Contains(err.Error(), "扫码登录") {
+		t.Fatalf("loginError() = %v, want qr login guidance", err)
 	}
 }
 

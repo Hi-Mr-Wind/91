@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,12 +97,13 @@ func TestCrawlerRunOnceImportsLocalFileAndSkipsExisting(t *testing.T) {
 
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	c := NewCrawler(CrawlerConfig{
-		Driver:      drv,
-		Catalog:     cat,
-		CrawlerName: "Demo Crawler",
-		PythonPath:  wrapper,
-		FFprobePath: writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:  dummyScript,
+		Driver:              drv,
+		Catalog:             cat,
+		CrawlerName:         "Demo Crawler",
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -164,12 +166,13 @@ func TestCrawlerRunOnceMarksPreviewDisabledWhenConfigured(t *testing.T) {
 
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	c := NewCrawler(CrawlerConfig{
-		Driver:         drv,
-		Catalog:        cat,
-		PythonPath:     wrapper,
-		FFprobePath:    writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:     dummyScript,
-		DisablePreview: true,
+		Driver:              drv,
+		Catalog:             cat,
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
+		DisablePreview:      true,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -235,12 +238,13 @@ func TestCrawlerRunOnceUsesCurrentDrivePreviewSwitch(t *testing.T) {
 
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	c := NewCrawler(CrawlerConfig{
-		Driver:         drv,
-		Catalog:        cat,
-		PythonPath:     wrapper,
-		FFprobePath:    writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:     dummyScript,
-		DisablePreview: true,
+		Driver:              drv,
+		Catalog:             cat,
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
+		DisablePreview:      true,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -286,11 +290,12 @@ func TestCrawlerRunOnceUsesDefaultCrawlerNamespace(t *testing.T) {
 
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	c := NewCrawler(CrawlerConfig{
-		Driver:      drv,
-		Catalog:     cat,
-		PythonPath:  wrapper,
-		FFprobePath: writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:  dummyScript,
+		Driver:              drv,
+		Catalog:             cat,
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -347,12 +352,13 @@ func TestCrawlerRunOncePassesAbsoluteJobPathsWhenWorkDirDiffers(t *testing.T) {
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_ASSERT_ABS", "1")
 	c := NewCrawler(CrawlerConfig{
-		Driver:      drv,
-		Catalog:     cat,
-		PythonPath:  wrapper,
-		FFprobePath: writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:  dummyScript,
-		WorkDir:     scriptDir,
+		Driver:              drv,
+		Catalog:             cat,
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
+		WorkDir:             scriptDir,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -405,12 +411,13 @@ func TestCrawlerRunOnceImportsSimpleMediaURLWithoutSourceID(t *testing.T) {
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_SIMPLE", "1")
 	t.Setenv("GO_SCRIPTCRAWLER_MEDIA_URL", srv.URL+"/video.mp4?token=first")
 	c := NewCrawler(CrawlerConfig{
-		Driver:      drv,
-		Catalog:     cat,
-		PythonPath:  wrapper,
-		FFprobePath: writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:  dummyScript,
-		HTTPClient:  srv.Client(),
+		Driver:              drv,
+		Catalog:             cat,
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
+		HTTPClient:          srv.Client(),
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -444,6 +451,140 @@ func TestCrawlerRunOnceImportsSimpleMediaURLWithoutSourceID(t *testing.T) {
 	}
 	if res.NewVideos != 0 || res.Skipped != 1 {
 		t.Fatalf("second result = new:%d skipped:%d, want 0/1", res.NewVideos, res.Skipped)
+	}
+}
+
+func TestCrawlerRunOnceSkipsThenRestoresRetainedLocalVideo(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	var requests atomic.Int32
+	var failRemote atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/video.mp4" {
+			http.NotFound(w, r)
+			return
+		}
+		requests.Add(1)
+		if failRemote.Load() {
+			http.Error(w, "remote unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("restored-video-bytes"))
+	}))
+	defer srv.Close()
+
+	drv := New(Config{ID: "demo", RootDir: filepath.Join(tmp, "crawler")})
+	if err := drv.Init(ctx); err != nil {
+		t.Fatalf("driver init: %v", err)
+	}
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            drv.ID(),
+		Kind:          Kind,
+		Name:          "Demo",
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	dummyScript := filepath.Join(tmp, "helper-script")
+	if err := os.WriteFile(dummyScript, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write dummy script: %v", err)
+	}
+	wrapper := filepath.Join(tmp, "helper-wrapper.sh")
+	wrapperScript := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestScriptCrawlerHelperProcess \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatalf("write helper wrapper: %v", err)
+	}
+
+	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
+	t.Setenv("GO_WANT_SCRIPTCRAWLER_SIMPLE", "1")
+	t.Setenv("GO_SCRIPTCRAWLER_MEDIA_URL", srv.URL+"/video.mp4?token=restore")
+	c := NewCrawler(CrawlerConfig{
+		Driver:              drv,
+		Catalog:             cat,
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
+		HTTPClient:          srv.Client(),
+	})
+	res, err := c.RunOnce(ctx, 1)
+	if err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	if res.NewVideos != 1 || res.Failed != 0 {
+		t.Fatalf("result = new:%d failed:%d, want 1/0", res.NewVideos, res.Failed)
+	}
+	videos, err := cat.ListVideosByDrive(ctx, "demo")
+	if err != nil {
+		t.Fatalf("list videos: %v", err)
+	}
+	if len(videos) != 1 {
+		t.Fatalf("videos = %d, want 1", len(videos))
+	}
+	v := videos[0]
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+	localPath := filepath.Join(drv.VideosDir(), v.FileID)
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("read local video: %v", err)
+	}
+	if string(data) != "restored-video-bytes" {
+		t.Fatalf("local data = %q", data)
+	}
+
+	if err := cat.DeleteVideoWithTombstone(ctx, v.ID); err != nil {
+		t.Fatalf("delete with tombstone: %v", err)
+	}
+	if err := cat.RemoveDeletedVideo(ctx, v.ID); err != nil {
+		t.Fatalf("remove deleted video: %v", err)
+	}
+	failRemote.Store(true)
+	res, err = c.RunOnce(ctx, 1)
+	if err != nil {
+		t.Fatalf("restore run: %v", err)
+	}
+	if res.NewVideos != 0 || res.Skipped != 1 || res.Failed != 0 {
+		t.Fatalf("restore crawl result = new:%d skipped:%d failed:%d, want 0/1/0", res.NewVideos, res.Skipped, res.Failed)
+	}
+	if res.SeenSnapshot != 1 {
+		t.Fatalf("restore crawl seen snapshot = %d, want pending source treated as seen", res.SeenSnapshot)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests after skipped restore candidate = %d, want 1", got)
+	}
+	if _, err := cat.GetVideo(ctx, v.ID); err == nil {
+		t.Fatal("video restored during crawl, want restore only after pipeline completion")
+	}
+	restoredCount, err := c.RestoreRequestedVideos(ctx)
+	if err != nil {
+		t.Fatalf("scan retained videos: %v", err)
+	}
+	if restoredCount != 1 {
+		t.Fatalf("restored count = %d, want 1", restoredCount)
+	}
+	restored, err := cat.GetVideo(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("get restored video: %v", err)
+	}
+	if restored.FileID != v.FileID || restored.Size != int64(len("restored-video-bytes")) {
+		t.Fatalf("restored video = file:%q size:%d, want %q/%d", restored.FileID, restored.Size, v.FileID, len("restored-video-bytes"))
+	}
+	if restored.Title != v.Title || restored.PreviewStatus != "pending" {
+		t.Fatalf("restored metadata = title:%q preview:%q, want %q/pending", restored.Title, restored.PreviewStatus, v.Title)
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, v.ID); err != nil || deleted {
+		t.Fatalf("restored video tombstone remains: deleted=%v err=%v", deleted, err)
 	}
 }
 
@@ -513,11 +654,12 @@ func TestCrawlerRunOnceSkipsFingerprintDuplicateAndContinues(t *testing.T) {
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_DUP_UNIQUE", "1")
 	c := NewCrawler(CrawlerConfig{
-		Driver:      drv,
-		Catalog:     cat,
-		PythonPath:  wrapper,
-		FFprobePath: writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:  dummyScript,
+		Driver:              drv,
+		Catalog:             cat,
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -705,7 +847,6 @@ func TestCrawlerProcessItemKeepsLargerNearDuplicate(t *testing.T) {
 	imported, err := c.processItem(ctx, Item{
 		SourceID:        "larger-source",
 		Title:           "91 Test Larger Candidate 1215516 - source suffix",
-		Author:          "helper",
 		DurationSeconds: 257,
 		Media:           MediaRef{LocalFile: mediaPath},
 		Thumbnail:       MediaRef{LocalFile: thumbPath},
@@ -728,6 +869,9 @@ func TestCrawlerProcessItemKeepsLargerNearDuplicate(t *testing.T) {
 	}
 	if larger.Size <= 5 {
 		t.Fatalf("larger size = %d, want > 5", larger.Size)
+	}
+	if larger.Author != "" {
+		t.Fatalf("larger author = %q, want empty when crawler omits author", larger.Author)
 	}
 }
 
@@ -759,12 +903,13 @@ func TestCrawlerRunOnceRejectsInvalidDownloadedVideo(t *testing.T) {
 
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	c := NewCrawler(CrawlerConfig{
-		Driver:      drv,
-		Catalog:     cat,
-		CrawlerName: "Demo Crawler",
-		PythonPath:  wrapper,
-		FFprobePath: writeScriptCrawlerFFprobeStub(t, tmp, false),
-		ScriptPath:  dummyScript,
+		Driver:              drv,
+		Catalog:             cat,
+		CrawlerName:         "Demo Crawler",
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, false),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -819,13 +964,14 @@ func TestCrawlerRunOnceDownloadsHLSMediaURL(t *testing.T) {
 	ffmpegArgsFile := filepath.Join(tmp, "ffmpeg-args.txt")
 	t.Setenv("GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE", ffmpegArgsFile)
 	c := NewCrawler(CrawlerConfig{
-		Driver:      drv,
-		Catalog:     cat,
-		CrawlerName: "Demo Crawler",
-		PythonPath:  wrapper,
-		FFmpegPath:  writeScriptCrawlerFFmpegStub(t, tmp),
-		FFprobePath: writeScriptCrawlerFFprobeStub(t, tmp, true),
-		ScriptPath:  dummyScript,
+		Driver:              drv,
+		Catalog:             cat,
+		CrawlerName:         "Demo Crawler",
+		PythonPath:          wrapper,
+		FFmpegPath:          writeScriptCrawlerFFmpegStub(t, tmp),
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
 	})
 	res, err := c.RunOnce(ctx, 1)
 	if err != nil {
@@ -862,6 +1008,154 @@ func TestCrawlerRunOnceDownloadsHLSMediaURL(t *testing.T) {
 		if !strings.Contains(argsText, want) {
 			t.Fatalf("ffmpeg args missing %q in:\n%s", strings.TrimSpace(want), string(argsData))
 		}
+	}
+}
+
+func TestPruneCrawlDirKeepsRecentHistory(t *testing.T) {
+	dir := t.TempDir()
+	writeFile := func(name string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return path
+	}
+	var seenNames, jobNames []string
+	for i := 0; i < crawlHistoryKeep+3; i++ {
+		runID := fmt.Sprintf("20250101T00000%dZ", i)
+		seenNames = append(seenNames, "seen-"+runID+".txt")
+		jobNames = append(jobNames, "job-"+runID+".json")
+		writeFile(seenNames[i])
+		writeFile(jobNames[i])
+	}
+	freshPart := writeFile("seen-20250102T000000Z.txt.part")
+	stalePart := writeFile("job-20240101T000000Z.json.part")
+	old := time.Now().Add(-2 * crawlPartMaxAge)
+	if err := os.Chtimes(stalePart, old, old); err != nil {
+		t.Fatalf("age stale part: %v", err)
+	}
+	unrelated := writeFile("notes.txt")
+	matchingDir := filepath.Join(dir, "seen-20250103T000000Z.txt")
+	if err := os.Mkdir(matchingDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	pruneCrawlDir(dir)
+
+	pruned := append(append([]string{}, seenNames[:3]...), jobNames[:3]...)
+	for _, name := range pruned {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s should be pruned, stat err=%v", name, err)
+		}
+	}
+	kept := append(append([]string{}, seenNames[3:]...), jobNames[3:]...)
+	for _, name := range kept {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s should survive: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(freshPart); err != nil {
+		t.Fatalf("fresh .part should survive: %v", err)
+	}
+	if _, err := os.Stat(stalePart); !os.IsNotExist(err) {
+		t.Fatalf("stale .part should be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("unrelated file should survive: %v", err)
+	}
+	if _, err := os.Stat(matchingDir); err != nil {
+		t.Fatalf("directory should survive: %v", err)
+	}
+}
+
+func TestCrawlerRunOncePrunesCrawlHistory(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	drv := New(Config{ID: "demo", RootDir: filepath.Join(tmp, "crawler")})
+	if err := drv.Init(ctx); err != nil {
+		t.Fatalf("driver init: %v", err)
+	}
+	crawlDir := drv.CrawlDir()
+	var staleSeen, staleJobs []string
+	for i := 0; i < crawlHistoryKeep+2; i++ {
+		runID := fmt.Sprintf("20250101T00000%dZ", i)
+		staleSeen = append(staleSeen, "seen-"+runID+".txt")
+		staleJobs = append(staleJobs, "job-"+runID+".json")
+		for _, name := range []string{staleSeen[i], staleJobs[i]} {
+			if err := os.WriteFile(filepath.Join(crawlDir, name), []byte("x"), 0o644); err != nil {
+				t.Fatalf("seed %s: %v", name, err)
+			}
+		}
+	}
+	dummyScript := filepath.Join(tmp, "helper-script")
+	if err := os.WriteFile(dummyScript, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write dummy script: %v", err)
+	}
+	wrapper := filepath.Join(tmp, "helper-wrapper.sh")
+	wrapperScript := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestScriptCrawlerHelperProcess \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatalf("write helper wrapper: %v", err)
+	}
+
+	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
+	c := NewCrawler(CrawlerConfig{
+		Driver:              drv,
+		Catalog:             cat,
+		CrawlerName:         "Demo Crawler",
+		PythonPath:          wrapper,
+		FFprobePath:         writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:          dummyScript,
+		SkipProtocolRefresh: true,
+	})
+	res, err := c.RunOnce(ctx, 1)
+	if err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+
+	for _, name := range []string{staleSeen[0], staleSeen[1], staleJobs[0], staleJobs[1]} {
+		if _, err := os.Stat(filepath.Join(crawlDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s should be pruned, stat err=%v", name, err)
+		}
+	}
+	for i := 2; i < len(staleSeen); i++ {
+		for _, name := range []string{staleSeen[i], staleJobs[i]} {
+			if _, err := os.Stat(filepath.Join(crawlDir, name)); err != nil {
+				t.Fatalf("%s should survive: %v", name, err)
+			}
+		}
+	}
+	if _, err := os.Stat(res.SeenFile); err != nil {
+		t.Fatalf("current run seen file: %v", err)
+	}
+	if _, err := os.Stat(res.JobFile); err != nil {
+		t.Fatalf("current run job file: %v", err)
+	}
+	entries, err := os.ReadDir(crawlDir)
+	if err != nil {
+		t.Fatalf("read crawl dir: %v", err)
+	}
+	seenCount, jobCount := 0, 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "seen-") && strings.HasSuffix(name, ".txt") {
+			seenCount++
+		}
+		if strings.HasPrefix(name, "job-") && strings.HasSuffix(name, ".json") {
+			jobCount++
+		}
+	}
+	if seenCount != crawlHistoryKeep+1 || jobCount != crawlHistoryKeep+1 {
+		t.Fatalf("crawl dir = %d seen / %d job files, want %d each", seenCount, jobCount, crawlHistoryKeep+1)
 	}
 }
 

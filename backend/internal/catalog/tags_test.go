@@ -3,10 +3,13 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/video-site/backend/internal/tagging"
 )
 
 func TestListVideosNeedingThumbnailIncludesExistingThumbnailMissingDuration(t *testing.T) {
@@ -119,7 +122,7 @@ func TestListVideosNeedingThumbnailIncludesExistingThumbnailMissingDuration(t *t
 	}
 }
 
-func TestCreateTagAndClassifyAddsTagToMatchingExistingVideos(t *testing.T) {
+func TestCreateTagAndClassifyMatchesExistingVideos(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -180,6 +183,35 @@ func TestCreateTagAndClassifyAddsTagToMatchingExistingVideos(t *testing.T) {
 	}
 }
 
+func TestUpsertVideoMatchesExistingTagsForNewVideo(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "new-auto-tagged",
+		DriveID:     "drive",
+		FileID:      "file-auto",
+		Title:       "大奶揉胸合集",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("upsert video: %v", err)
+	}
+	got, err := cat.GetVideo(ctx, "new-auto-tagged")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if !sameStrings(got.Tags, []string{"奶子"}) {
+		t.Fatalf("new video tags = %#v, want 奶子", got.Tags)
+	}
+}
+
 func TestDeleteTagRemovesTagFromVideos(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
@@ -207,6 +239,9 @@ func TestDeleteTagRemovesTagFromVideos(t *testing.T) {
 	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
 		t.Fatalf("create tag: %v", err)
 	}
+	if err := cat.SetManualVideoTags(ctx, "video-1", []string{"清纯"}); err != nil {
+		t.Fatalf("set manual tag: %v", err)
+	}
 
 	tag := mustTagByLabel(t, ctx, cat, "清纯")
 	removed, err := cat.DeleteTag(ctx, tag.ID)
@@ -231,7 +266,7 @@ func TestDeleteTagRemovesTagFromVideos(t *testing.T) {
 	}
 }
 
-func TestCreateTagAndClassifyRestoresDeletedTag(t *testing.T) {
+func TestCreateTagAndClassifyRecreatesDeletedTag(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -318,12 +353,15 @@ func TestEnsureTagForVideoIDPrefixBackfillsSourceTag(t *testing.T) {
 		}
 	}
 
-	added, err := cat.EnsureTagForVideoIDPrefix(ctx, "scriptcrawler-crawler-a-", "crawler-tag", nil, "system")
+	added, err := cat.EnsureCrawlerTagForVideoIDPrefix(ctx, "scriptcrawler-crawler-a-", "crawler-tag")
 	if err != nil {
 		t.Fatalf("ensure prefix tag: %v", err)
 	}
-	if added != 1 {
-		t.Fatalf("added = %d, want 1", added)
+	if added != 2 {
+		t.Fatalf("added = %d, want 2", added)
+	}
+	if tag := mustTagByLabel(t, ctx, cat, "crawler-tag"); tag.Source != "generated" {
+		t.Fatalf("crawler tag source = %q, want generated", tag.Source)
 	}
 	got, err := cat.GetVideo(ctx, "scriptcrawler-crawler-a-source001")
 	if err != nil {
@@ -336,8 +374,8 @@ func TestEnsureTagForVideoIDPrefixBackfillsSourceTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get manual video: %v", err)
 	}
-	if len(manual.Tags) != 0 {
-		t.Fatalf("manual video tags = %#v, want unchanged", manual.Tags)
+	if !sameStrings(manual.Tags, []string{"crawler-tag"}) {
+		t.Fatalf("manual video tags = %#v, want crawler-tag", manual.Tags)
 	}
 	other, err := cat.GetVideo(ctx, "scriptcrawler-other-source003")
 	if err != nil {
@@ -348,7 +386,7 @@ func TestEnsureTagForVideoIDPrefixBackfillsSourceTag(t *testing.T) {
 	}
 }
 
-func TestDeleteTagRejectsSystemTags(t *testing.T) {
+func TestAutoGenerateTagsSettingPreventsNewGeneratedTags(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -360,17 +398,382 @@ func TestDeleteTagRejectsSystemTags(t *testing.T) {
 		}
 	})
 
-	tag := mustTagByLabel(t, ctx, cat, "AV")
-	if _, err := cat.DeleteTag(ctx, tag.ID); !errors.Is(err, ErrSystemTag) {
-		t.Fatalf("delete system tag err = %v, want ErrSystemTag", err)
+	enabled, err := cat.AutoGenerateTagsEnabled(ctx)
+	if err != nil {
+		t.Fatalf("read default setting: %v", err)
+	}
+	if enabled {
+		t.Fatal("auto-generate tags should default to disabled")
 	}
 
-	if tag := mustTagByLabel(t, ctx, cat, "AV"); tag.Source != "system" {
-		t.Fatalf("AV source = %q, want system", tag.Source)
+	if err := cat.SetAutoGenerateTagsEnabled(ctx, false); err != nil {
+		t.Fatalf("disable auto-generate tags: %v", err)
+	}
+	enabled, err = cat.AutoGenerateTagsEnabled(ctx)
+	if err != nil {
+		t.Fatalf("read disabled setting: %v", err)
+	}
+	if enabled {
+		t.Fatal("auto-generate tags setting stayed enabled")
+	}
+
+	if _, err := cat.EnsureTag(ctx, "new-auto", "generated"); !errors.Is(err, ErrAutoTagGenerationDisabled) {
+		t.Fatalf("ensure new generated tag err = %v, want ErrAutoTagGenerationDisabled", err)
+	}
+	if _, err := cat.getTagByLabel(ctx, "new-auto"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("new generated tag exists: %v", err)
+	}
+
+	if err := cat.SetAutoGenerateTagsEnabled(ctx, true); err != nil {
+		t.Fatalf("enable auto-generate tags: %v", err)
+	}
+	enabled, err = cat.AutoGenerateTagsEnabled(ctx)
+	if err != nil {
+		t.Fatalf("read re-enabled setting: %v", err)
+	}
+	if enabled {
+		t.Fatal("auto-generate tags should stay disabled")
+	}
+
+	userTag, err := cat.EnsureTag(ctx, "manual-tag", "user")
+	if err != nil {
+		t.Fatalf("ensure user tag while disabled: %v", err)
+	}
+	if userTag.Source != "user" {
+		t.Fatalf("user tag source = %q, want user", userTag.Source)
+	}
+
+	crawlerTag, err := cat.EnsureCrawlerTag(ctx, "Crawler Owner")
+	if err != nil {
+		t.Fatalf("ensure crawler tag while disabled: %v", err)
+	}
+	if crawlerTag.Source != "generated" {
+		t.Fatalf("crawler tag source = %q, want generated", crawlerTag.Source)
+	}
+	if _, err := cat.DeleteTag(ctx, crawlerTag.ID); err != nil {
+		t.Fatalf("delete crawler tag: %v", err)
+	}
+	restoredCrawlerTag, err := cat.EnsureCrawlerTag(ctx, "Crawler Owner")
+	if err != nil {
+		t.Fatalf("restore crawler tag while disabled: %v", err)
+	}
+	if restoredCrawlerTag.Source != "generated" {
+		t.Fatalf("restored crawler tag source = %q, want generated", restoredCrawlerTag.Source)
 	}
 }
 
-func TestOpenClassifiesSystemTagsForExistingVideos(t *testing.T) {
+func TestEnsureCrawlerTagForVideoIDPrefixIgnoresAutoGenerateSetting(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.SetAutoGenerateTagsEnabled(ctx, false); err != nil {
+		t.Fatalf("disable auto-generate tags: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "scriptcrawler-demo-source001",
+		DriveID:     "demo",
+		FileID:      "source001",
+		Title:       "crawler video",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed crawler video: %v", err)
+	}
+	if _, err := cat.EnsureTag(ctx, "manual-only", "user"); err != nil {
+		t.Fatalf("seed manual tag: %v", err)
+	}
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "scriptcrawler-demo-source002",
+		DriveID:     "demo",
+		FileID:      "source002",
+		Title:       "manual crawler video",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed manual crawler video: %v", err)
+	}
+	if err := cat.SetManualVideoTags(ctx, "scriptcrawler-demo-source002", []string{"manual-only"}); err != nil {
+		t.Fatalf("lock manual crawler video: %v", err)
+	}
+	added, err := cat.EnsureCrawlerTagForVideoIDPrefix(ctx, "scriptcrawler-demo-", "Demo Crawler")
+	if err != nil {
+		t.Fatalf("ensure crawler tag prefix: %v", err)
+	}
+	if added != 2 {
+		t.Fatalf("added = %d, want 2", added)
+	}
+	got, err := cat.GetVideo(ctx, "scriptcrawler-demo-source001")
+	if err != nil {
+		t.Fatalf("get crawler video: %v", err)
+	}
+	if !sameStrings(got.Tags, []string{"Demo Crawler"}) {
+		t.Fatalf("crawler video tags = %#v, want Demo Crawler", got.Tags)
+	}
+	manual, err := cat.GetVideo(ctx, "scriptcrawler-demo-source002")
+	if err != nil {
+		t.Fatalf("get manual crawler video: %v", err)
+	}
+	if !sameStrings(manual.Tags, []string{"manual-only", "Demo Crawler"}) {
+		t.Fatalf("manual crawler video tags = %#v, want manual-only + Demo Crawler", manual.Tags)
+	}
+
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "other-crawler-video",
+		DriveID:     "demo",
+		FileID:      "source003",
+		Title:       "direct manual crawler video",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed direct manual crawler video: %v", err)
+	}
+	if err := cat.SetManualVideoTags(ctx, "other-crawler-video", []string{"manual-only"}); err != nil {
+		t.Fatalf("lock direct manual crawler video: %v", err)
+	}
+	changed, err := cat.EnsureCrawlerTagForVideo(ctx, "other-crawler-video", "Direct Crawler")
+	if err != nil {
+		t.Fatalf("ensure direct crawler tag: %v", err)
+	}
+	if !changed {
+		t.Fatal("direct crawler tag did not report a change")
+	}
+	direct, err := cat.GetVideo(ctx, "other-crawler-video")
+	if err != nil {
+		t.Fatalf("get direct manual crawler video: %v", err)
+	}
+	if !sameStrings(direct.Tags, []string{"manual-only", "Direct Crawler"}) {
+		t.Fatalf("direct manual crawler video tags = %#v, want manual-only + Direct Crawler", direct.Tags)
+	}
+}
+
+func TestEnsureCrawlerTagForVideoIDPrefixDoesNotCreateTagWithoutVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	added, err := cat.EnsureCrawlerTagForVideoIDPrefix(ctx, "scriptcrawler-empty-", "Empty Crawler")
+	if err != nil {
+		t.Fatalf("ensure empty crawler tag prefix: %v", err)
+	}
+	if added != 0 {
+		t.Fatalf("added = %d, want 0", added)
+	}
+	if _, err := cat.getTagByLabel(ctx, "Empty Crawler"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty crawler tag was created: %v", err)
+	}
+}
+
+func TestDeleteTagAllowsBuiltinTagsWithoutMaintenanceReseed(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	label := "美臀"
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+
+	tag := mustTagByLabel(t, ctx, cat, label)
+	if _, err := cat.DeleteTag(ctx, tag.ID); err != nil {
+		t.Fatalf("delete builtin tag: %v", err)
+	}
+	if _, err := cat.getTagByLabel(ctx, label); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted builtin tag still exists: %v", err)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if _, err := reopened.getTagByLabel(ctx, label); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted builtin tag was recreated on reopen: %v", err)
+	}
+	if err := reopened.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("post-startup maintenance with deleted builtin tag: %v", err)
+	}
+	if _, err := reopened.getTagByLabel(ctx, label); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted builtin tag was recreated by maintenance: %v", err)
+	}
+}
+
+func TestMigrateResetsLegacyTagPoolToUserTagsPlusBuiltinPack(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	now := time.Now().UnixMilli()
+	legacyRule := `{"keywords":["大学生","college student"],"words":["大一"],"excludes":["大学路"]}`
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO tags (id, label, aliases, match_rules, source, origin, created_at, updated_at)
+VALUES
+	(1, '我的标签', '[]', '{"keywords":["custom-only"]}', 'user', '', ?, ?),
+	(2, '女大', '[]', ?, 'builtin', '', ?, ?),
+	(3, '旧自动', '[]', '{"keywords":["old-auto"]}', 'generated', '', ?, ?),
+	(4, '旧爬虫', '[]', '{}', 'generated', 'crawler', ?, ?)`,
+		now, now, legacyRule, now, now, now, now, now, now); err != nil {
+		t.Fatalf("seed legacy tags: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO videos (id, drive_id, file_id, title, tags, tags_manual, published_at, created_at, updated_at)
+VALUES ('legacy-video', 'drive', 'file', 'legacy video', '["我的标签","女大","旧自动","旧爬虫"]', 0, ?, ?, ?)`,
+		now, now, now); err != nil {
+		t.Fatalf("seed legacy video: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO video_tags (video_id, tag_id, source, evidence, created_at)
+VALUES
+	('legacy-video', 1, 'manual', '', ?),
+	('legacy-video', 2, 'auto', '', ?),
+	('legacy-video', 3, 'auto', '', ?),
+	('legacy-video', 4, 'crawler', '', ?)`,
+		now, now, now, now); err != nil {
+		t.Fatalf("seed legacy video tags: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open migrated catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	custom := mustTagByLabel(t, ctx, cat, "我的标签")
+	if custom.Source != "user" {
+		t.Fatalf("custom tag source = %q, want user", custom.Source)
+	}
+	for _, label := range []string{"旧自动", "旧爬虫"} {
+		if _, err := cat.getTagByLabel(ctx, label); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("legacy non-user tag %q still exists: %v", label, err)
+		}
+	}
+	tag := mustTagByLabel(t, ctx, cat, "女大")
+	if tag.Source != "builtin" {
+		t.Fatalf("女大 source = %q, want builtin", tag.Source)
+	}
+	want := []string{"女大", "大一", "大二", "大三", "大四", "学妹", "学姐", "研究生"}
+	if !sameStrings(tag.MatchRules.Keywords, want) {
+		t.Fatalf("keywords = %#v, want %#v", tag.MatchRules.Keywords, want)
+	}
+	video, err := cat.GetVideo(ctx, "legacy-video")
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if !sameStrings(video.Tags, []string{"我的标签"}) {
+		t.Fatalf("video tags = %#v, want only user tag", video.Tags)
+	}
+	marker, err := cat.GetSetting(ctx, settingBuiltinTagPackInit, "")
+	if err != nil {
+		t.Fatalf("read builtin init marker: %v", err)
+	}
+	if !parseSettingBool(marker, false) {
+		t.Fatalf("builtin init marker = %q, want true", marker)
+	}
+}
+
+func TestSeedBuiltinTagPackPreservesCustomBuiltinRules(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	customRule := `{"keywords":["custom-only"],"words":["legacy-word"],"excludes":["custom-exclude"]}`
+	if _, err := cat.db.ExecContext(ctx,
+		`UPDATE tags SET source = 'builtin', match_rules = ? WHERE label = '奶子'`,
+		customRule); err != nil {
+		t.Fatalf("seed custom rule: %v", err)
+	}
+	if err := cat.removeRetiredTagRuleFields(ctx); err != nil {
+		t.Fatalf("remove retired fields: %v", err)
+	}
+	if err := cat.seedBuiltinTagPack(ctx); err != nil {
+		t.Fatalf("seed builtin pack: %v", err)
+	}
+	tag := mustTagByLabel(t, ctx, cat, "奶子")
+	if !sameStrings(tag.MatchRules.Keywords, []string{"custom-only"}) {
+		t.Fatalf("custom keywords overwritten: %#v", tag.MatchRules.Keywords)
+	}
+	var raw string
+	if err := cat.db.QueryRowContext(ctx, `SELECT match_rules FROM tags WHERE label = '奶子'`).Scan(&raw); err != nil {
+		t.Fatalf("read raw match_rules: %v", err)
+	}
+	if strings.Contains(raw, `"words"`) || strings.Contains(raw, `"excludes"`) {
+		t.Fatalf("retired fields were not removed: %s", raw)
+	}
+}
+
+func TestBuiltinKeywordDeletionSurvivesMaintenanceAndReopen(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	tag := mustTagByLabel(t, ctx, cat, "奶子")
+	var keywords []string
+	for _, keyword := range tag.MatchRules.Keywords {
+		if keyword != "大奶" {
+			keywords = append(keywords, keyword)
+		}
+	}
+	if stringSliceContains(keywords, "大奶") || !stringSliceContains(tag.MatchRules.Keywords, "大奶") {
+		t.Fatalf("test setup failed, keywords = %#v", tag.MatchRules.Keywords)
+	}
+	if _, err := cat.UpdateTag(ctx, tag.ID, tagging.Rule{Keywords: keywords}); err != nil {
+		t.Fatalf("update builtin keywords: %v", err)
+	}
+	if err := cat.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("post-startup maintenance: %v", err)
+	}
+	afterMaintenance := mustTagByLabel(t, ctx, cat, "奶子")
+	if stringSliceContains(afterMaintenance.MatchRules.Keywords, "大奶") {
+		t.Fatalf("maintenance restored deleted keyword: %#v", afterMaintenance.MatchRules.Keywords)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	afterReopen := mustTagByLabel(t, ctx, reopened, "奶子")
+	if stringSliceContains(afterReopen.MatchRules.Keywords, "大奶") {
+		t.Fatalf("reopen restored deleted keyword: %#v", afterReopen.MatchRules.Keywords)
+	}
+}
+
+func TestPostStartupTagMaintenanceClassifiesSystemTagsForExistingVideos(t *testing.T) {
 	path := t.TempDir() + "/catalog.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -402,13 +805,23 @@ VALUES
 			t.Fatalf("close catalog: %v", err)
 		}
 	})
+	before, err := cat.GetVideo(ctx, "video-auto")
+	if err != nil {
+		t.Fatalf("get video before background maintenance: %v", err)
+	}
+	if len(before.Tags) != 0 {
+		t.Fatalf("Open performed full-library tag work: %#v", before.Tags)
+	}
+	if err := cat.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("run post-startup tag maintenance: %v", err)
+	}
 
 	got, err := cat.GetVideo(ctx, "video-auto")
 	if err != nil {
 		t.Fatalf("get auto video: %v", err)
 	}
-	if !sameStrings(got.Tags, []string{"后入", "奶子"}) {
-		t.Fatalf("auto tags = %#v, want 后入/奶子", got.Tags)
+	if !sameStrings(got.Tags, []string{"奶子", "后入"}) {
+		t.Fatalf("auto tags = %#v, want 奶子 + 后入", got.Tags)
 	}
 
 	manual, err := cat.GetVideo(ctx, "video-manual")
@@ -463,7 +876,66 @@ func TestMigrateDoesNotRewriteAlreadySyncedVideoTags(t *testing.T) {
 	}
 }
 
-func TestMigrateBackfillsLegacyTagsWithoutRelations(t *testing.T) {
+func TestMigrateRemovesRetiredLLMTaggingArtifacts(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "video-llm",
+		DriveID:     "drive",
+		FileID:      "file-llm",
+		Title:       "legacy llm tagged video",
+		Tags:        []string{"legacy-ai"},
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	tag := mustTagByLabel(t, ctx, cat, "legacy-ai")
+	if _, err := cat.db.ExecContext(ctx, `ALTER TABLE videos ADD COLUMN llm_tagged_at INTEGER DEFAULT 0`); err != nil {
+		t.Fatalf("add retired llm column: %v", err)
+	}
+	if _, err := cat.db.ExecContext(ctx, `
+UPDATE video_tags
+   SET source = 'llm', evidence = 'retired'
+ WHERE video_id = ? AND tag_id = ?`, "video-llm", tag.ID); err != nil {
+		t.Fatalf("seed retired llm source: %v", err)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if hasColumn(t, reopened, "videos", "llm_tagged_at") {
+		t.Fatal("retired llm_tagged_at column was not dropped")
+	}
+	var retiredRows int
+	if err := reopened.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM video_tags WHERE lower(trim(COALESCE(source, ''))) = 'llm'`).Scan(&retiredRows); err != nil {
+		t.Fatalf("count retired llm rows: %v", err)
+	}
+	if retiredRows != 0 {
+		t.Fatalf("retired llm video_tags rows = %d, want 0", retiredRows)
+	}
+	got, err := reopened.GetVideo(ctx, "video-llm")
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("migrated video tags = %#v, want retired llm tags removed", got.Tags)
+	}
+}
+
+func TestMigrateDoesNotBackfillLegacyTagsWithoutRelations(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -482,18 +954,27 @@ VALUES ('legacy-video', 'drive', 'file-legacy', 'legacy title', '["legacy-tag"]'
 		now, now, now); err != nil {
 		t.Fatalf("seed legacy video: %v", err)
 	}
-	if err := cat.migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := cat.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("post-startup tag maintenance: %v", err)
 	}
 
-	tag := mustTagByLabel(t, ctx, cat, "legacy-tag")
 	var count int
 	if err := cat.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM video_tags WHERE video_id = 'legacy-video' AND tag_id = ?`, tag.ID).Scan(&count); err != nil {
+		`SELECT COUNT(*) FROM video_tags WHERE video_id = 'legacy-video'`).Scan(&count); err != nil {
 		t.Fatalf("count video tag: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("legacy video tag relation count = %d, want 1", count)
+	if count != 0 {
+		t.Fatalf("legacy video tag relation count = %d, want 0", count)
+	}
+	if _, err := cat.getTagByLabel(ctx, "legacy-tag"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("legacy tag was created: %v", err)
+	}
+	got, err := cat.GetVideo(ctx, "legacy-video")
+	if err != nil {
+		t.Fatalf("get legacy video: %v", err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("legacy video tags = %#v, want none", got.Tags)
 	}
 }
 
@@ -597,8 +1078,8 @@ INSERT INTO videos (
 	if got.Title != "Legacy Video" || got.Author != "Legacy Author" || got.Views != 7 {
 		t.Fatalf("migrated video lost data: %#v", got)
 	}
-	if !sameStrings(got.Tags, []string{"旧标签"}) {
-		t.Fatalf("migrated video tags = %#v, want legacy tag preserved", got.Tags)
+	if len(got.Tags) != 0 {
+		t.Fatalf("migrated video tags = %#v, want none", got.Tags)
 	}
 
 	now := time.Now()
@@ -701,7 +1182,7 @@ func TestCreateTagAndClassifyMapsAVCodeLabelToAV(t *testing.T) {
 		}
 	})
 
-	if _, err := cat.CreateTagAndClassify(ctx, "cc-1750027", nil, "user"); err != nil {
+	if _, err := cat.CreateTagAndClassify(ctx, "SSNI-001", nil, "user"); err != nil {
 		t.Fatalf("create code tag: %v", err)
 	}
 
@@ -710,9 +1191,182 @@ func TestCreateTagAndClassifyMapsAVCodeLabelToAV(t *testing.T) {
 		t.Fatalf("list tags: %v", err)
 	}
 	for _, tag := range tags {
-		if tag.Label == "cc-1750027" {
-			t.Fatal("created standalone AV code tag cc-1750027")
+		if tag.Label == "SSNI-001" {
+			t.Fatal("created standalone AV code tag SSNI-001")
 		}
+		if tag.Label == "AV" && tag.Source != "builtin" {
+			t.Fatalf("AV source = %q, want builtin", tag.Source)
+		}
+	}
+}
+
+func TestAVTagUsesCodeRuleNotLegacyAliases(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	aliasesJSON, _ := json.Marshal([]string{"JAV", "番号", "番號", "custom-av-alias"})
+	now := time.Now().UnixMilli()
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO tags (label, aliases, match_rules, source, origin, created_at, updated_at)
+VALUES ('AV', ?, '{}', 'generated', '', ?, ?)`, string(aliasesJSON), now, now); err != nil {
+		t.Fatalf("seed legacy AV tag shape: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO videos (id, drive_id, file_id, title, file_name, tags, tags_manual, published_at, created_at, updated_at)
+VALUES ('video-av-code', 'drive', 'file-av-code', 'SSNI-001', 'SSNI-001.mp4', '[]', 0, ?, ?, ?)`,
+		now, now, now); err != nil {
+		t.Fatalf("seed AV-code video: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("post-startup tag maintenance: %v", err)
+	}
+
+	tag, err := cat.getTagByLabel(ctx, "AV")
+	if err != nil {
+		t.Fatalf("get AV tag: %v", err)
+	}
+	if len(tag.Aliases) != 0 {
+		t.Fatalf("AV aliases = %#v, want legacy aliases removed", tag.Aliases)
+	}
+	if tag.Source != "builtin" {
+		t.Fatalf("AV source = %q, want builtin", tag.Source)
+	}
+	if !tag.MatchRules.MatchAVCode {
+		t.Fatalf("AV match rules = %#v, want MatchAVCode", tag.MatchRules)
+	}
+	for _, text := range []string{"JAV合集", "无码高清番号", "番號整理", "经典 AV 合集", "custom-av-alias"} {
+		got, err := cat.MatchTags(ctx, text)
+		if err != nil {
+			t.Fatalf("match %q: %v", text, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("MatchTags(%q) = %#v, want no AV alias match", text, got)
+		}
+	}
+	for _, text := range []string{"SSNI-001.mp4", "FC2PPV-4768873.mp4"} {
+		got, err := cat.MatchTags(ctx, text)
+		if err != nil {
+			t.Fatalf("match %q: %v", text, err)
+		}
+		if !sameStrings(got, []string{"AV"}) {
+			t.Fatalf("MatchTags(%q) = %#v, want [AV]", text, got)
+		}
+	}
+}
+
+func TestAVTagPrefixesAreEditable(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if got, err := cat.MatchTags(ctx, "SSNI-001.mp4"); err != nil {
+		t.Fatalf("match default AV: %v", err)
+	} else if !sameStrings(got, []string{"AV"}) {
+		t.Fatalf("default MatchTags(SSNI) = %#v, want AV", got)
+	}
+	av := mustTagByLabel(t, ctx, cat, "AV")
+	prefixes := make([]string, 0, len(av.MatchRules.AVCodePrefixes)+1)
+	for _, prefix := range av.MatchRules.AVCodePrefixes {
+		if prefix == "OBA" {
+			continue
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	prefixes = append(prefixes, "FHD")
+	if _, err := cat.UpdateTag(ctx, av.ID, tagging.Rule{MatchAVCode: true, AVCodePrefixes: prefixes}); err != nil {
+		t.Fatalf("update AV prefixes: %v", err)
+	}
+
+	got, err := cat.MatchTags(ctx, "FHD-78824.mp4")
+	if err != nil {
+		t.Fatalf("match custom AV: %v", err)
+	}
+	if !sameStrings(got, []string{"AV"}) {
+		t.Fatalf("custom MatchTags(FHD) = %#v, want AV", got)
+	}
+	assignments, err := cat.MatchTagAssignments(ctx, "FHD-78824", "FHD-78824.mp4", "", "")
+	if err != nil {
+		t.Fatalf("match custom AV assignments: %v", err)
+	}
+	if !sameStrings(assignmentLabels(assignments), []string{"AV", "FHD"}) {
+		t.Fatalf("custom AV assignments = %#v, want AV + FHD", assignments)
+	}
+
+	got, err = cat.MatchTags(ctx, "OBA-334456.mp4")
+	if err != nil {
+		t.Fatalf("match removed AV prefix: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("removed-prefix MatchTags(OBA) = %#v, want none", got)
+	}
+	assignments, err = cat.MatchTagAssignments(ctx, "OBA-334456", "OBA-334456.mp4", "", "")
+	if err != nil {
+		t.Fatalf("match removed AV assignments: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("removed-prefix assignments = %#v, want none", assignments)
+	}
+
+	got, err = cat.MatchTags(ctx, "SSNI-001.mp4")
+	if err != nil {
+		t.Fatalf("match retained AV prefix: %v", err)
+	}
+	if !sameStrings(got, []string{"AV"}) {
+		t.Fatalf("retained-prefix MatchTags(SSNI) = %#v, want AV", got)
+	}
+
+	listedAV := mustTagByLabel(t, ctx, cat, "AV")
+	if !listedAV.MatchRules.MatchAVCode {
+		t.Fatalf("listed AV match rule = %#v, want MatchAVCode", listedAV.MatchRules)
+	}
+	for _, prefix := range []string{"SSNI", "FC2PPV", "FHD"} {
+		if !stringSliceContains(listedAV.MatchRules.AVCodePrefixes, prefix) {
+			t.Fatalf("listed AV prefixes missing %q: %#v", prefix, listedAV.MatchRules.AVCodePrefixes)
+		}
+	}
+	if stringSliceContains(listedAV.MatchRules.AVCodePrefixes, "OBA") {
+		t.Fatalf("listed AV prefixes still include removed OBA: %#v", listedAV.MatchRules.AVCodePrefixes)
+	}
+	if len(listedAV.Aliases) != 0 {
+		t.Fatalf("listed AV aliases = %#v, want prefixes stored in match_rules", listedAV.Aliases)
+	}
+
+	if err := cat.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("post-startup maintenance after AV prefix edit: %v", err)
+	}
+	listedAV = mustTagByLabel(t, ctx, cat, "AV")
+	if stringSliceContains(listedAV.MatchRules.AVCodePrefixes, "OBA") {
+		t.Fatalf("post-startup AV prefixes restored removed OBA: %#v", listedAV.MatchRules.AVCodePrefixes)
+	}
+	if !stringSliceContains(listedAV.MatchRules.AVCodePrefixes, "FHD") {
+		t.Fatalf("post-startup AV prefixes missing custom FHD: %#v", listedAV.MatchRules.AVCodePrefixes)
 	}
 }
 
@@ -733,10 +1387,10 @@ func TestMigrateCollapsesAVCodeTagsIntoAV(t *testing.T) {
 		id    string
 		label string
 	}{
-		{id: "video-1", label: "cc-1750027"},
-		{id: "video-2", label: "ADN-778-FHD(1)"},
-		{id: "video-3", label: "[44x.me]idbd-786"},
-		{id: "video-4", label: "390JAC-233"},
+		{id: "video-1", label: "SSNI-001"},
+		{id: "video-2", label: "IPX-778-FHD(1)"},
+		{id: "video-3", label: "[44x.me]MIMK-786"},
+		{id: "video-4", label: "FC2PPV-4162750"},
 	} {
 		if err := cat.UpsertVideo(ctx, &Video{
 			ID:          seed.id,
@@ -752,8 +1406,8 @@ func TestMigrateCollapsesAVCodeTagsIntoAV(t *testing.T) {
 		}
 	}
 
-	if err := cat.migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := cat.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("post-startup tag maintenance: %v", err)
 	}
 
 	tags, err := cat.ListTags(ctx)
@@ -765,13 +1419,16 @@ func TestMigrateCollapsesAVCodeTagsIntoAV(t *testing.T) {
 	for _, tag := range tags {
 		if tag.Label == "AV" {
 			sawAV = true
+			if tag.Source != "builtin" {
+				t.Fatalf("AV source = %q, want builtin", tag.Source)
+			}
 		}
 		if tag.Label != "AV" && isAVCodePollutedLabel(tag.Label) {
 			polluted[tag.Label] = true
 		}
 	}
 	if !sawAV {
-		t.Fatal("AV tag was not seeded")
+		t.Fatal("AV tag was not present")
 	}
 	if len(polluted) > 0 {
 		t.Fatalf("AV code tags were not removed: %#v", polluted)
@@ -1244,6 +1901,15 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
+func stringSliceContains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
 func mustListTags(t *testing.T, ctx context.Context, cat *Catalog) []Tag {
 	t.Helper()
 	tags, err := cat.ListTags(ctx)
@@ -1313,7 +1979,7 @@ func videoUpdatedAtByID(t *testing.T, ctx context.Context, cat *Catalog, ids ...
 }
 
 // 删除旧版本 collection 标签的最后一个引用视频后，标签应当自动从 tags 表里消失。
-// user/system 标签不受影响：用户/系统标签的语义由人维护，孤儿状态保留。
+// user/builtin 标签不受影响：自定义/内置标签的语义由人维护，孤儿状态保留。
 func TestDeleteVideoPrunesLegacyOrphanCollectionTag(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
@@ -1405,19 +2071,136 @@ func TestDeleteVideoPrunesLegacyOrphanCollectionTag(t *testing.T) {
 		t.Fatalf("user tag count = %d, want 1 (user-source orphans must be preserved)", userCount)
 	}
 
-	// AV 系统标签也不能被孤儿清理影响。
-	var avCount int
+	// 当前内置标签即使零引用也不能被孤儿清理影响。
+	var builtinCount int
 	if err := cat.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM tags WHERE label = 'AV' AND source = 'system'`).Scan(&avCount); err != nil {
-		t.Fatalf("count av tag: %v", err)
+		`SELECT COUNT(*) FROM tags WHERE label = '奶子' AND source = 'builtin'`).Scan(&builtinCount); err != nil {
+		t.Fatalf("count builtin tag: %v", err)
 	}
-	if avCount != 1 {
-		t.Fatalf("system AV tag count = %d, want 1", avCount)
+	if builtinCount != 1 {
+		t.Fatalf("builtin tag count = %d, want 1", builtinCount)
 	}
 }
 
-// 重启时 migrate 应当一次性把历史遗留的孤儿 collection 标签清掉。
-func TestMigratePrunesPreexistingOrphanCollectionTags(t *testing.T) {
+func TestMigrateKeepsUserTagsAndRemovesOrdinaryGeneratedSources(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	now := time.Now().UnixMilli()
+	sources := []string{"system", "builtin", "user", "series", "crawler", "legacy", "collection", "generated", "unknown"}
+	for _, oldSource := range sources {
+		label := "source-" + oldSource
+		if _, err := cat.db.ExecContext(ctx,
+			`INSERT INTO tags (label, aliases, source, created_at, updated_at) VALUES (?, '[]', ?, ?, ?)`,
+			label, oldSource, now, now); err != nil {
+			t.Fatalf("insert %s tag: %v", oldSource, err)
+		}
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	var userSource string
+	if err := reopened.db.QueryRowContext(ctx,
+		`SELECT source FROM tags WHERE label = 'source-user'`).Scan(&userSource); err != nil {
+		t.Fatalf("read user tag source: %v", err)
+	}
+	if userSource != "user" {
+		t.Fatalf("user tag source = %q, want user", userSource)
+	}
+	for _, oldSource := range sources {
+		if oldSource == "user" {
+			continue
+		}
+		var count int
+		if err := reopened.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM tags WHERE label = ?`, "source-"+oldSource).Scan(&count); err != nil {
+			t.Fatalf("count %s tag: %v", oldSource, err)
+		}
+		if count != 0 {
+			t.Errorf("%s tag was retained, want removed", oldSource)
+		}
+	}
+}
+
+func TestMigrateKeepsOnlyCurrentBuiltinLabels(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "video-butt",
+		DriveID:     "drive",
+		FileID:      "file-butt",
+		Title:       "蜜桃臀",
+		Tags:        []string{"臀"},
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed old builtin video: %v", err)
+	}
+	if _, err := cat.db.ExecContext(ctx, `UPDATE tags SET source = 'builtin' WHERE label = '臀'`); err != nil {
+		t.Fatalf("mark old butt tag builtin: %v", err)
+	}
+	if _, err := cat.db.ExecContext(ctx,
+		`INSERT INTO tags (label, aliases, source, created_at, updated_at) VALUES ('丝袜', '[]', 'builtin', ?, ?)`,
+		time.Now().UnixMilli(), time.Now().UnixMilli()); err != nil {
+		t.Fatalf("seed retired builtin: %v", err)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	var badBuiltinCount int
+	if err := reopened.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+  FROM tags
+ WHERE source = 'builtin'
+   AND label COLLATE NOCASE NOT IN ('AV', '奶子', '女大', '人妻', '后入', '制服', '美臀', '口交')`).Scan(&badBuiltinCount); err != nil {
+		t.Fatalf("count retired builtins: %v", err)
+	}
+	if badBuiltinCount != 0 {
+		t.Fatalf("retired builtin count = %d, want 0", badBuiltinCount)
+	}
+	if _, err := reopened.getTagByLabel(ctx, "臀"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("old 臀 tag still exists: %v", err)
+	}
+	tag := mustTagByLabel(t, ctx, reopened, "美臀")
+	if tag.Source != "builtin" {
+		t.Fatalf("美臀 source = %q, want builtin", tag.Source)
+	}
+	if _, err := reopened.getTagByLabel(ctx, "丝袜"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("retired builtin tag still exists: %v", err)
+	}
+	video, err := reopened.GetVideo(ctx, "video-butt")
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if !sameStrings(video.Tags, []string{"美臀"}) {
+		t.Fatalf("video tags = %#v, want 美臀", video.Tags)
+	}
+}
+
+// 监听完成后的后台维护应当清掉历史遗留的孤儿自动生成标签。
+func TestPostStartupMaintenancePrunesPreexistingOrphanGeneratedTags(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/catalog.db"
 	cat, err := Open(path)
@@ -1464,17 +2247,25 @@ func TestMigratePrunesPreexistingOrphanCollectionTags(t *testing.T) {
 		"用户孤儿", now, now); err != nil {
 		t.Fatalf("insert user orphan: %v", err)
 	}
+	if _, err := cat.db.ExecContext(ctx,
+		`INSERT INTO tags (label, aliases, source, origin, created_at, updated_at) VALUES (?, '[]', 'generated', 'crawler', ?, ?)`,
+		"空爬虫", now, now); err != nil {
+		t.Fatalf("insert crawler orphan: %v", err)
+	}
 
 	if err := cat.Close(); err != nil {
 		t.Fatalf("close before reopen: %v", err)
 	}
 
-	// 重新打开 → 触发 migrate → 应当只清掉 source='collection' 且无引用的 "孤儿合集"。
+	// 重新打开不会扫描标签；监听完成后的后台维护才清理孤儿合集。
 	cat2, err := Open(path)
 	if err != nil {
 		t.Fatalf("reopen catalog: %v", err)
 	}
 	t.Cleanup(func() { _ = cat2.Close() })
+	if err := cat2.RunPostStartupTagMaintenance(ctx); err != nil {
+		t.Fatalf("post-startup tag maintenance: %v", err)
+	}
 
 	count := func(label string) int {
 		var n int
@@ -1485,13 +2276,23 @@ func TestMigratePrunesPreexistingOrphanCollectionTags(t *testing.T) {
 		return n
 	}
 	if count("孤儿合集") != 0 {
-		t.Fatal("migrate did not prune orphan collection tag")
+		t.Fatal("post-startup maintenance did not prune orphan generated tag")
 	}
-	if count("在用合集") != 1 {
-		t.Fatal("migrate wrongly pruned in-use collection tag")
+	if count("在用合集") != 0 {
+		t.Fatal("post-startup maintenance did not prune in-use ordinary generated tag")
 	}
 	if count("用户孤儿") != 1 {
-		t.Fatal("migrate wrongly pruned user-source orphan tag")
+		t.Fatal("post-startup maintenance wrongly pruned user-source orphan tag")
+	}
+	if count("空爬虫") != 0 {
+		t.Fatal("post-startup maintenance did not prune orphan crawler tag")
+	}
+	video, err := cat2.GetVideo(ctx, "video-keeper")
+	if err != nil {
+		t.Fatalf("get keeper video: %v", err)
+	}
+	if len(video.Tags) != 0 {
+		t.Fatalf("keeper video tags = %#v, want none", video.Tags)
 	}
 }
 

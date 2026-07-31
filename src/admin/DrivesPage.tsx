@@ -3,13 +3,10 @@ import { useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   ChevronRight,
-  CircleStop,
   FolderTree,
   HardDrive,
-  PlayCircle,
-  Plus,
+  Loader2,
   RefreshCw,
-  Trash2,
 } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
@@ -17,16 +14,19 @@ import { Modal } from "./Modal";
 import { ConfirmModal } from "./ConfirmModal";
 import { formatBytes } from "./storageFormat";
 import { makeUniqueDriveId } from "./driveId";
+import { AdminLoading } from "./AdminLoading";
 import {
   FormState,
   driveKindAbbr,
-  kindLabel,
+  driveKindIconPath,
   emptyForm,
   idleNightlyStatus,
   nightlyButtonText,
   nightlyBusyText,
   usesRootDirectoryID,
   defaultRootId,
+  credentialFields,
+  rootDirectoryLabel,
 } from "./drive/constants";
 import {
   StorageSummary,
@@ -37,6 +37,7 @@ import {
 import { DriveForm } from "./drive/DriveForm";
 import { DeleteDriveModal } from "./drive/DeleteDriveModal";
 import { SkipDirsPanel } from "./drive/SkipDirsPanel";
+import { AdminEmptyVisual } from "./AdminEmptyVisual";
 
 const DRIVE_BUSY_MESSAGE = "当前存储有正在进行的任务，请稍后重试";
 const NIGHTLY_BUSY_MESSAGE = "当前有全量扫描任务正在进行，请稍后重试";
@@ -66,8 +67,9 @@ export function DrivesPage() {
   const [deleteTarget, setDeleteTarget] = useState<api.AdminDrive | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [initialForm, setInitialForm] = useState<FormState>(emptyForm);
-  const [nameTouched, setNameTouched] = useState(false);
+  const [createDriveTypeSelected, setCreateDriveTypeSelected] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [editingCredentialsId, setEditingCredentialsId] = useState("");
   const [deletingId, setDeletingId] = useState("");
   const [regenFailedId, setRegenFailedId] = useState("");
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
@@ -85,8 +87,6 @@ export function DrivesPage() {
   const { show } = useToast();
   const pollConnectionLost = useRef(false);
   const nightlyBusy = scanningAll || nightlyStatus.running || nightlyStatus.queued;
-  const nameMissing = form.name.trim().length === 0;
-  const nameError = nameTouched && nameMissing ? "请填写网盘名称" : "";
   const formDirty = form.id
     ? !sameForm(form, initialForm)
     : hasCreateFormChanges(form);
@@ -181,30 +181,34 @@ export function DrivesPage() {
     const nextForm = { ...emptyForm };
     setForm(nextForm);
     setInitialForm(nextForm);
-    setNameTouched(false);
+    setCreateDriveTypeSelected(false);
     setModalOpen(true);
   }
 
-  function openEdit(d: api.AdminDrive) {
-    const nextForm: FormState = {
-      id: d.id,
-      kind: d.kind,
-      name: d.name,
-      rootId: d.rootId,
-      creds:
-        d.kind === "googledrive"
-          ? {
-              use_online_api: (d.googleDriveUseOnlineAPI ?? true) ? "true" : "false",
-              api_url_address: d.googleDriveOpenListApiUrl ?? "",
-            }
-          : d.kind === "localstorage"
-          ? { strm_allow_outside_root: (d.strmAllowOutsideRoot ?? false) ? "true" : "false" }
-          : {},
-    };
-    setForm(nextForm);
-    setInitialForm(nextForm);
-    setNameTouched(false);
-    setModalOpen(true);
+  async function openEdit(d: api.AdminDrive) {
+    if (editingCredentialsId) return;
+    setEditingCredentialsId(d.id);
+    try {
+      const result = await api.getDriveCredentials(d.id);
+      const creds = { ...(result.credentials ?? {}) };
+      if (d.kind === "localstorage" && !("strm_allow_outside_root" in creds)) {
+        creds.strm_allow_outside_root = (d.strmAllowOutsideRoot ?? false) ? "true" : "false";
+      }
+      const nextForm: FormState = {
+        id: d.id,
+        kind: d.kind,
+        name: d.name,
+        rootId: d.rootId,
+        creds,
+      };
+      setForm(nextForm);
+      setInitialForm(nextForm);
+      setModalOpen(true);
+    } catch (e) {
+      show(e instanceof Error ? e.message : "加载网盘凭证失败", "error");
+    } finally {
+      setEditingCredentialsId("");
+    }
   }
 
   function requestCloseDriveModal() {
@@ -220,7 +224,6 @@ export function DrivesPage() {
     setDiscardConfirmOpen(false);
     setModalOpen(false);
     setForm(initialForm);
-    setNameTouched(false);
   }
 
   function handleCreateFormChange(nextForm: FormState) {
@@ -232,10 +235,33 @@ export function DrivesPage() {
 
   async function handleSave() {
     const name = form.name.trim();
-    if (!name || !form.kind) {
-      setNameTouched(true);
-      show("请填名称和类型", "error");
+    if (!form.kind) {
+      show("请选择网盘类型", "error");
       return;
+    }
+    if (!name) {
+      show("请填写网盘名称", "error");
+      return;
+    }
+    if (!form.id) {
+      if (form.kind === "p123") {
+        const hasScannedToken = Boolean((form.creds.access_token ?? "").trim());
+        const hasUsername = Boolean((form.creds.username ?? "").trim());
+        const hasPassword = Boolean((form.creds.password ?? "").trim());
+        if (!hasScannedToken && (!hasUsername || !hasPassword)) {
+          show("请使用方式一扫码登录，或填写方式二的手机号/邮箱和密码", "error");
+          return;
+        }
+      }
+      const missingField = credentialFields(form.kind).find(
+        (field) =>
+          field.required &&
+          !((form.creds[field.key] ?? field.defaultValue ?? "").trim())
+      );
+      if (missingField) {
+        show(`请填写${missingField.label}`, "error");
+        return;
+      }
     }
     const existing = list.find((x) => x.id === form.id);
     const driveID = existing
@@ -497,13 +523,51 @@ export function DrivesPage() {
     return selectedDriveId ? list.find((d) => d.id === selectedDriveId) : null;
   }, [selectedDriveId, list]);
 
+  if (selectedDriveId && !selectedDrive) {
+    const title = loading || loadError ? "网盘详情" : "网盘不存在";
+
+    return (
+      <section className="admin-drives-page">
+        <header className="admin-drive-detail__header-bar">
+          <button
+            type="button"
+            className="admin-drive-detail__back-btn"
+            onClick={() => closeDriveDetail({ replace: true })}
+            title="返回网盘列表"
+          >
+            <ArrowLeft size={16} />
+          </button>
+          <div className="admin-drive-detail__title-wrap">
+            <h1 className="admin-drive-detail__title">{title}</h1>
+          </div>
+        </header>
+
+        {loading ? (
+          <AdminLoading />
+        ) : loadError ? (
+          <div className="admin-error-state">
+            <strong>网盘数据加载失败</strong>
+            <span>{loadError}</span>
+            <button type="button" className="admin-btn" onClick={refresh}>
+              <RefreshCw size={13} /> 重试
+            </button>
+          </div>
+        ) : (
+          <div className="admin-card admin-empty">
+            未找到这个网盘，可能已被删除或配置尚未加载。
+          </div>
+        )}
+      </section>
+    );
+  }
+
   // --- Detail view ---
   if (selectedDriveId && selectedDrive) {
     const d = selectedDrive;
     const driveStorage = storage?.drives[d.id];
 
     return (
-      <section>
+      <section className="admin-drives-page">
         <header className="admin-drive-detail__header-bar">
           <button
             type="button"
@@ -515,10 +579,6 @@ export function DrivesPage() {
           </button>
           <div className="admin-drive-detail__title-wrap">
             <h1 className="admin-drive-detail__title">{d.name || d.id}</h1>
-          </div>
-          <div className="admin-drive-detail__header-right">
-            <span className="admin-drive-detail__kind-chip">{kindLabel[d.kind] ?? d.kind}</span>
-            <StatusTag status={d.status} error={d.lastError} hasCred={d.hasCredential} />
           </div>
         </header>
 
@@ -539,7 +599,7 @@ export function DrivesPage() {
                 </div>
                 {usesRootDirectoryID(d.kind) && (
                   <div className="admin-detail-row">
-                    <span className="admin-detail-label">根目录 ID</span>
+                    <span className="admin-detail-label">{rootDirectoryLabel(d.kind)}</span>
                     <span className="admin-detail-value admin-mono-cell">{d.rootId}</span>
                   </div>
                 )}
@@ -552,7 +612,7 @@ export function DrivesPage() {
                 <div className="admin-task-controls" aria-label="当前网盘任务控制">
                   <button
                     type="button"
-                    className="admin-btn is-primary"
+                    className="admin-btn"
                     onClick={() => handleRescan(d)}
                     aria-disabled={nightlyBusy || isDriveBusy(d) || !!scanningDriveIds[d.id]}
                     title={
@@ -563,25 +623,35 @@ export function DrivesPage() {
                         : undefined
                     }
                   >
-                    <RefreshCw size={13} className={scanningDriveIds[d.id] ? "admin-spin" : undefined} />
-                    {scanningDriveIds[d.id] ? "触发中..." : "立即重扫"}
+                    {scanningDriveIds[d.id] ? "触发中..." : "开始扫盘"}
                   </button>
                   <button
                     type="button"
-                    className="admin-btn is-primary"
+                    className="admin-btn"
                     onClick={() => handleStopDriveTasks(d)}
                     disabled={!!stoppingDriveId}
                     title="停止此网盘当前的扫描、封面、预览视频和视频指纹生成任务。"
                   >
-                    <CircleStop size={13} />
-                    {stoppingDriveId === d.id ? "停止中..." : "停止所有任务"}
+                    {stoppingDriveId === d.id ? "停止中..." : "停止任务"}
                   </button>
                 </div>
-                <button type="button" className="admin-btn is-primary" onClick={() => openEdit(d)}>
-                  编辑配置凭证
+                <button
+                  type="button"
+                  className="admin-btn"
+                  onClick={() => openEdit(d)}
+                  disabled={!!editingCredentialsId}
+                >
+                  {editingCredentialsId === d.id ? (
+                    <>
+                      <Loader2 size={14} className="admin-spin" />
+                      加载中
+                    </>
+                  ) : (
+                    "编辑凭证"
+                  )}
                 </button>
-                <button type="button" className="admin-btn is-danger admin-detail-actions__danger" onClick={() => setDeleteTarget(d)}>
-                  <Trash2 size={13} /> 删除网盘
+                <button type="button" className="admin-btn admin-detail-actions__danger" onClick={() => setDeleteTarget(d)}>
+                  删除网盘
                 </button>
               </div>
             </div>
@@ -643,6 +713,7 @@ export function DrivesPage() {
         <Modal
           open={modalOpen}
           title="编辑网盘"
+          className="admin-modal--drive-form"
           onClose={requestCloseDriveModal}
           footer={
             <>
@@ -651,11 +722,11 @@ export function DrivesPage() {
               </button>
               <button
                 type="button"
-                className="admin-btn is-primary"
+                className="admin-btn"
                 onClick={handleSave}
-                disabled={saving || nameMissing}
+                disabled={saving}
               >
-                {saving ? "保存中..." : "保存"}
+                {saving ? "确认中..." : "确认"}
               </button>
             </>
           }
@@ -664,8 +735,6 @@ export function DrivesPage() {
             form={form}
             onChange={setForm}
             isEdit={true}
-            nameError={nameError}
-            onNameBlur={() => setNameTouched(true)}
           />
         </Modal>
         <DeleteDriveModal
@@ -695,9 +764,8 @@ export function DrivesPage() {
 
   // --- List view ---
   return (
-    <section>
+    <section className="admin-drives-page admin-drives-page--list">
       <header className="admin-page__header">
-        <h1 className="admin-page__title">网盘管理</h1>
         <div className="admin-page__actions admin-drive-list-actions">
           <div className="admin-task-controls" aria-label="所有网盘任务控制">
             <button
@@ -707,20 +775,20 @@ export function DrivesPage() {
               disabled={scanningAll}
               title={nightlyBusyText(nightlyStatus) || "立即扫描所有网盘。耗时较长，期间不要重复触发。"}
             >
-              <PlayCircle size={14} /> {nightlyButtonText(nightlyStatus, scanningAll)}
+              {nightlyButtonText(nightlyStatus, scanningAll)}
             </button>
             <button
               type="button"
-              className="admin-btn is-stop"
+              className="admin-btn"
               onClick={handleStopAllTasks}
               disabled={stoppingAll}
               title="停止所有网盘当前的扫描、封面、预览视频和视频指纹生成任务。"
             >
-              <CircleStop size={14} /> {stoppingAll ? "停止中..." : "停止所有网盘任务"}
+              {stoppingAll ? "停止中..." : "停止所有任务"}
             </button>
           </div>
-          <button type="button" className="admin-btn is-primary" onClick={openCreate}>
-            <Plus size={14} /> 新建网盘
+          <button type="button" className="admin-btn" onClick={openCreate}>
+            添加网盘
           </button>
         </div>
       </header>
@@ -728,10 +796,7 @@ export function DrivesPage() {
       {storage && <StorageSummary storage={storage} />}
 
       {loading ? (
-        <div className="admin-loading-state">
-          <RefreshCw size={20} className="admin-spin" />
-          <span>加载中...</span>
-        </div>
+        <AdminLoading />
       ) : loadError ? (
         <div className="admin-error-state">
           <strong>网盘数据加载失败</strong>
@@ -740,48 +805,66 @@ export function DrivesPage() {
             <RefreshCw size={13} /> 重试
           </button>
         </div>
-      ) : list.length === 0 ? (
-        <div className="admin-card admin-empty">
-          当前还没有配置任何网盘
+      ) : list.length > 0 ? (
+        <div className="admin-drives-grid">
+          {list.map((d) => {
+            const iconSrc = driveKindIconPath(d.kind);
+            return (
+              <button
+                type="button"
+                key={d.id}
+                className="admin-drive-card"
+                onClick={() => openDriveDetail(d.id)}
+                aria-label={`管理网盘 ${d.name || d.id}`}
+              >
+                <div className="admin-drive-card__header">
+                  <div className="admin-drive-card__title">
+                    <span
+                      className={`admin-drive-card__brand-icon${iconSrc ? " has-image" : ""}`}
+                      data-kind={d.kind}
+                    >
+                      {iconSrc ? (
+                        <img
+                          src={iconSrc}
+                          alt=""
+                          aria-hidden="true"
+                          className="admin-drive-card__brand-icon-img"
+                        />
+                      ) : (
+                        driveKindAbbr(d.kind)
+                      )}
+                    </span>
+                    <span>{d.name || d.id}</span>
+                  </div>
+                  <StatusTag status={d.status} error={d.lastError} hasCred={d.hasCredential} />
+                </div>
+
+                <DriveCardMetrics d={d} />
+
+                <div className="admin-drive-card__footer">
+                  <span>本地占用: {formatBytes(storage?.drives[d.id]?.totalBytes ?? 0)}</span>
+                  <span className="admin-drive-card__manage-link">
+                    管理 <ChevronRight size={14} />
+                  </span>
+                </div>
+              </button>
+            );
+          })}
         </div>
       ) : (
-        <div className="admin-drives-grid">
-          {list.map((d) => (
-            <button
-              type="button"
-              key={d.id}
-              className="admin-drive-card"
-              onClick={() => openDriveDetail(d.id)}
-              aria-label={`管理网盘 ${d.name || d.id}`}
-            >
-              <div className="admin-drive-card__header">
-                <div className="admin-drive-card__title">
-                  <span className="admin-drive-card__brand-icon" data-kind={d.kind}>
-                    {driveKindAbbr(d.kind)}
-                  </span>
-                  <span>{d.name || d.id}</span>
-                </div>
-                <StatusTag status={d.status} error={d.lastError} hasCred={d.hasCredential} />
-              </div>
-
-              <DriveCardMetrics d={d} />
-
-              <div className="admin-drive-card__footer">
-                <span>本地占用: {formatBytes(storage?.drives[d.id]?.totalBytes ?? 0)}</span>
-                <span className="admin-drive-card__manage-link">
-                  管理 <ChevronRight size={14} />
-                </span>
-              </div>
-            </button>
-          ))}
-        </div>
+        <AdminEmptyVisual
+          variant="empty"
+          text="请先添加网盘"
+          className="admin-drive-empty-state"
+        />
       )}
 
       <Modal
         open={modalOpen}
-        title={form.id && list.find((x) => x.id === form.id) ? "编辑网盘" : "新建网盘"}
+        title={form.id && list.find((x) => x.id === form.id) ? "编辑网盘" : "添加网盘"}
+        className="admin-modal--drive-form"
         onClose={requestCloseDriveModal}
-        footer={
+        footer={form.id || createDriveTypeSelected ? (
           <>
             <button type="button" className="admin-btn" onClick={requestCloseDriveModal}>
               取消
@@ -790,20 +873,18 @@ export function DrivesPage() {
               type="button"
               className="admin-btn is-primary"
               onClick={handleSave}
-              disabled={saving || nameMissing}
+              disabled={saving}
             >
               {saving ? "保存中..." : "保存"}
             </button>
           </>
-        }
+        ) : undefined}
       >
         <DriveForm
           form={form}
           onChange={handleCreateFormChange}
           isEdit={!!list.find((x) => x.id === form.id)}
-          nameError={nameError}
-          onNameBlur={() => setNameTouched(true)}
-          onBack={() => setNameTouched(false)}
+          onTypeSelected={() => setCreateDriveTypeSelected(true)}
         />
       </Modal>
       <DeleteDriveModal

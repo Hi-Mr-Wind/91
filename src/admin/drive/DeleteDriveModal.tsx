@@ -1,4 +1,3 @@
-import { Trash2 } from "lucide-react";
 import * as api from "../api";
 import { Modal } from "../Modal";
 
@@ -15,7 +14,7 @@ export function DeleteDriveModal({
 }) {
   const name = drive?.name || drive?.id || "";
   const title = "删除存储";
-  const primaryText = deleting ? "删除中..." : "确认删除";
+  const primaryText = deleting ? "删除中..." : "确认";
 
   return (
     <Modal
@@ -28,8 +27,7 @@ export function DeleteDriveModal({
           <button className="admin-btn" onClick={onCancel} disabled={deleting}>
             取消
           </button>
-          <button className="admin-btn is-danger" onClick={onConfirm} disabled={deleting}>
-            <Trash2 size={13} />
+          <button className="admin-btn" onClick={onConfirm} disabled={deleting}>
             {primaryText}
           </button>
         </>

@@ -1,4 +1,15 @@
-export type Kind = "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage";
+import googledriveIcon from "./icons/googledrive.png";
+import guangyapanIcon from "./icons/guangyapan.png";
+import localstorageIcon from "./icons/localstorage.png";
+import onedriveIcon from "./icons/onedrive.png";
+import p115Icon from "./icons/p115.png";
+import p123Icon from "./icons/p123.png";
+import pikpakIcon from "./icons/pikpak.png";
+import quarkIcon from "./icons/quark.png";
+import webdavIcon from "./icons/webdav.png";
+import wopanIcon from "./icons/wopan.png";
+
+export type Kind = "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "webdav" | "localstorage";
 
 export const kindAbbr: Record<string, string> = {
   quark: "Qk",
@@ -9,7 +20,21 @@ export const kindAbbr: Record<string, string> = {
   guangyapan: "GY",
   onedrive: "OD",
   googledrive: "GD",
+  webdav: "WD",
   localstorage: "Lo",
+};
+
+export const kindIconPath: Record<string, string> = {
+  quark: quarkIcon,
+  p115: p115Icon,
+  p123: p123Icon,
+  pikpak: pikpakIcon,
+  wopan: wopanIcon,
+  guangyapan: guangyapanIcon,
+  onedrive: onedriveIcon,
+  googledrive: googledriveIcon,
+  webdav: webdavIcon,
+  localstorage: localstorageIcon,
 };
 
 export function driveKindAbbr(kind: string): string {
@@ -22,6 +47,10 @@ export function driveKindAbbr(kind: string): string {
   return (compact || trimmed).slice(0, 2).toUpperCase();
 }
 
+export function driveKindIconPath(kind: string): string {
+  return kindIconPath[kind] || "";
+}
+
 export const kindLabel: Record<string, string> = {
   quark: "夸克网盘",
   p115: "115 网盘",
@@ -31,6 +60,7 @@ export const kindLabel: Record<string, string> = {
   guangyapan: "光鸭网盘",
   onedrive: "OneDrive",
   googledrive: "Google Drive",
+  webdav: "WebDAV",
   localstorage: "本地存储",
 };
 
@@ -127,6 +157,7 @@ export function defaultRootId(kind: Kind): string {
   if (kind === "guangyapan") return "";
   if (kind === "onedrive") return "root";
   if (kind === "googledrive") return "root";
+  if (kind === "webdav") return "/";
   if (kind === "localstorage") return "/";
   return "0";
 }
@@ -136,36 +167,12 @@ export function usesRootDirectoryID(kind: Kind): boolean {
 }
 
 export function rootIdPlaceholder(kind: Kind): string {
-  const rootId = defaultRootId(kind);
-  return rootId ? `默认：${rootId}` : "留空表示根目录";
+  if (kind === "webdav") return "可填写目录路径，留空表示根目录";
+  return "可填写目录ID，留空表示根目录";
 }
 
-export function credentialHelp(kind: Kind, isEdit: boolean): string {
-  const note = isEdit ? "如不修改凭证，留空即可，保存时会沿用旧值。" : "";
-  switch (kind) {
-    case "quark":
-      return `在 pan.quark.cn 登录后，F12 → Network → 任意请求 → Request Headers 里复制整段 Cookie 粘贴到下方。${note}`;
-    case "p115":
-      return `登录 115.com 后复制 Cookie，形如 "UID=...; CID=...; SEID=...; KID=..."。${note}`;
-    case "p123":
-      return `推荐使用扫码登录自动获取 access_token；账号密码登录被 123网盘风控拦截时，也可以只填写 access_token。播放走 302 跳转到 123网盘返回的短期 CDN 地址。${note}`;
-    case "pikpak":
-      return `填写 PikPak 账号和密码即可。平台、设备 ID、验证码 token 和 refresh token 会由服务端自动处理并保存。${note}`;
-    case "wopan":
-      return `推荐使用扫码登录自动获取 access_token 和 refresh_token；也可以手工粘贴已有凭证。${note}`;
-    case "guangyapan":
-      return `推荐使用扫码登录自动获取 access_token 和 refresh_token；也可以手工粘贴已有 token。${note}`;
-    case "onedrive":
-      return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
-    case "googledrive":
-      return isEdit
-        ? "请参考OpenList文档中关于谷歌云盘的配置方法；如不修改凭证，留空即可，保存时会沿用旧值"
-        : "请参考OpenList文档中关于谷歌云盘的配置方法";
-    case "localstorage":
-      return `填写服务器可访问的本地目录绝对路径，例如 /mnt/videos。系统会扫描该目录及子目录中的视频文件和 .strm 文件；.strm 可指向 HTTP/HTTPS 直链或本地视频路径（指向目录外需开启下方开关）。Docker 部署时请填写容器内路径。${note}`;
-    default:
-      return "";
-  }
+export function rootDirectoryLabel(kind: Kind): string {
+  return kind === "webdav" ? "WebDAV根目录(可选)" : "自定义网盘根目录(可选)";
 }
 
 export type CredentialField = {
@@ -177,22 +184,9 @@ export type CredentialField = {
   multiline?: boolean;
   required?: boolean;
   defaultValue?: string;
-  help?: string;
 };
 
-export function credentialBoolValue(value: string | undefined, defaultValue: boolean): boolean {
-  const normalized = (value ?? "").trim().toLowerCase();
-  if (normalized === "") return defaultValue;
-  if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on") return true;
-  if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off") return false;
-  return defaultValue;
-}
-
-export function googleDriveUsesOnlineAPI(creds: Record<string, string> = {}): boolean {
-  return credentialBoolValue(creds.use_online_api, true);
-}
-
-export function credentialFields(kind: Kind, creds: Record<string, string> = {}): CredentialField[] {
+export function credentialFields(kind: Kind): CredentialField[] {
   switch (kind) {
     case "quark":
       return [
@@ -218,20 +212,13 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
       return [
         {
           key: "username",
-          label: "用户名 / 邮箱（可选）",
-          placeholder: "user@example.com",
+          label: "手机号/邮箱",
+          placeholder: "手机号或邮箱",
         },
         {
           key: "password",
-          label: "密码（可选）",
+          label: "密码",
           placeholder: "123网盘密码",
-        },
-        {
-          key: "access_token",
-          label: "access_token（推荐用于风控场景）",
-          placeholder: "Bearer eyJ... 或直接粘贴 token",
-          multiline: true,
-          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
         },
       ];
     case "pikpak":
@@ -256,7 +243,6 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
           label: "access_token",
           placeholder: "",
           required: true,
-          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
         },
         {
           key: "refresh_token",
@@ -264,33 +250,20 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
           placeholder: "",
           required: true,
         },
-        {
-          key: "family_id",
-          label: "family_id（家庭空间可选）",
-          placeholder: "留空走个人空间",
-        },
       ];
     case "guangyapan":
       return [
-        {
-          key: "root_path",
-          label: "根目录路径（可选）",
-          placeholder: "例如：影视/电影；留空使用上方根目录 ID",
-          help: "如果填写 root_path，服务端会按路径解析光鸭目录，并优先作为扫描根目录。",
-        },
         {
           key: "refresh_token",
           label: "refresh_token",
           placeholder: "推荐填写，服务端会自动刷新 access_token",
           multiline: true,
-          help: "扫码成功后会自动填入该字段。",
         },
         {
           key: "access_token",
           label: "access_token",
           placeholder: "Bearer eyJ... 或直接粘贴 token",
           multiline: true,
-          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
         },
       ];
     case "onedrive":
@@ -306,46 +279,43 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
     case "googledrive":
       return [
         {
-          key: "use_online_api",
-          label: "认证方式",
-          placeholder: "",
-          type: "select",
-          defaultValue: "true",
-          options: [
-            { value: "true", label: "OpenList 在线 API" },
-            { value: "false", label: "自建 Google OAuth 客户端" },
-          ],
+          key: "client_id",
+          label: "客户端 ID",
+          placeholder: "xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com",
+          required: true,
         },
-        ...(googleDriveUsesOnlineAPI(creds)
-          ? [
-              {
-                key: "api_url_address",
-                label: "OpenList 在线 API URL",
-                placeholder: "默认：https://api.oplist.org/googleui/renewapi",
-                help: "留空时使用 OpenList 官方在线 API，填写后会使用自定义续期 API。",
-              },
-            ]
-          : [
-              {
-                key: "client_id",
-                label: "客户端 ID",
-                placeholder: "xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com",
-                required: true,
-                help: "Google Cloud Console 中 OAuth 2.0 客户端的 Client ID",
-              },
-              {
-                key: "client_secret",
-                label: "客户端密钥",
-                placeholder: "Google OAuth client secret",
-                required: true,
-                help: "Google Cloud Console 中同一个 OAuth 客户端的 Client Secret",
-              },
-            ]),
+        {
+          key: "client_secret",
+          label: "客户端密钥",
+          placeholder: "Google OAuth client secret",
+          required: true,
+        },
         {
           key: "refresh_token",
           label: "refresh_token",
-          placeholder: "OpenList Google Drive refresh_token",
+          placeholder: "Google OAuth refresh_token",
           multiline: true,
+          required: true,
+        },
+      ];
+    case "webdav":
+      return [
+        {
+          key: "base_url",
+          label: "WebDAV 地址",
+          placeholder: "https://openlist.example.com/dav",
+          required: true,
+        },
+        {
+          key: "username",
+          label: "用户名",
+          placeholder: "WebDAV 用户名",
+          required: true,
+        },
+        {
+          key: "password",
+          label: "密码",
+          placeholder: "WebDAV 密码",
           required: true,
         },
       ];
@@ -356,7 +326,6 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
           label: "本地目录路径",
           placeholder: "/mnt/videos",
           required: true,
-          help: "路径必须是后端服务器上的已有目录；保存后可手动重扫，系统会递归扫描支持的视频格式。",
         },
         {
           key: "strm_allow_outside_root",
@@ -368,7 +337,6 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
             { value: "false", label: "关闭（默认，仅允许目录内路径）" },
             { value: "true", label: "开启（允许任意本地路径）" },
           ],
-          help: "开启后 .strm 可指向本目录之外的本地文件（如 rclone 挂载点）。注意：等于允许通过 .strm 读取服务器上任意文件，请只在自己完全掌控媒体目录时开启。Docker 部署时路径必须是容器内路径。",
         },
       ];
   }

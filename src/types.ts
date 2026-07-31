@@ -45,6 +45,8 @@ export type CommentItem = {
 
 export type VideoDetail = VideoItem & {
   videoSrc: string;
+  /** 实际交给浏览器播放的资源 MIME；后端无法确认时省略。 */
+  mediaType?: string;
   poster: string;
   description: string;
   embedUrl: string;
@@ -52,6 +54,16 @@ export type VideoDetail = VideoItem & {
   authorProfile: AuthorProfile;
   relatedVideos: VideoItem[];
   commentsList: CommentItem[];
+};
+
+export type VideoSubtitle = {
+  name: string;
+  label: string;
+  language?: string;
+  ext: string;
+  type: "vtt" | "srt" | "ass";
+  url: string;
+  source: string;
 };
 
 export type PreviewState = "idle" | "intent" | "loading" | "playing" | "error";

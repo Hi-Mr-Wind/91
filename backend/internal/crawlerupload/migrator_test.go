@@ -153,6 +153,9 @@ func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	if got.FileName != wantName {
 		t.Fatalf("file_name = %q, want %q", got.FileName, wantName)
 	}
+	if got.Title != strings.TrimSuffix(wantName, filepath.Ext(wantName)) {
+		t.Fatalf("title = %q, want uploaded filename without extension", got.Title)
+	}
 	if _, err := os.Stat(filepath.Join(src.VideosDir(), "source-001.mp4")); !os.IsNotExist(err) {
 		t.Fatalf("local video still exists or stat failed: %v", err)
 	}
@@ -198,6 +201,48 @@ func TestRunOnceRequiresPerCrawlerUploadTarget(t *testing.T) {
 	}
 	if got.DriveID != src.ID() {
 		t.Fatalf("drive_id = %q, want local crawler drive", got.DriveID)
+	}
+}
+
+func TestRunOncePreservesCrawlerVideoPendingDirectoryRestore(t *testing.T) {
+	ctx := context.Background()
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-restore")
+	target := newFakeUploadDrive("target-drive", "pikpak", "target-root")
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(target)
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            src.ID(),
+		Kind:          scriptcrawler.Kind,
+		Name:          "Restore Crawler",
+		RootID:        "/",
+		Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("upsert crawler drive: %v", err)
+	}
+	videoID := writeCrawlerVideo(t, cat, src, "source-restore", ".mp4", []byte("retained payload"), true)
+	if err := cat.DeleteVideoWithTombstone(ctx, videoID); err != nil {
+		t.Fatalf("delete video with tombstone: %v", err)
+	}
+	if err := cat.RemoveDeletedVideo(ctx, videoID); err != nil {
+		t.Fatalf("request restore: %v", err)
+	}
+
+	m := New(Config{Catalog: cat, Registry: reg})
+	if err := m.RunOnce(ctx); err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	if target.uploadCalls != 0 {
+		t.Fatalf("upload calls = %d, want pending restore skipped", target.uploadCalls)
+	}
+	if _, err := os.Stat(filepath.Join(src.VideosDir(), "source-restore.mp4")); err != nil {
+		t.Fatalf("pending restore source removed during migration: %v", err)
+	}
+	if requests, err := cat.ListCrawlerRestoreRequests(ctx, src.ID()); err != nil || len(requests) != 1 {
+		t.Fatalf("restore requests = %#v err=%v, want one", requests, err)
 	}
 }
 

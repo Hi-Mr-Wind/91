@@ -1014,10 +1014,28 @@ func fileItemToEntry(item fileItem, parentID string) drives.Entry {
 		ID:       item.FileID,
 		Name:     item.FileName,
 		Size:     item.FileSize,
+		Hash:     normalizeGCID(item.GCID),
 		IsDir:    item.ResType == 2,
 		ParentID: parentID,
 		ModTime:  unixOrZero(item.UTime),
 	}
+}
+
+func normalizeGCID(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) != 40 {
+		return ""
+	}
+	for _, ch := range value {
+		switch {
+		case ch >= '0' && ch <= '9':
+		case ch >= 'a' && ch <= 'f':
+		case ch >= 'A' && ch <= 'F':
+		default:
+			return ""
+		}
+	}
+	return strings.ToUpper(value)
 }
 
 func successMessage(msg string) bool {

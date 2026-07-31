@@ -1,4 +1,4 @@
-import { CircleStop, PlayCircle, Power, PowerOff, RotateCcw, Wand2 } from "lucide-react";
+import { Activity } from "lucide-react";
 import * as api from "../api";
 import { formatBytes } from "../storageFormat";
 import {
@@ -194,18 +194,24 @@ export function DriveGenerationPanel({
     <div className="admin-detail-card">
       <header className="admin-detail-card__title">
         <div className="admin-detail-card__title-left">
-          <PlayCircle size={16} />
+          <Activity size={16} />
           <span>生成状态</span>
         </div>
         <div className="admin-detail-actions-inline">
+          <span className="admin-drive-preview-toggle__label">预览视频</span>
           <button
-            className={`admin-btn ${d.teaserEnabled ? "is-success" : ""}`}
+            type="button"
+            className={`toggle-switch ${d.teaserEnabled ? "is-on" : ""} ${
+              togglingTeaserId === d.id ? "is-saving" : ""
+            }`}
             onClick={onToggleTeaser}
             disabled={togglingTeaserId === d.id}
-            style={{ padding: "4px 10px", fontSize: "11px" }}
+            role="switch"
+            aria-checked={d.teaserEnabled}
+            aria-label="生成预览视频"
+            title={d.teaserEnabled ? "关闭预览视频生成" : "开启预览视频生成"}
           >
-            {d.teaserEnabled ? <Power size={11} /> : <PowerOff size={11} />}
-            <span>{d.teaserEnabled ? "预览视频：开" : "预览视频：关"}</span>
+            <span className="toggle-switch__dot" />
           </button>
         </div>
       </header>
@@ -247,13 +253,12 @@ export function DriveGenerationPanel({
         />
       </div>
 
-      <div className="admin-detail-actions">
+      <div className="admin-detail-actions admin-generation-actions">
         <button
           className="admin-btn"
           disabled={!canQueueThumbnails || regenFailedThumbId === d.id}
           onClick={onRegenFailedThumbnails}
         >
-          <RotateCcw size={13} />
           <span>{(d.thumbnailFailedCount ?? 0) > 0 ? "重试失败封面" : "继续生成封面"}</span>
         </button>
         <button
@@ -261,15 +266,13 @@ export function DriveGenerationPanel({
           disabled={!canQueuePreviews || regenFailedId === d.id}
           onClick={onRegenFailed}
         >
-          <RotateCcw size={13} />
-          <span>{(d.teaserFailedCount ?? 0) > 0 ? "重试失败预览视频" : "继续生成预览视频"}</span>
+          <span>{(d.teaserFailedCount ?? 0) > 0 ? "重试失败预览" : "继续生成预览视频"}</span>
         </button>
         <button
           className="admin-btn"
           disabled={!canQueueFingerprints || regenFailedFingerprintId === d.id}
           onClick={onRegenFailedFingerprints}
         >
-          <RotateCcw size={13} />
           <span>{(d.fingerprintFailedCount ?? 0) > 0 ? "重试失败指纹" : "继续生成指纹"}</span>
         </button>
         {transcodeRunning ? (
@@ -279,7 +282,6 @@ export function DriveGenerationPanel({
             onClick={onStopTranscode}
             title="停止当前的转码任务。未处理的视频保持原状态，下次开始时继续。"
           >
-            <CircleStop size={13} />
             <span>{togglingTranscodeId === d.id ? "停止中..." : "停止转码"}</span>
           </button>
         ) : (
@@ -289,7 +291,6 @@ export function DriveGenerationPanel({
             onClick={onStartTranscode}
             title="把浏览器播放不了的视频（AVI/WMV/RMVB、MPEG-4 等老格式）转码成 H.264 MP4 并上传回本存储。转码不会自动运行，只能在这里手动开启。"
           >
-            <Wand2 size={13} />
             <span>
               {togglingTranscodeId === d.id
                 ? "开启中..."

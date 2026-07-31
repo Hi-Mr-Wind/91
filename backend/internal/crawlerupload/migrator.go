@@ -35,12 +35,15 @@ import (
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
+	"github.com/video-site/backend/internal/drives/webdav"
 	"github.com/video-site/backend/internal/drives/wopan"
 	"github.com/video-site/backend/internal/mediaasset"
+	"github.com/video-site/backend/internal/persistence"
+	"github.com/video-site/backend/internal/videoname"
 )
 
 // uploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收爬虫上传"的
-// 网盘都要实现它；当前 PikPak、115、123、OneDrive、Google Drive、联通网盘和光鸭网盘各自通过适配器满足。
+// 网盘都要实现它；当前 PikPak、115、123、OneDrive、Google Drive、联通网盘、光鸭网盘和 WebDAV 各自通过适配器满足。
 //
 // 这一层抽象把"迁移调用方"和"具体盘的 SDK 协议"解耦：
 //   - PikPak 走 GCID + OSS PutObject（pikpak.UploadResult）
@@ -50,6 +53,7 @@ import (
 //   - Google Drive 走 MD5 + resumable upload session
 //   - 联通网盘 走 SDK Upload2C，当前上游不返回内容 hash
 //   - 光鸭网盘 走 OSS 分片上传，当前上游不返回内容 hash
+//   - WebDAV 走标准 MKCOL + PUT，协议不提供稳定内容 hash
 //
 // 各家返回值都被归一成本地的 UploadResult，并在 catalog 改写阶段统一处理。
 type uploadTarget interface {
@@ -105,7 +109,7 @@ type migrationPlan struct {
 	requirePreviewReady bool
 }
 
-// pikpakAdapter / p115Adapter / p123Adapter / onedriveAdapter / googledriveAdapter / wopanAdapter / guangyapanAdapter 把具体 driver 包装成 uploadTarget。
+// pikpakAdapter / p115Adapter / p123Adapter / onedriveAdapter / googledriveAdapter / webdavAdapter / wopanAdapter / guangyapanAdapter 把具体 driver 包装成 uploadTarget。
 //
 // 之所以不让 driver 直接实现 uploadTarget：
 //
@@ -259,6 +263,27 @@ func (a *guangyapanAdapter) Rename(ctx context.Context, fileID, newName string) 
 	return a.d.Rename(ctx, fileID, newName)
 }
 
+type webdavAdapter struct {
+	d *webdav.Driver
+}
+
+func (a *webdavAdapter) ID() string     { return a.d.ID() }
+func (a *webdavAdapter) Kind() string   { return a.d.Kind() }
+func (a *webdavAdapter) RootID() string { return a.d.RootID() }
+func (a *webdavAdapter) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	return a.d.EnsureDir(ctx, pathFromRoot)
+}
+func (a *webdavAdapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	fileID, err := a.d.Upload(ctx, parentID, name, r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	return UploadResult{FileID: fileID, Size: size}, nil
+}
+func (a *webdavAdapter) Rename(ctx context.Context, fileID, newName string) error {
+	return a.d.Rename(ctx, fileID, newName)
+}
+
 // adaptUploadTarget 把通用 drive 包装成 uploadTarget。
 // 不支持的盘 kind 返回 error；调用方静默跳过。
 func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
@@ -277,6 +302,8 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		return &wopanAdapter{d: v}, nil
 	case *guangyapan.Driver:
 		return &guangyapanAdapter{d: v}, nil
+	case *webdav.Driver:
+		return &webdavAdapter{d: v}, nil
 	case uploadTarget:
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil
@@ -850,13 +877,19 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrat
 	}
 
 	// 事务性改写 catalog 行：drive_id / file_id / content_hash
+	persistence.RLock()
+	defer persistence.RUnlock()
 	if err := m.cfg.Catalog.MigrateVideoToDrive(ctx, v.ID, plan.targetDriveID, res.FileID, res.Hash); err != nil {
 		return false, fmt.Errorf("catalog migrate: %w", err)
 	}
 	m.preserveCrawledThumbnail(ctx, src, v)
 	// 同步 catalog 里的 file_name，让下次目标盘扫盘时 (file_name, size) 也能匹配上
-	if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{FileName: uploadName}); err != nil {
-		log.Printf("[crawlerupload] %s update file_name after migrate: %v", v.ID, err)
+	if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+		FileName: uploadName,
+		Title:    videoname.TitleFromFileName(uploadName),
+		TitleSet: true,
+	}); err != nil {
+		log.Printf("[crawlerupload] %s update file_name/title after migrate: %v", v.ID, err)
 	}
 
 	// 删除本地 mp4 和源 thumb（公共 /p/thumb 副本已在 preserveCrawledThumbnail 中保留）。
@@ -873,12 +906,18 @@ func (m *Migrator) bindToExistingTarget(ctx context.Context, v, target *catalog.
 	if plan.targetDriveID == "" || target.FileID == "" {
 		return false, nil
 	}
+	persistence.RLock()
+	defer persistence.RUnlock()
 	if err := m.cfg.Catalog.MigrateVideoToDrive(ctx, v.ID, plan.targetDriveID, target.FileID, firstNonEmpty(target.ContentHash, v.ContentHash)); err != nil {
 		return false, fmt.Errorf("catalog bind existing target: %w", err)
 	}
 	if target.FileName != "" {
-		if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{FileName: target.FileName}); err != nil {
-			log.Printf("[crawlerupload] %s update file_name after duplicate bind: %v", v.ID, err)
+		if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+			FileName: target.FileName,
+			Title:    videoname.TitleFromFileName(target.FileName),
+			TitleSet: true,
+		}); err != nil {
+			log.Printf("[crawlerupload] %s update file_name/title after duplicate bind: %v", v.ID, err)
 		}
 	}
 	m.preserveCrawledThumbnail(ctx, plan.source, v)

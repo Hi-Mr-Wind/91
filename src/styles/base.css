@@ -17,10 +17,13 @@ body,
 }
 
 html {
-  /* 让锚点跳转有平滑动画，但尊重系统 reduce-motion */
-  scroll-behavior: smooth;
+  /*
+   * 历史记录恢复必须是即时的。全局 smooth 会让浏览器后退到视频列表时
+   * 从页面顶部缓慢滚回原位置；需要动画的按钮会在调用 scrollTo 时单独声明。
+   */
+  scroll-behavior: auto;
   scrollbar-gutter: stable;
-  overflow-y: scroll;
+  overflow-y: auto;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -47,16 +50,14 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* 页面背景的微妙暖光晕（顶部偏右），强化氛围又不抢戏 */
+/* 各主题的背景纹理由 tokens.css 定义；基础层不叠加局部光晕。 */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
   z-index: 0;
-  background:
-    radial-gradient(1200px 600px at 85% -10%, rgba(255, 138, 60, 0.07), transparent 60%),
-    radial-gradient(900px 500px at 10% 110%, rgba(120, 80, 200, 0.05), transparent 60%);
+  background: none;
 }
 
 #root {

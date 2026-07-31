@@ -11,6 +11,7 @@ const ListingPage = lazy(() => import("@/pages/ListingPage"));
 const ShortsPage = lazy(() => import("@/pages/ShortsPage"));
 const UploadPage = lazy(() => import("@/pages/UploadPage"));
 const VideoDetailPage = lazy(() => import("@/pages/VideoDetailPage"));
+const SharedVideoPage = lazy(() => import("@/pages/SharedVideoPage"));
 
 const LoginPage = lazy(() =>
   import("@/admin/LoginPage").then((module) => ({ default: module.LoginPage }))
@@ -29,8 +30,16 @@ const VideosPage = lazy(() =>
 const TagsPage = lazy(() =>
   import("@/admin/TagsPage").then((module) => ({ default: module.TagsPage }))
 );
+const DuplicateReviewsPage = lazy(() =>
+  import("@/admin/DuplicateReviewsPage").then((module) => ({
+    default: module.DuplicateReviewsPage,
+  }))
+);
 const ThemePage = lazy(() =>
   import("@/admin/ThemePage").then((module) => ({ default: module.ThemePage }))
+);
+const BackupPage = lazy(() =>
+  import("@/admin/BackupPage").then((module) => ({ default: module.BackupPage }))
 );
 const UsersPage = lazy(() =>
   import("@/admin/UsersPage").then((module) => ({ default: module.UsersPage }))
@@ -62,6 +71,16 @@ export default function App() {
           element={
             <PageSuspense>
               <LoginPage />
+            </PageSuspense>
+          }
+        />
+
+        {/* 一次性分享页公开；具体视频和媒体请求由分享会话单独鉴权。 */}
+        <Route
+          path="/share"
+          element={
+            <PageSuspense>
+              <SharedVideoPage />
             </PageSuspense>
           }
         />
@@ -101,9 +120,11 @@ export default function App() {
           path="/upload"
           element={
             <RequireAuth>
-              <PageSuspense>
-                <UploadPage />
-              </PageSuspense>
+              <RequireAdmin>
+                <PageSuspense>
+                  <UploadPage />
+                </PageSuspense>
+              </RequireAdmin>
             </RequireAuth>
           }
         />
@@ -155,6 +176,14 @@ export default function App() {
             }
           />
           <Route
+            path="duplicate-reviews"
+            element={
+              <PageSuspense>
+                <DuplicateReviewsPage />
+              </PageSuspense>
+            }
+          />
+          <Route
             path="tags"
             element={
               <PageSuspense>
@@ -167,6 +196,14 @@ export default function App() {
             element={
               <PageSuspense>
                 <ThemePage />
+              </PageSuspense>
+            }
+          />
+          <Route
+            path="backup"
+            element={
+              <PageSuspense>
+                <BackupPage />
               </PageSuspense>
             }
           />

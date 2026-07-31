@@ -1,17 +1,27 @@
 import { useEffect, useState } from "react";
 import { ArrowUp } from "lucide-react";
 
-export function BackToTop() {
+type Props = {
+  onVisibilityChange?: (visible: boolean) => void;
+};
+
+export function BackToTop({ onVisibilityChange }: Props) {
   const [visible, setVisible] = useState(false);
 
   useEffect(() => {
     function onScroll() {
-      setVisible(window.scrollY > 400);
+      const nextVisible = window.scrollY > 400;
+      setVisible((current) => {
+        if (current !== nextVisible) {
+          onVisibilityChange?.(nextVisible);
+        }
+        return nextVisible;
+      });
     }
     window.addEventListener("scroll", onScroll, { passive: true });
     onScroll();
     return () => window.removeEventListener("scroll", onScroll);
-  }, []);
+  }, [onVisibilityChange]);
 
   return (
     <button

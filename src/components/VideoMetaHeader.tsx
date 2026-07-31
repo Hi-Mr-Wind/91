@@ -27,7 +27,6 @@ export function VideoMetaHeader({ video }: Props) {
         <ul className="vd-meta" aria-label="视频信息">
           {source && (
             <li className="vd-meta__chip" data-tone={sourceKind || "neutral"}>
-              <span className="vd-meta__dot" aria-hidden="true" />
               {source}
             </li>
           )}
@@ -77,6 +76,7 @@ function sourceKindFromLabel(label: string): string {
   if (value.includes("光鸭") || value.includes("guangyapan") || value.includes("guangya"))
     return "guangyapan";
   if (value.includes("onedrive") || value.includes("one drive")) return "onedrive";
+  if (value.includes("webdav") || value.includes("web dav")) return "webdav";
   if (value.includes("本地") || value.includes("localstorage") || value.includes("local storage"))
     return "localstorage";
   return "";

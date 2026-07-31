@@ -12,7 +12,7 @@ import (
 
 // Drive 是多家网盘统一抽象。上层不区分盘，只区分 Kind。
 type Drive interface {
-	// Kind 返回驱动代号："quark" / "p115" / "p123" / "pikpak" / "wopan" / "guangyapan" / "onedrive" / "googledrive" / "localstorage"
+	// Kind 返回驱动代号："quark" / "p115" / "p123" / "pikpak" / "wopan" / "guangyapan" / "onedrive" / "googledrive" / "webdav" / "localstorage"
 	Kind() string
 
 	// ID 返回该盘在 catalog 中的唯一标识
@@ -40,6 +40,18 @@ type Drive interface {
 
 	// RootID 返回根目录 fileID
 	RootID() string
+}
+
+// GenerationStreamProvider is an optional drive capability for a provider-
+// generated playback stream that is cheaper to seek than the original file.
+// Background thumbnail/preview workers prefer this stream, while ordinary
+// playback and fingerprinting continue to use StreamURL.
+//
+// forceRefresh invalidates any short-lived provider cache after a signed
+// playlist rejection. Implementations must never expose account credentials in
+// the returned StreamLink.
+type GenerationStreamProvider interface {
+	GenerationStreamURL(ctx context.Context, fileID string, forceRefresh bool) (*StreamLink, error)
 }
 
 // Remover is an optional drive capability. It mirrors OpenList's optional
@@ -81,11 +93,25 @@ type Entry struct {
 type StreamLink struct {
 	URL     string
 	Headers http.Header
+	// Expires is the deadline through which callers may reuse this link. It can
+	// be a conservative local deadline when a provider does not expose the
+	// signed URL's exact expiry.
 	Expires time.Time
+
+	// PassThroughRedirects tells the online playback proxy to make the first
+	// authenticated request itself, but relay an upstream 3xx Location to the
+	// browser instead of following it on the server. Background consumers such
+	// as fingerprinting and transcoding still follow redirects to read bytes.
+	PassThroughRedirects bool
 }
 
 // ErrNotSupported 代表某家盘不支持某操作
 var ErrNotSupported = errors.New("operation not supported by this drive")
+
+// ErrGenerationStreamUnavailable means the optional optimized generation
+// stream does not exist for this file. Callers may safely fall back to the
+// original StreamURL without treating the drive as unhealthy.
+var ErrGenerationStreamUnavailable = errors.New("generation stream unavailable")
 
 // RateLimitError 表示上游服务正在限流。RetryAfter 为 0 时由调用方选择默认冷却时间。
 type RateLimitError struct {

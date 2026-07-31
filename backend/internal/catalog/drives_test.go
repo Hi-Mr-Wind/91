@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -61,6 +62,7 @@ func TestUpsertDriveDefaultsRootIDByKind(t *testing.T) {
 		{id: "guangyapan", kind: "guangyapan", want: ""},
 		{id: "onedrive", kind: "onedrive", want: "root"},
 		{id: "googledrive", kind: "googledrive", want: "root"},
+		{id: "webdav", kind: "webdav", want: "/"},
 		{id: "localstorage", kind: "localstorage", want: "/"},
 		{id: "scriptcrawler", kind: "scriptcrawler", want: "/"},
 	}
@@ -123,5 +125,64 @@ func TestUpsertDriveIgnoresRootIDForLocalStorageAndScriptCrawler(t *testing.T) {
 		if got.ScanRootID != "/" {
 			t.Fatalf("%s scanRootId = %q, want /", tc.kind, got.ScanRootID)
 		}
+	}
+}
+
+func TestSetDriveRuntimeStatusTracksPlaybackFailureAndRecovery(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drive := &Drive{
+		ID:     "drive",
+		Kind:   "p115",
+		Name:   "115",
+		Status: "ok",
+		Credentials: map[string]string{
+			"cookie": "credential-must-be-preserved",
+		},
+	}
+	if err := cat.UpsertDrive(ctx, drive); err != nil {
+		t.Fatalf("upsert drive: %v", err)
+	}
+	if err := cat.SetDriveRuntimeStatus(ctx, drive.ID, "error", "user not login"); err != nil {
+		t.Fatalf("set error status: %v", err)
+	}
+
+	got, err := cat.GetDrive(ctx, drive.ID)
+	if err != nil {
+		t.Fatalf("get failed drive: %v", err)
+	}
+	if got.Status != "error" || !strings.Contains(got.LastError, "not login") {
+		t.Fatalf("status=%q lastError=%q, want playback error", got.Status, got.LastError)
+	}
+	if got.Credentials["cookie"] != "credential-must-be-preserved" {
+		t.Fatalf("credentials changed: %#v", got.Credentials)
+	}
+
+	if err := cat.SetDriveRuntimeStatus(ctx, drive.ID, "ok", ""); err != nil {
+		t.Fatalf("recover status: %v", err)
+	}
+	got, err = cat.GetDrive(ctx, drive.ID)
+	if err != nil {
+		t.Fatalf("get recovered drive: %v", err)
+	}
+	if got.Status != "ok" || got.LastError != "" {
+		t.Fatalf("status=%q lastError=%q, want recovered drive", got.Status, got.LastError)
+	}
+}
+
+func TestSetDriveRuntimeStatusRejectsInvalidState(t *testing.T) {
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.SetDriveRuntimeStatus(context.Background(), "drive", "pending", ""); err == nil {
+		t.Fatal("invalid runtime status unexpectedly accepted")
 	}
 }

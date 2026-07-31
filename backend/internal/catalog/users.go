@@ -75,24 +75,90 @@ func (c *Catalog) ListUsers(ctx context.Context) ([]*User, error) {
 	return out, rows.Err()
 }
 
+// ListAdmins returns every administrator, including the stored password hash,
+// for internal operations that must preserve target-environment credentials.
+func (c *Catalog) ListAdmins(ctx context.Context) ([]*User, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT id, username, password, role, banned, created_at
+  FROM users
+ WHERE role = 'admin'
+ ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*User
+	for rows.Next() {
+		u := &User{}
+		if err := rows.Scan(
+			&u.ID,
+			&u.Username,
+			&u.Password,
+			&u.Role,
+			&u.Banned,
+			&u.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+func (c *Catalog) CountUsers(ctx context.Context) (int, error) {
+	var count int
+	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
+	return count, err
+}
+
+func (c *Catalog) CountAdmins(ctx context.Context) (int, error) {
+	var count int
+	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&count)
+	return count, err
+}
+
+func (c *Catalog) CountActiveAdmins(ctx context.Context) (int, error) {
+	var count int
+	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin' AND banned = 0`).Scan(&count)
+	return count, err
+}
+
 func (c *Catalog) SetUserBanned(ctx context.Context, id int64, banned bool) error {
 	val := 0
 	if banned {
 		val = 1
 	}
-	_, err := c.db.ExecContext(ctx,
+	res, err := c.db.ExecContext(ctx,
 		`UPDATE users SET banned = ? WHERE id = ?`, val, id)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
 	return err
 }
 
 func (c *Catalog) DeleteUser(ctx context.Context, id int64) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
+	res, err := c.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
 	return err
 }
 
 func (c *Catalog) UpdateUserPassword(ctx context.Context, id int64, hashedPassword string) error {
-	_, err := c.db.ExecContext(ctx,
+	res, err := c.db.ExecContext(ctx,
 		`UPDATE users SET password = ? WHERE id = ?`, hashedPassword, id)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
 	return err
 }
 

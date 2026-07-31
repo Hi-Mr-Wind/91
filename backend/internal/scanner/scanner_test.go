@@ -376,15 +376,81 @@ func TestRunSyncsRenamedExistingVideoMetadata(t *testing.T) {
 	if got.FileName != "[4K] renamed clip.mp4" {
 		t.Fatalf("file_name = %q, want remote name", got.FileName)
 	}
-	if got.Title != "renamed clip" {
-		t.Fatalf("title = %q, want parsed title from remote name", got.Title)
+	if got.Title != "[4K] renamed clip" {
+		t.Fatalf("title = %q, want full remote filename without extension", got.Title)
 	}
 	if got.Author != "" {
 		t.Fatalf("author = %q, want cleared author from remote name without author suffix", got.Author)
 	}
 }
 
-func TestRunReplacesExistingVideoTagsWithFixedFilenameTags(t *testing.T) {
+func TestRunUsesFullFilenameForTitleButKeepsAuthorParser(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+
+	drv := &scannerFakeDrive{entries: []drives.Entry{
+		{ID: "hnd", Name: "HND-970.mp4", Size: 123},
+		{ID: "weather", Name: "天气晴朗-小白.mp4", Size: 124},
+	}}
+	if _, err := New(cat, drv, []string{".mp4"}, nil, nil).Run(ctx, ""); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	hnd, err := cat.GetVideo(ctx, "fake-drive-hnd")
+	if err != nil {
+		t.Fatalf("get HND video: %v", err)
+	}
+	if hnd.Title != "HND-970" || hnd.Author != "970" {
+		t.Fatalf("HND metadata = title %q author %q", hnd.Title, hnd.Author)
+	}
+	weather, err := cat.GetVideo(ctx, "fake-drive-weather")
+	if err != nil {
+		t.Fatalf("get weather video: %v", err)
+	}
+	if weather.Title != "天气晴朗-小白" || weather.Author != "小白" {
+		t.Fatalf("weather metadata = title %q author %q", weather.Title, weather.Author)
+	}
+}
+
+func TestRunUpdatesMigratedCrawlerByDriveFileID(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "scriptcrawler-crawler-memojav-DASS-984", DriveID: "drive", FileID: "remote-file",
+		FileName: "Long title-DASS-984.mp4", Title: "Untruncated source title", Author: "Haduki Honami",
+		Size: 123, PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed crawler video: %v", err)
+	}
+	drv := &scannerFakeDrive{entries: []drives.Entry{{ID: "remote-file", Name: "Long title-DASS-984.mp4", Size: 123}}}
+	if _, err := New(cat, drv, []string{".mp4"}, nil, nil).Run(ctx, ""); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	got, err := cat.GetVideo(ctx, "scriptcrawler-crawler-memojav-DASS-984")
+	if err != nil {
+		t.Fatalf("get crawler video: %v", err)
+	}
+	if got.Title != "Long title-DASS-984" {
+		t.Fatalf("title = %q", got.Title)
+	}
+	if got.Author != "Haduki Honami" {
+		t.Fatalf("author = %q, want preserved crawler author", got.Author)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-remote-file"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("generated duplicate exists: %v", err)
+	}
+}
+
+func TestRunPreservesExistingManualTagsInsteadOfFilenameTags(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -429,7 +495,7 @@ func TestRunReplacesExistingVideoTagsWithFixedFilenameTags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get video: %v", err)
 	}
-	want := []string{"后入", "女大"}
+	want := []string{"sunny", "kenny"}
 	if !sameStrings(got.Tags, want) {
 		t.Fatalf("tags = %#v, want %#v", got.Tags, want)
 	}
@@ -492,7 +558,7 @@ func TestRunDoesNotCreateTagFromDirectoryName(t *testing.T) {
 	}
 }
 
-func TestRunMapsAVCodeDirectoryToAVTag(t *testing.T) {
+func TestRunMapsAVCodeDirectoryToExistingAVTag(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -522,7 +588,7 @@ func TestRunMapsAVCodeDirectoryToAVTag(t *testing.T) {
 		entries: map[string][]drives.Entry{
 			"root": {{
 				ID:    "dir-1",
-				Name:  "cc-1750027",
+				Name:  "SSNI-001",
 				IsDir: true,
 			}},
 			"dir-1": {{
@@ -544,8 +610,8 @@ func TestRunMapsAVCodeDirectoryToAVTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get video: %v", err)
 	}
-	if !sameStrings(got.Tags, []string{"AV"}) {
-		t.Fatalf("tags = %#v, want AV", got.Tags)
+	if !sameStrings(got.Tags, []string{"AV", "SSNI"}) {
+		t.Fatalf("tags = %#v, want AV + SSNI", got.Tags)
 	}
 }
 

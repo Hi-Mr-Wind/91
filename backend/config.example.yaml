@@ -4,8 +4,6 @@ server:
   listen: "127.0.0.1:9192"
   # 管理后台用户。保留默认值时，首次访问登录页会要求设置新用户名和密码，
   # 并写回 backend/config.yaml。
-  # 用于签发 admin session cookie，生产请改成随机字符串
-  session_secret: "change-me-to-a-random-string"
   # CORS 白名单：允许跨源访问的前端 Origin 列表。默认空 = 不允许任何跨源请求。
   # 同源部署（前后端在同一域名 + 端口下，由 nginx 反代）不需要配此项。
   # 仅在前后端分别部署在不同域名/端口、且需要前端 fetch 后端时填写。
@@ -33,11 +31,9 @@ scanner:
   video_extensions: [".mp4", ".mkv", ".mov", ".webm", ".avi", ".strm"]
 
 nightly:
-  # 凌晨流水线触发整点（0-23），默认 1 即每天 01:00。
+  # 凌晨流水线触发整点，默认 1 即每天 01:00；需要改时间直接改这个值。
   # 运行时会统一编排扫描、媒体资产生成和后续清理任务。
   cron_hour: 1
-  # 单次流水线总耗时上限（软超时）；超过后当前 phase 跑完不启动后续 phase。
-  max_duration: 6h
 
 preview:
   # 是否启用 ffmpeg 抽帧生成预览视频
@@ -52,8 +48,19 @@ preview:
   # 预览视频宽度
   width: 480
 
+proxy:
+  # 是否允许播放器为“三屏画面”请求服务端全量中转视频流。
+  # 关闭后，支持直链的网盘仍保持 302，避免客户端主动消耗服务端上行带宽。
+  allow_forced_relay: true
+
+remote_upload:
+  # 视频直链后台下载时始终保留的数据盘空间，默认 1 GiB。
+  disk_reserve_bytes: 1073741824
+  # 已收到响应头后，正文连续无数据多久判定失败。
+  idle_timeout_seconds: 120
+
 # 盘列表。上线后请通过管理后台添加，本文件可留空。
-# kind 支持 quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / localstorage。
+# kind 支持 quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / webdav / localstorage。
 # OneDrive 示例：
 # - id: "my-onedrive"
 #   kind: "onedrive"
@@ -68,11 +75,8 @@ preview:
 #   root_id: "root"
 #   params:
 #     refresh_token: "..."
-#     # 默认 use_online_api=true，会使用 OpenList 在线续期 API。
-#     # 如需使用自己创建的 Google OAuth 客户端，取消下面三行注释：
-#     # use_online_api: "false"
-#     # client_id: "..."
-#     # client_secret: "..."
+#     client_id: "..."
+#     client_secret: "..."
 # 光鸭网盘示例：
 # - id: "my-guangyapan"
 #   kind: "guangyapan"
@@ -84,6 +88,16 @@ preview:
 #     refresh_token: "..."
 #     # 可选：按路径解析扫描根目录，优先于 root_id
 #     # root_path: "影视/电影"
+# WebDAV 示例（OpenList 通常为 https://example.com/dav）：
+# - id: "my-webdav"
+#   kind: "webdav"
+#   name: "我的 WebDAV"
+#   # WebDAV 端点下的绝对路径；留空时为 /
+#   root_id: "/影视"
+#   params:
+#     base_url: "https://example.com/dav"
+#     username: "..."
+#     password: "..."
 # 本地存储示例：
 # - id: "local-media"
 #   kind: "localstorage"

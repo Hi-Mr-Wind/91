@@ -1,5 +1,8 @@
 import { useId, useMemo, useState } from "react";
-import { ArrowLeft, ChevronDown } from "lucide-react";
+import { ChevronDown } from "lucide-react";
+import { PasswordInput } from "../PasswordInput";
+import { QuarkQRCodeLogin } from "./QuarkQRCodeLogin";
+import { P115QRCodeLogin } from "./P115QRCodeLogin";
 import { P123QRCodeLogin } from "./P123QRCodeLogin";
 import { WopanQRCodeLogin } from "./WopanQRCodeLogin";
 import { GuangYaPanQRCodeLogin } from "./GuangYaPanQRCodeLogin";
@@ -7,48 +10,44 @@ import {
   FormState,
   Kind,
   credentialFields,
-  credentialHelp,
-  usesRootDirectoryID,
+  driveKindIconPath,
+  rootDirectoryLabel,
   rootIdPlaceholder,
+  usesRootDirectoryID,
 } from "./constants";
 
 type DriveOption = {
   kind: Kind;
   label: string;
   abbr: string;
-  desc: string;
 };
 
 const DRIVE_OPTIONS: DriveOption[] = [
-  { kind: "p115", label: "115 网盘", abbr: "115", desc: "302直链，不占带宽" },
-  { kind: "p123", label: "123网盘", abbr: "123", desc: "扫码登录，302直链" },
-  { kind: "pikpak", label: "PikPak", abbr: "Pk", desc: "302直链，稳定快速" },
-  { kind: "guangyapan", label: "光鸭网盘", abbr: "GY", desc: "扫码登录，302直链" },
-  { kind: "onedrive", label: "OneDrive", abbr: "OD", desc: "302直链，微软网盘" },
-  { kind: "googledrive", label: "Google Drive", abbr: "GD", desc: "服务器中转模式" },
-  { kind: "localstorage", label: "本地存储", abbr: "Lo", desc: "本机文件目录" },
-  { kind: "quark", label: "夸克网盘", abbr: "Qk", desc: "302直链" },
-  { kind: "wopan", label: "联通网盘", abbr: "Wo", desc: "302直链" },
+  { kind: "p115", label: "115 网盘", abbr: "115" },
+  { kind: "p123", label: "123网盘", abbr: "123" },
+  { kind: "pikpak", label: "PikPak", abbr: "Pk" },
+  { kind: "guangyapan", label: "光鸭网盘", abbr: "GY" },
+  { kind: "onedrive", label: "OneDrive", abbr: "OD" },
+  { kind: "googledrive", label: "Google Drive", abbr: "GD" },
+  { kind: "quark", label: "夸克网盘", abbr: "Qk" },
+  { kind: "wopan", label: "联通网盘", abbr: "Wo" },
+  { kind: "webdav", label: "WebDAV", abbr: "WD" },
+  { kind: "localstorage", label: "本地存储", abbr: "Lo" },
 ];
 
 export function DriveForm({
   form,
   onChange,
   isEdit,
-  nameError,
-  onNameBlur,
-  onBack,
+  onTypeSelected,
 }: {
   form: FormState;
   onChange: (f: FormState) => void;
   isEdit: boolean;
-  nameError?: string;
-  onNameBlur?: () => void;
-  onBack?: () => void;
+  onTypeSelected?: () => void;
 }) {
   const idPrefix = useId();
-  const fields = useMemo(() => credentialFields(form.kind, form.creds), [form.kind, form.creds]);
-  const help = credentialHelp(form.kind, isEdit);
+  const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
   const [step, setStep] = useState<"type" | "form">(isEdit ? "form" : "type");
   const nameId = `${idPrefix}-drive-name`;
   const rootId = `${idPrefix}-drive-root`;
@@ -70,38 +69,45 @@ export function DriveForm({
   function selectType(kind: Kind) {
     setKind(kind);
     setStep("form");
-  }
-  function goBack() {
-    setStep("type");
-    onChange({
-      ...form,
-      name: "",
-      rootId: "",
-      creds: {},
-    });
-    onBack?.();
+    onTypeSelected?.();
   }
 
   const selectedOption = DRIVE_OPTIONS.find((o) => o.kind === form.kind);
+  const selectedIconSrc = selectedOption ? driveKindIconPath(selectedOption.kind) : "";
 
   if (step === "type" && !isEdit) {
     return (
       <div className="admin-drive-type-picker">
         <div className="admin-drive-type-grid">
-          {DRIVE_OPTIONS.map((opt) => (
-            <button
-              key={opt.kind}
-              type="button"
-              className="admin-drive-type-card"
-              data-kind={opt.kind}
-              onClick={() => selectType(opt.kind)}
-            >
-              <span className="admin-drive-type-card__icon" data-kind={opt.kind}>
-                {opt.abbr}
-              </span>
-              <span className="admin-drive-type-card__label">{opt.label}</span>
-            </button>
-          ))}
+          {DRIVE_OPTIONS.map((opt) => {
+            const iconSrc = driveKindIconPath(opt.kind);
+            return (
+              <button
+                key={opt.kind}
+                type="button"
+                className="admin-drive-type-card"
+                data-kind={opt.kind}
+                onClick={() => selectType(opt.kind)}
+              >
+                <span
+                  className={`admin-drive-type-card__icon${iconSrc ? " has-image" : ""}`}
+                  data-kind={opt.kind}
+                >
+                  {iconSrc ? (
+                    <img
+                      src={iconSrc}
+                      alt=""
+                      aria-hidden="true"
+                      className="admin-drive-type-card__icon-img"
+                    />
+                  ) : (
+                    opt.abbr
+                  )}
+                </span>
+                <span className="admin-drive-type-card__label">{opt.label}</span>
+              </button>
+            );
+          })}
         </div>
       </div>
     );
@@ -111,63 +117,46 @@ export function DriveForm({
     <div className="admin-form">
       {!isEdit && selectedOption && (
         <div className="admin-drive-selected-bar" data-kind={form.kind}>
-          <span className="admin-drive-selected-bar__icon" data-kind={form.kind}>
-            {selectedOption.abbr}
+          <span
+            className={`admin-drive-selected-bar__icon${selectedIconSrc ? " has-image" : ""}`}
+            data-kind={form.kind}
+          >
+            {selectedIconSrc ? (
+              <img
+                src={selectedIconSrc}
+                alt=""
+                aria-hidden="true"
+                className="admin-drive-selected-bar__icon-img"
+              />
+            ) : (
+              selectedOption.abbr
+            )}
           </span>
           <div className="admin-drive-selected-bar__text">
             <span className="admin-drive-selected-bar__name">{selectedOption.label}</span>
-            <span className="admin-drive-selected-bar__desc">{selectedOption.desc}</span>
           </div>
-          <button type="button" className="admin-drive-selected-bar__back" onClick={goBack}>
-            <ArrowLeft size={12} /> 重选类型
-          </button>
         </div>
       )}
 
       <div className="admin-form__section">
         <div className="admin-form__row">
-          <label htmlFor={nameId}>名称 *</label>
+          <label htmlFor={nameId}>名称</label>
           <input
             id={nameId}
             value={form.name}
             onChange={(e) => set("name", e.target.value)}
-            onBlur={onNameBlur}
-            placeholder="给这个盘起个名字"
-            className={nameError ? "is-invalid" : undefined}
-            aria-invalid={nameError ? "true" : undefined}
-            aria-describedby={nameError ? `${nameId}-error` : undefined}
           />
-          {nameError && (
-            <div className="admin-form__error" id={`${nameId}-error`}>
-              {nameError}
-            </div>
-          )}
         </div>
-
-        {usesRootDirectoryID(form.kind) && (
-          <div className="admin-form__row">
-            <label htmlFor={rootId}>根目录 ID</label>
-            <input
-              id={rootId}
-              value={form.rootId}
-              onChange={(e) => set("rootId", e.target.value)}
-              placeholder={rootIdPlaceholder(form.kind)}
-            />
-            <div className="admin-form__help">
-              留空时使用该网盘类型的默认根目录
-            </div>
-          </div>
-        )}
       </div>
 
-      {(help || fields.length > 0) && (
+      {fields.length > 0 && (
         <div className="admin-form__section">
-          <h3 className="admin-form__section-label">凭证配置</h3>
+          {form.kind === "quark" && (
+            <QuarkQRCodeLogin onCookie={(cookie) => setCred("cookie", cookie)} />
+          )}
 
-          {help && (
-            <div className="admin-form__help admin-form__help--lead">
-              {help}
-            </div>
+          {form.kind === "p115" && (
+            <P115QRCodeLogin onCookie={(cookie) => setCred("cookie", cookie)} />
           )}
 
           {form.kind === "p123" && (
@@ -207,13 +196,24 @@ export function DriveForm({
             />
           )}
 
+          {form.kind === "p123" && fields.length > 0 && (
+            <div className="admin-form__method-label">方式二</div>
+          )}
+
+          {form.kind === "p115" && fields.length > 0 && (
+            <div className="admin-form__method-label">方式二</div>
+          )}
+
+          {form.kind === "quark" && fields.length > 0 && (
+            <div className="admin-form__method-label">方式二</div>
+          )}
+
           {fields.map((f) => (
             <div key={f.key} className="admin-form__row">
               {f.type === "select" ? (
                 <>
                   <label htmlFor={`${idPrefix}-credential-${f.key}`}>
                     {f.label}
-                    {f.required && " *"}
                   </label>
                   <div className="admin-form-select-wrap">
                     <select
@@ -235,37 +235,54 @@ export function DriveForm({
                 <>
                   <label htmlFor={`${idPrefix}-credential-${f.key}`}>
                     {f.label}
-                    {f.required && " *"}
                   </label>
                   {f.multiline ? (
                     <textarea
                       id={`${idPrefix}-credential-${f.key}`}
                       value={form.creds[f.key] ?? ""}
                       onChange={(e) => setCred(f.key, e.target.value)}
-                      placeholder={f.placeholder}
+                      required={f.required && !isEdit}
+                    />
+                  ) : isSecretCredential(f.key) ? (
+                    <PasswordInput
+                      id={`${idPrefix}-credential-${f.key}`}
+                      value={form.creds[f.key] ?? ""}
+                      onChange={(e) => setCred(f.key, e.target.value)}
                       required={f.required && !isEdit}
                     />
                   ) : (
                     <input
                       id={`${idPrefix}-credential-${f.key}`}
-                      type={credentialInputType(f.key)}
+                      type="text"
                       value={form.creds[f.key] ?? ""}
                       onChange={(e) => setCred(f.key, e.target.value)}
-                      placeholder={f.placeholder}
                       required={f.required && !isEdit}
                     />
                   )}
                 </>
               )}
-              {f.help && <div className="admin-form__help">{f.help}</div>}
             </div>
           ))}
+        </div>
+      )}
+
+      {usesRootDirectoryID(form.kind) && (
+        <div className="admin-form__section">
+          <div className="admin-form__row">
+            <label htmlFor={rootId}>{rootDirectoryLabel(form.kind)}</label>
+            <input
+              id={rootId}
+              placeholder={rootIdPlaceholder(form.kind)}
+              value={form.rootId}
+              onChange={(e) => set("rootId", e.target.value)}
+            />
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function credentialInputType(key: string): string {
-  return /password|token|secret/i.test(key) ? "password" : "text";
+function isSecretCredential(key: string): boolean {
+  return /password|token|secret/i.test(key);
 }

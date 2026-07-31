@@ -1,224 +1,207 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { AppShell } from "@/components/AppShell";
 import { PromoStrip } from "@/components/PromoStrip";
 import { SearchPanel } from "@/components/SearchPanel";
 import { TagCloud } from "@/components/TagCloud";
-import { SectionHeader } from "@/components/SectionHeader";
 import { SortToolbar, type ViewMode } from "@/components/SortToolbar";
 import { VideoGrid } from "@/components/VideoGrid";
 import { Pagination } from "@/components/Pagination";
+import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
 import { fetchListing } from "@/data/videos";
+import {
+  readListingSort,
+  withListingSort,
+} from "@/lib/listingSearchParams";
+import { MOBILE_VIDEO_PAGE_SIZE, useIsMobile } from "@/lib/responsive";
 import type { SortKey, VideoItem } from "@/types";
 
-const PAGE_SIZE_DEFAULT = 24;
-const PAGE_SIZE_TAG = 12;
-const LISTING_STATE_PREFIX = "video-site:list-state:";
+const DESKTOP_PAGE_SIZE = 20;
 
-type ListingState = {
-  sort: SortKey;
-  view: ViewMode;
+type ListingSnapshot = {
+  key: string;
   page: number;
-  scrollY: number;
+  view: ViewMode;
+  items: VideoItem[];
+  total: number;
+};
+
+// 只保留 SPA 生命周期内最后一次成功显示的列表。返回详情前的列表时直接
+// 恢复；刷新浏览器后模块重载，仍会正常请求最新内容。
+let cachedListingSnapshot: ListingSnapshot | null = null;
+
+function listingSnapshotKey(
+  keyword: string,
+  tag: string,
+  pageSize: number,
+  sort: SortKey
+): string {
+  return JSON.stringify([keyword, tag, pageSize, sort]);
+}
+
+function listingRequestKey(snapshotKey: string, page: number): string {
+  return `${snapshotKey}\n${page}`;
+}
+
+type ListingContentProps = {
+  keyword: string;
+  tag: string;
+  pageSize: number;
+  sort: SortKey;
+  snapshotKey: string;
+  onSortChange: (sort: SortKey) => void;
 };
 
 export default function ListingPage() {
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const keyword = params.get("q") ?? "";
   const tag = params.get("tag") ?? "";
-  const listKey = useMemo(
-    () => listingStateKey({ keyword, tag }),
-    [keyword, tag]
+  const sort = readListingSort(params);
+  const isMobile = useIsMobile();
+  const pageSize = isMobile ? MOBILE_VIDEO_PAGE_SIZE : DESKTOP_PAGE_SIZE;
+  const snapshotKey = listingSnapshotKey(keyword, tag, pageSize, sort);
+
+  return (
+    <ListingContent
+      key={`${keyword}\n${tag}\n${pageSize}`}
+      keyword={keyword}
+      tag={tag}
+      pageSize={pageSize}
+      sort={sort}
+      snapshotKey={snapshotKey}
+      onSortChange={(nextSort) => {
+        setParams(withListingSort(params, nextSort), { replace: true });
+      }}
+    />
   );
-  const initialState = useMemo(() => readListingState(listKey), [listKey]);
-  const activeListKeyRef = useRef(listKey);
-  const hasLoadedListingRef = useRef(false);
-  const pendingScrollYRef = useRef<number | null>(
-    initialState ? initialState.scrollY : null
+}
+
+function ListingContent({
+  keyword,
+  tag,
+  pageSize,
+  sort,
+  snapshotKey,
+  onSortChange,
+}: ListingContentProps) {
+  const initialSnapshotRef = useRef(
+    cachedListingSnapshot?.key === snapshotKey
+      ? cachedListingSnapshot
+      : null
+  );
+  const initialSnapshot = initialSnapshotRef.current;
+  const loadedRequestKeyRef = useRef<string | null>(
+    initialSnapshot
+      ? listingRequestKey(snapshotKey, initialSnapshot.page)
+      : null
   );
 
-  const [sort, setSort] = useState<SortKey>(initialState?.sort ?? "latest");
-  const [view, setView] = useState<ViewMode>(initialState?.view ?? "grid");
-  const [page, setPage] = useState(initialState?.page ?? 1);
-  const [initialLoading, setInitialLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [items, setItems] = useState<VideoItem[]>([]);
-  const [total, setTotal] = useState(0);
-  const isFetching = initialLoading || refreshing;
-
-  useEffect(() => {
-    if (activeListKeyRef.current === listKey) return;
-    activeListKeyRef.current = listKey;
-    const saved = readListingState(listKey);
-    setSort(saved?.sort ?? "latest");
-    setView(saved?.view ?? "grid");
-    setPage(saved?.page ?? 1);
-    pendingScrollYRef.current = saved ? saved.scrollY : 0;
-  }, [listKey]);
+  const [view, setView] = useState<ViewMode>(initialSnapshot?.view ?? "grid");
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const [page, setPage] = useState(initialSnapshot?.page ?? 1);
+  const [initialLoading, setInitialLoading] = useState(initialSnapshot === null);
+  const [listingError, setListingError] = useState(false);
+  const [items, setItems] = useState<VideoItem[]>(initialSnapshot?.items ?? []);
+  const [total, setTotal] = useState(initialSnapshot?.total ?? 0);
+  const hasActiveFilter = keyword.trim().length > 0 || tag.trim().length > 0;
 
   useEffect(() => {
     document.title = keyword
-      ? `搜索 "${keyword}" · 91`
+      ? `搜索 "${keyword}"`
       : tag
-      ? `标签 ${tag} · 91`
-      : "视频列表 · 91";
+      ? `标签 ${tag}`
+      : "视频列表";
+
+    const requestKey = listingRequestKey(snapshotKey, page);
+    if (loadedRequestKeyRef.current === requestKey) return;
 
     let active = true;
-    const isInitialLoad = !hasLoadedListingRef.current;
-    if (isInitialLoad) {
-      setInitialLoading(true);
-    } else {
-      setRefreshing(true);
-    }
-    fetchListing(page, tag ? PAGE_SIZE_TAG : PAGE_SIZE_DEFAULT, { q: keyword, tag, sort }).then((r) => {
-      if (!active) return;
-      setItems(r.items ?? []);
-      setTotal(r.total ?? 0);
-      hasLoadedListingRef.current = true;
-      setInitialLoading(false);
-      setRefreshing(false);
-    });
+    setListingError(false);
+    fetchListing(page, pageSize, { q: keyword, tag, sort })
+      .then((r) => {
+        if (!active) return;
+        const nextItems = r.items ?? [];
+        const nextTotal = r.total ?? 0;
+        loadedRequestKeyRef.current = requestKey;
+        cachedListingSnapshot = {
+          key: snapshotKey,
+          page,
+          view: viewRef.current,
+          items: nextItems,
+          total: nextTotal,
+        };
+        setItems(nextItems);
+        setTotal(nextTotal);
+      })
+      .catch(() => {
+        if (active) setListingError(true);
+      })
+      .finally(() => {
+        if (active) setInitialLoading(false);
+      });
     return () => {
       active = false;
     };
-  }, [keyword, tag, sort, page]);
-
-  useEffect(() => {
-    const previous = window.history.scrollRestoration;
-    window.history.scrollRestoration = "manual";
-    return () => {
-      window.history.scrollRestoration = previous;
-    };
-  }, []);
-
-  useEffect(() => {
-    let frame = 0;
-    const save = () => {
-      writeListingState(listKey, { sort, view, page, scrollY: window.scrollY });
-    };
-    const saveOnScroll = () => {
-      if (frame) return;
-      frame = window.requestAnimationFrame(() => {
-        frame = 0;
-        save();
-      });
-    };
-
-    window.addEventListener("scroll", saveOnScroll, { passive: true });
-    window.addEventListener("pagehide", save);
-    save();
-    return () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      window.removeEventListener("scroll", saveOnScroll);
-      window.removeEventListener("pagehide", save);
-      save();
-    };
-  }, [listKey, sort, view, page]);
-
-  useEffect(() => {
-    if (isFetching) return;
-    const scrollY = pendingScrollYRef.current;
-    if (scrollY === null) return;
-    pendingScrollYRef.current = null;
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        window.scrollTo({ top: scrollY, behavior: "auto" });
-      });
-    });
-  }, [isFetching, items.length, listKey]);
-
-  const title = keyword
-    ? `搜索结果：${keyword}`
-    : tag
-    ? `标签：${tag}`
-    : "全部视频";
+  }, [keyword, tag, pageSize, sort, snapshotKey, page]);
 
   return (
     <AppShell>
-      <div className="container page-section">
+      <div className="container page-section listing-discovery-section">
         <PromoStrip />
         <SearchPanel />
         <TagCloud />
       </div>
 
-      <div className="container page-section">
-        <SectionHeader title={title} extra={`共 ${total} 个视频`} />
+      <div className="container page-section listing-primary-section">
         <SortToolbar
           sort={sort}
           view={view}
           onSortChange={(nextSort) => {
-            pendingScrollYRef.current = 0;
-            setSort(nextSort);
+            onSortChange(nextSort);
             setPage(1);
             window.scrollTo({ top: 0, behavior: "smooth" });
           }}
           onViewChange={(nextView) => {
             setView(nextView);
+            if (
+              cachedListingSnapshot?.key === snapshotKey &&
+              cachedListingSnapshot.page === page
+            ) {
+              cachedListingSnapshot = {
+                ...cachedListingSnapshot,
+                view: nextView,
+              };
+            }
           }}
         />
-        <VideoGrid
-          videos={items}
-          loading={initialLoading}
-          compact={view === "compact"}
-          skeletonCount={12}
-          emptyText="没有找到匹配的视频"
-        />
+        {initialLoading ? (
+          <VideoGrid videos={items} loading compact={view === "compact"} skeletonCount={12} />
+        ) : listingError && items.length === 0 ? (
+          <AdminEmptyVisual
+            variant="no-results"
+            text="视频列表加载失败，请刷新重试"
+            className="admin-empty-state admin-empty-state--plain listing-empty-state"
+          />
+        ) : items.length === 0 ? (
+          <AdminEmptyVisual
+            variant={hasActiveFilter ? "no-results" : "empty"}
+            text={hasActiveFilter ? "未查询到" : "当前库中没有视频"}
+            className="admin-empty-state admin-empty-state--plain listing-empty-state"
+          />
+        ) : (
+          <VideoGrid videos={items} compact={view === "compact"} skeletonCount={12} />
+        )}
         <Pagination
           page={page}
-          pageSize={tag ? PAGE_SIZE_TAG : PAGE_SIZE_DEFAULT}
+          pageSize={pageSize}
           total={total}
           onChange={(p) => {
-            pendingScrollYRef.current = 0;
             setPage(p);
             window.scrollTo({ top: 0, behavior: "smooth" });
           }}
         />
       </div>
     </AppShell>
-  );
-}
-
-function listingStateKey(filters: {
-  keyword: string;
-  tag: string;
-}): string {
-  const params = new URLSearchParams();
-  if (filters.keyword) params.set("q", filters.keyword);
-  if (filters.tag) params.set("tag", filters.tag);
-  return `${LISTING_STATE_PREFIX}${params.toString()}`;
-}
-
-function readListingState(key: string): ListingState | null {
-  try {
-    const raw = window.sessionStorage.getItem(key);
-    if (!raw) return null;
-    const value = JSON.parse(raw) as Partial<ListingState>;
-    return {
-      sort: isSortKey(value.sort) ? value.sort : "latest",
-      view: value.view === "compact" ? "compact" : "grid",
-      page: typeof value.page === "number" && value.page > 0 ? value.page : 1,
-      scrollY:
-        typeof value.scrollY === "number" && value.scrollY > 0
-          ? value.scrollY
-          : 0,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function writeListingState(key: string, state: ListingState) {
-  try {
-    window.sessionStorage.setItem(key, JSON.stringify(state));
-  } catch {
-    // Storage can be unavailable in private browsing modes.
-  }
-}
-
-function isSortKey(value: unknown): value is SortKey {
-  return (
-    value === "latest" ||
-    value === "hot" ||
-    value === "recent"
   );
 }
